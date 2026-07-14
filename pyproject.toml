@@ -1,0 +1,82 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "obsync-app"
+version = "0.1.0"
+description = "Continuously turn folders from any computer into organized Obsidian Markdown."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Obsync contributors" }]
+keywords = ["obsidian", "sync", "knowledge-base", "ollama", "lm-studio", "self-hosted"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Office/Business",
+]
+dependencies = [
+  "beautifulsoup4>=4.13,<5",
+  "fastapi>=0.116,<1",
+  "httpx>=0.28,<1",
+  "openpyxl>=3.1,<4",
+  "platformdirs>=4.3,<5",
+  "pydantic>=2.11,<3",
+  "pypdf>=5.7,<6",
+  "python-docx>=1.2,<2",
+  "python-multipart>=0.0.20,<1",
+  "python-pptx>=1.0,<2",
+  "PyYAML>=6.0,<7",
+  "uvicorn[standard]>=0.35,<1",
+  "watchfiles>=1.1,<2",
+]
+
+[project.optional-dependencies]
+ocr = ["Pillow>=11,<12", "pytesseract>=0.3.13,<1"]
+dev = [
+  "coverage[toml]>=7.9,<8",
+  "pyinstaller>=6.14,<7",
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.0,<2",
+  "ruff>=0.12,<1",
+]
+
+[project.scripts]
+obsync = "obsync.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/eliautobot/obsync"
+Documentation = "https://github.com/eliautobot/obsync/tree/main/docs"
+Issues = "https://github.com/eliautobot/obsync/issues"
+Source = "https://github.com/eliautobot/obsync"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/obsync"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["obsync"]
+branch = true
+omit = ["src/obsync/cli.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 80
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

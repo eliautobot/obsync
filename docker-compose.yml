@@ -1,0 +1,25 @@
+services:
+  obsync:
+    build:
+      context: .
+    image: obsync:local
+    container_name: obsync
+    restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"
+    ports:
+      - "${OBSYNC_BIND_IP:-0.0.0.0}:${OBSYNC_PORT:-7769}:7769"
+    environment:
+      OBSYNC_ADMIN_TOKEN: "${OBSYNC_ADMIN_TOKEN:-}"
+      OBSYNC_DATA_DIR: /data
+      OBSYNC_VAULT_PATH: /vault
+      OBSYNC_MAX_UPLOAD_MB: "${OBSYNC_MAX_UPLOAD_MB:-100}"
+      OBSYNC_MAX_EXTRACT_CHARS: "${OBSYNC_MAX_EXTRACT_CHARS:-200000}"
+      OBSYNC_LOG_LEVEL: "${OBSYNC_LOG_LEVEL:-info}"
+    volumes:
+      - obsync-data:/data
+      - "${OBSYNC_VAULT_HOST_PATH:-./vault}:/vault"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  obsync-data:

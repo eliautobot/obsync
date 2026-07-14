@@ -1,0 +1,50 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from obsync.security import (
+    hash_token,
+    new_enrollment_code,
+    new_token,
+    safe_relative_path,
+    safe_vault_path,
+    slugify,
+    verify_token,
+)
+
+
+def test_tokens_are_random_and_verifiable() -> None:
+    first = new_token("agent")
+    second = new_token("agent")
+    assert first.startswith("agent_")
+    assert first != second
+    assert verify_token(first, hash_token(first))
+    assert not verify_token(second, hash_token(first))
+
+
+def test_enrollment_code_is_human_readable() -> None:
+    code = new_enrollment_code()
+    assert len(code.split("-")) == 3
+    assert all(len(part) == 4 for part in code.split("-"))
+
+
+@pytest.mark.parametrize(
+    "value", ["../secret", "folder/../../secret", "/absolute/file", "C:\\absolute\\file"]
+)
+def test_unsafe_relative_paths_are_rejected(value: str) -> None:
+    with pytest.raises(ValueError):
+        safe_relative_path(value)
+
+
+def test_safe_vault_path_stays_inside_root(tmp_path: Path) -> None:
+    result = safe_vault_path(tmp_path, "Knowledge/Invoices/invoice.md")
+    assert result == tmp_path / "Knowledge" / "Invoices" / "invoice.md"
+    with pytest.raises(ValueError):
+        safe_vault_path(tmp_path, "../../escape.md")
+
+
+def test_slugify_handles_unicode_and_unsafe_characters() -> None:
+    assert slugify("  Résumé / Q3: Plans?  ") == "resume-q3-plans"
+    assert slugify("***", fallback="document") == "document"

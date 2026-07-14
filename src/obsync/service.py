@@ -1,0 +1,680 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import tempfile
+import uuid
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from .config import Settings
+from .db import Database, utc_now
+from .extractors import extract_document
+from .llm import Analysis, LLMAnalyzer, LLMConfig
+from .markdown import (
+    is_managed_note,
+    merge_preserving_manual,
+    render_markdown,
+    set_source_status,
+)
+from .security import (
+    hash_token,
+    new_enrollment_code,
+    new_token,
+    safe_relative_path,
+    safe_vault_path,
+    slugify,
+    verify_token,
+)
+
+DEFAULT_SETTINGS: dict[str, tuple[str, bool]] = {
+    "llm_enabled": ("false", False),
+    "llm_provider": ("ollama", False),
+    "llm_base_url": ("", False),
+    "llm_model": ("", False),
+    "llm_api_key": ("", True),
+    "llm_timeout_seconds": ("120", False),
+    "review_threshold": ("0.65", False),
+}
+
+
+class ObsyncService:
+    def __init__(self, settings: Settings, db: Database | None = None):
+        self.settings = settings
+        self.settings.prepare()
+        self.db = db or Database(settings.database_path)
+        self.db.initialize()
+        self._ensure_defaults()
+
+    def _ensure_defaults(self) -> None:
+        existing = self.db.get_settings()
+        missing = {key: value for key, value in DEFAULT_SETTINGS.items() if key not in existing}
+        if missing:
+            self.db.set_settings(missing)
+
+    def verify_admin(self, token: str) -> bool:
+        return bool(self.settings.admin_token and token) and verify_token(
+            token, hash_token(self.settings.admin_token)
+        )
+
+    def create_enrollment(self, label: str = "", minutes: int = 20) -> dict[str, Any]:
+        code = new_enrollment_code()
+        enrollment_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        expires = now + timedelta(minutes=max(1, min(minutes, 1440)))
+        self.db.execute(
+            """
+            INSERT INTO enrollments(id, code_hash, label, expires_at, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (enrollment_id, hash_token(code), label[:120], expires.isoformat(), now.isoformat()),
+        )
+        self.db.add_event(
+            "enrollment.created", f"Enrollment code created for {label or 'a device'}"
+        )
+        return {"id": enrollment_id, "code": code, "expires_at": expires.isoformat()}
+
+    def register_agent(self, code: str, payload: dict[str, str]) -> dict[str, str]:
+        now = datetime.now(UTC)
+        enrollment = self.db.query_one(
+            "SELECT * FROM enrollments WHERE code_hash = ?", (hash_token(code.upper()),)
+        )
+        if not enrollment or enrollment["used_at"]:
+            raise ValueError("Enrollment code is invalid or already used")
+        if datetime.fromisoformat(enrollment["expires_at"]) < now:
+            raise ValueError("Enrollment code has expired")
+
+        agent_id = str(uuid.uuid4())
+        token = new_token("agent")
+        name = (payload.get("name") or payload.get("hostname") or "Unnamed device").strip()[:100]
+        hostname = (payload.get("hostname") or name).strip()[:255]
+        with self.db.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO agents(id, name, hostname, os_name, os_version, agent_version,
+                                   token_hash, status, last_seen_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'online', ?, ?, ?)
+                """,
+                (
+                    agent_id,
+                    name,
+                    hostname,
+                    (payload.get("os_name") or "unknown")[:100],
+                    (payload.get("os_version") or "")[:200],
+                    (payload.get("agent_version") or "")[:50],
+                    hash_token(token),
+                    now.isoformat(),
+                    now.isoformat(),
+                    now.isoformat(),
+                ),
+            )
+            connection.execute(
+                "UPDATE enrollments SET used_at = ? WHERE id = ?",
+                (now.isoformat(), enrollment["id"]),
+            )
+        self.db.add_event("agent.registered", f"Device {name} joined Obsync", agent_id=agent_id)
+        return {"agent_id": agent_id, "agent_token": token, "name": name}
+
+    def authenticate_agent(self, token: str) -> dict[str, Any] | None:
+        if not token:
+            return None
+        row = self.db.query_one("SELECT * FROM agents WHERE token_hash = ?", (hash_token(token),))
+        if not row or not row["enabled"]:
+            return None
+        return row
+
+    def heartbeat(self, agent_id: str, version: str = "") -> None:
+        now = utc_now()
+        self.db.execute(
+            """
+            UPDATE agents SET status = 'online', last_seen_at = ?, updated_at = ?,
+                              agent_version = CASE WHEN ? = '' THEN agent_version ELSE ? END
+            WHERE id = ?
+            """,
+            (now, now, version, version[:50], agent_id),
+        )
+
+    def list_agents(self) -> list[dict[str, Any]]:
+        rows = self.db.query_all(
+            """
+            SELECT a.*,
+                   count(DISTINCT r.id) AS root_count,
+                   count(DISTINCT d.id) AS document_count,
+                   sum(CASE WHEN d.status = 'error' THEN 1 ELSE 0 END) AS error_count
+            FROM agents a
+            LEFT JOIN roots r ON r.agent_id = a.id
+            LEFT JOIN documents d ON d.agent_id = a.id
+            GROUP BY a.id
+            ORDER BY a.name COLLATE NOCASE
+            """
+        )
+        cutoff = datetime.now(UTC) - timedelta(seconds=90)
+        for row in rows:
+            try:
+                online = row["enabled"] and datetime.fromisoformat(row["last_seen_at"]) >= cutoff
+            except (TypeError, ValueError):
+                online = False
+            row["status"] = "online" if online else "offline"
+            if not online and row["status"] != "offline":
+                self.db.execute("UPDATE agents SET status = 'offline' WHERE id = ?", (row["id"],))
+        return rows
+
+    def upsert_root(self, agent_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        root_key = str(payload["root_key"])[:200]
+        now = utc_now()
+        existing = self.db.query_one(
+            "SELECT * FROM roots WHERE agent_id = ? AND root_key = ?", (agent_id, root_key)
+        )
+        root_id = existing["id"] if existing else str(uuid.uuid4())
+        name = str(payload.get("name") or Path(str(payload.get("path", "Folder"))).name or "Folder")
+        destination = str(payload.get("destination") or "Obsync")
+        safe_relative_path(destination)
+        include = json.dumps(list(payload.get("include_patterns") or ["**/*"]))
+        exclude = json.dumps(list(payload.get("exclude_patterns") or []))
+        self.db.execute(
+            """
+            INSERT INTO roots(id, agent_id, root_key, name, path, destination, include_patterns,
+                              exclude_patterns, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(agent_id, root_key) DO UPDATE SET
+                name = excluded.name,
+                path = excluded.path,
+                destination = excluded.destination,
+                include_patterns = excluded.include_patterns,
+                exclude_patterns = excluded.exclude_patterns,
+                enabled = excluded.enabled,
+                updated_at = excluded.updated_at
+            """,
+            (
+                root_id,
+                agent_id,
+                root_key,
+                name[:120],
+                str(payload.get("path") or "")[:2000],
+                destination[:500],
+                include,
+                exclude,
+                int(bool(payload.get("enabled", True))),
+                now,
+                now,
+            ),
+        )
+        root = self.db.query_one("SELECT * FROM roots WHERE id = ?", (root_id,))
+        assert root is not None
+        return self._decode_root(root)
+
+    def list_roots(self, agent_id: str | None = None) -> list[dict[str, Any]]:
+        sql = """
+            SELECT r.*, a.name AS agent_name,
+                   count(d.id) AS document_count,
+                   sum(CASE WHEN d.status = 'error' THEN 1 ELSE 0 END) AS error_count
+            FROM roots r
+            JOIN agents a ON a.id = r.agent_id
+            LEFT JOIN documents d ON d.root_id = r.id
+        """
+        params: tuple[str, ...] = ()
+        if agent_id:
+            sql += " WHERE r.agent_id = ?"
+            params = (agent_id,)
+        sql += " GROUP BY r.id ORDER BY a.name COLLATE NOCASE, r.name COLLATE NOCASE"
+        return [self._decode_root(row) for row in self.db.query_all(sql, params)]
+
+    @staticmethod
+    def _decode_root(row: dict[str, Any]) -> dict[str, Any]:
+        row["include_patterns"] = json.loads(row.get("include_patterns") or "[]")
+        row["exclude_patterns"] = json.loads(row.get("exclude_patterns") or "[]")
+        return row
+
+    def _llm_config(self) -> LLMConfig:
+        enabled = self.db.get_setting("llm_enabled", "false").lower() == "true"
+        try:
+            timeout = int(self.db.get_setting("llm_timeout_seconds", "120"))
+        except ValueError:
+            timeout = 120
+        return LLMConfig(
+            enabled=enabled,
+            provider=self.db.get_setting("llm_provider", "ollama"),
+            base_url=self.db.get_setting("llm_base_url", ""),
+            model=self.db.get_setting("llm_model", ""),
+            api_key=self.db.get_setting("llm_api_key", ""),
+            timeout_seconds=max(5, min(timeout, 600)),
+        )
+
+    def _candidate_titles(self, source_path: str, limit: int = 100) -> list[str]:
+        words = {
+            word.lower()
+            for word in Path(source_path).stem.replace("_", " ").replace("-", " ").split()
+            if len(word) >= 4
+        }
+        rows = self.db.query_all(
+            "SELECT DISTINCT title FROM documents WHERE status = 'synced' AND title != '' "
+            "ORDER BY updated_at DESC LIMIT 500"
+        )
+        scored = []
+        for row in rows:
+            title = row["title"]
+            title_words = set(title.lower().split())
+            score = len(words & title_words)
+            scored.append((score, title))
+        scored.sort(key=lambda item: (-item[0], item[1].casefold()))
+        return [title for _, title in scored[:limit]]
+
+    def _new_destination(
+        self,
+        *,
+        document_id: str,
+        agent_name: str,
+        root: dict[str, Any],
+        analysis: Analysis,
+    ) -> str:
+        segments = [
+            str(root["destination"]),
+            slugify(agent_name, "device"),
+            slugify(str(root["name"]), "folder"),
+            slugify(analysis.category, "documents"),
+        ]
+        filename = f"{slugify(analysis.title, 'document')}-{document_id[:8]}.md"
+        relative = Path(*segments) / filename
+        safe_relative_path(str(relative))
+        return relative.as_posix()
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _atomic_write(path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temp_name = tempfile.mkstemp(prefix=".obsync-", suffix=".tmp", dir=path.parent)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, path)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
+
+    async def process_file(
+        self,
+        *,
+        agent: dict[str, Any],
+        root_id: str,
+        source_path: str,
+        source_mtime_ns: int,
+        source_size: int,
+        staged_file: Path,
+        claimed_hash: str = "",
+        previous_path: str = "",
+    ) -> dict[str, Any]:
+        source_rel = safe_relative_path(source_path).as_posix()
+        root = self.db.query_one(
+            "SELECT * FROM roots WHERE id = ? AND agent_id = ?", (root_id, agent["id"])
+        )
+        if not root or not root["enabled"]:
+            raise ValueError("Watched folder is unknown or disabled")
+        if staged_file.stat().st_size > self.settings.max_upload_bytes:
+            raise ValueError(f"File exceeds the {self.settings.max_upload_mb} MB upload limit")
+
+        actual_hash = self._sha256(staged_file)
+        if claimed_hash and claimed_hash.lower() != actual_hash:
+            raise ValueError("Uploaded file hash does not match the agent manifest")
+
+        existing = self.db.query_one(
+            "SELECT * FROM documents WHERE agent_id = ? AND root_id = ? AND source_path = ?",
+            (agent["id"], root_id, source_rel),
+        )
+        if not existing and previous_path:
+            previous_rel = safe_relative_path(previous_path).as_posix()
+            existing = self.db.query_one(
+                "SELECT * FROM documents WHERE agent_id = ? AND root_id = ? AND source_path = ?",
+                (agent["id"], root_id, previous_rel),
+            )
+            if existing:
+                self.db.execute(
+                    """
+                    UPDATE documents SET source_path = ?, source_name = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (source_rel, Path(source_rel).name, utc_now(), existing["id"]),
+                )
+                existing["source_path"] = source_rel
+                existing["source_name"] = Path(source_rel).name
+
+        if existing and existing["source_hash"] == actual_hash and not existing["missing"]:
+            self.db.execute(
+                """
+                UPDATE documents SET source_mtime_ns = ?, source_size = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (source_mtime_ns, source_size, utc_now(), existing["id"]),
+            )
+            return {**self._decode_document(existing), "result": "unchanged"}
+
+        document_id = existing["id"] if existing else str(uuid.uuid4())
+        now = utc_now()
+        if existing:
+            self.db.execute(
+                """
+                UPDATE documents SET source_mtime_ns = ?, source_size = ?, source_hash = ?,
+                    status = 'processing', missing = 0, error = '', updated_at = ? WHERE id = ?
+                """,
+                (source_mtime_ns, source_size, actual_hash, now, document_id),
+            )
+        else:
+            self.db.execute(
+                """
+                INSERT INTO documents(
+                    id, agent_id, root_id, source_path, source_name, source_mtime_ns,
+                    source_size, source_hash, status, first_seen_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?, ?)
+                """,
+                (
+                    document_id,
+                    agent["id"],
+                    root_id,
+                    source_rel,
+                    Path(source_rel).name,
+                    source_mtime_ns,
+                    source_size,
+                    actual_hash,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+
+        try:
+            extracted = extract_document(staged_file, self.settings.max_extract_chars)
+            analyzer = LLMAnalyzer(self._llm_config())
+            analysis = await analyzer.analyze(
+                source_path=source_rel,
+                text=extracted.text,
+                mime_type=extracted.mime_type,
+                candidates=self._candidate_titles(source_rel),
+            )
+            try:
+                threshold = float(self.db.get_setting("review_threshold", "0.65"))
+            except ValueError:
+                threshold = 0.65
+            needs_review = analysis.confidence < max(0.0, min(1.0, threshold))
+            destination = (
+                existing["destination_path"]
+                if existing and existing["destination_path"]
+                else self._new_destination(
+                    document_id=document_id,
+                    agent_name=agent["name"],
+                    root=root,
+                    analysis=analysis,
+                )
+            )
+            destination_path = safe_vault_path(self.settings.vault_path, destination)
+
+            generated = render_markdown(
+                document_id=document_id,
+                source_path=source_rel,
+                source_name=Path(source_rel).name,
+                source_hash=actual_hash,
+                source_size=source_size,
+                source_mtime_ns=source_mtime_ns,
+                machine_name=agent["name"],
+                root_name=root["name"],
+                mime_type=extracted.mime_type,
+                extractor=extracted.extractor,
+                extracted_text=extracted.text,
+                extraction_warning=extracted.warning,
+                truncated=extracted.truncated,
+                analysis=analysis,
+            )
+            if destination_path.exists():
+                current = destination_path.read_text(encoding="utf-8")
+                if not is_managed_note(current):
+                    raise ValueError(
+                        f"Destination already exists and is not managed: {destination}"
+                    )
+                generated = merge_preserving_manual(current, generated)
+            self._atomic_write(destination_path, generated)
+
+            processed_at = utc_now()
+            self.db.execute(
+                """
+                UPDATE documents SET mime_type = ?, destination_path = ?, title = ?, category = ?,
+                    tags_json = ?, summary = ?, analysis_json = ?, status = 'synced',
+                    llm_status = ?, confidence = ?, needs_review = ?, missing = 0, error = '',
+                    processed_at = ?, updated_at = ? WHERE id = ?
+                """,
+                (
+                    extracted.mime_type,
+                    destination,
+                    analysis.title,
+                    analysis.category,
+                    json.dumps(analysis.tags, ensure_ascii=False),
+                    analysis.summary,
+                    json.dumps(analysis.as_dict(), ensure_ascii=False),
+                    "analyzed" if analysis.provider != "rules" else "rules",
+                    analysis.confidence,
+                    int(needs_review),
+                    processed_at,
+                    processed_at,
+                    document_id,
+                ),
+            )
+            self.db.add_event(
+                "document.synced",
+                f"Synced {source_rel} to {destination}",
+                agent_id=agent["id"],
+                root_id=root_id,
+                document_id=document_id,
+                details={"llm": analysis.provider, "needs_review": needs_review},
+            )
+            row = self.db.query_one("SELECT * FROM documents WHERE id = ?", (document_id,))
+            assert row is not None
+            return {**self._decode_document(row), "result": "synced"}
+        except Exception as exc:
+            self.db.execute(
+                "UPDATE documents SET status = 'error', error = ?, updated_at = ? WHERE id = ?",
+                (str(exc)[:2000], utc_now(), document_id),
+            )
+            self.db.add_event(
+                "document.error",
+                f"Could not sync {source_rel}: {exc}",
+                level="error",
+                agent_id=agent["id"],
+                root_id=root_id,
+                document_id=document_id,
+            )
+            raise
+
+    def mark_missing(self, agent_id: str, root_id: str, source_path: str) -> dict[str, Any]:
+        source_rel = safe_relative_path(source_path).as_posix()
+        document = self.db.query_one(
+            "SELECT * FROM documents WHERE agent_id = ? AND root_id = ? AND source_path = ?",
+            (agent_id, root_id, source_rel),
+        )
+        if not document:
+            return {"result": "unknown"}
+        if document["missing"]:
+            return {"result": "unchanged", **self._decode_document(document)}
+        if document["destination_path"]:
+            note_path = safe_vault_path(self.settings.vault_path, document["destination_path"])
+            if note_path.exists():
+                updated = set_source_status(note_path.read_text(encoding="utf-8"), "source-missing")
+                self._atomic_write(note_path, updated)
+        now = utc_now()
+        self.db.execute(
+            "UPDATE documents SET missing = 1, updated_at = ? WHERE id = ?", (now, document["id"])
+        )
+        self.db.add_event(
+            "document.missing",
+            f"Source file is missing: {source_rel}",
+            level="warning",
+            agent_id=agent_id,
+            root_id=root_id,
+            document_id=document["id"],
+        )
+        document["missing"] = 1
+        return {"result": "marked-missing", **self._decode_document(document)}
+
+    def list_documents(
+        self,
+        *,
+        status: str = "",
+        search: str = "",
+        review: bool | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            clauses.append("d.status = ?")
+            params.append(status)
+        if search:
+            clauses.append("(d.title LIKE ? OR d.source_path LIKE ? OR d.summary LIKE ?)")
+            term = f"%{search}%"
+            params.extend([term, term, term])
+        if review is not None:
+            clauses.append("d.needs_review = ?")
+            params.append(int(review))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        count = self.db.query_one(f"SELECT count(*) AS count FROM documents d {where}", params)
+        rows = self.db.query_all(
+            f"""
+            SELECT d.*, a.name AS agent_name, r.name AS root_name
+            FROM documents d
+            JOIN agents a ON a.id = d.agent_id
+            JOIN roots r ON r.id = d.root_id
+            {where}
+            ORDER BY d.updated_at DESC LIMIT ? OFFSET ?
+            """,
+            [*params, max(1, min(limit, 500)), max(0, offset)],
+        )
+        return {"items": [self._decode_document(row) for row in rows], "total": count["count"]}
+
+    @staticmethod
+    def _decode_document(row: dict[str, Any]) -> dict[str, Any]:
+        result = dict(row)
+        result["tags"] = json.loads(result.pop("tags_json", "[]") or "[]")
+        result["analysis"] = json.loads(result.pop("analysis_json", "{}") or "{}")
+        return result
+
+    def approve_document(self, document_id: str) -> None:
+        self.db.execute(
+            "UPDATE documents SET needs_review = 0, updated_at = ? WHERE id = ?",
+            (utc_now(), document_id),
+        )
+
+    def queue_command(
+        self, agent_id: str, command: str, payload: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        if not self.db.query_one("SELECT id FROM agents WHERE id = ? AND enabled = 1", (agent_id,)):
+            raise ValueError("Unknown or disabled agent")
+        command_id = str(uuid.uuid4())
+        now = utc_now()
+        self.db.execute(
+            """
+            INSERT INTO commands(id, agent_id, command, payload_json, status, created_at)
+            VALUES (?, ?, ?, ?, 'pending', ?)
+            """,
+            (command_id, agent_id, command, json.dumps(payload or {}), now),
+        )
+        return {
+            "id": command_id,
+            "agent_id": agent_id,
+            "command": command,
+            "payload": payload or {},
+            "status": "pending",
+            "created_at": now,
+        }
+
+    def pending_commands(self, agent_id: str) -> list[dict[str, Any]]:
+        rows = self.db.query_all(
+            "SELECT * FROM commands WHERE agent_id = ? AND status = 'pending' ORDER BY created_at",
+            (agent_id,),
+        )
+        for row in rows:
+            row["payload"] = json.loads(row.pop("payload_json") or "{}")
+        return rows
+
+    def complete_command(self, agent_id: str, command_id: str, result: str, ok: bool) -> None:
+        self.db.execute(
+            """
+            UPDATE commands SET status = ?, result = ?, completed_at = ?
+            WHERE id = ? AND agent_id = ?
+            """,
+            ("completed" if ok else "failed", result[:4000], utc_now(), command_id, agent_id),
+        )
+
+    def overview(self) -> dict[str, Any]:
+        stats = self.db.dashboard_stats()
+        stats["online_agents"] = sum(1 for row in self.list_agents() if row["status"] == "online")
+        events = self.db.query_all("SELECT * FROM events ORDER BY created_at DESC LIMIT 20")
+        for event in events:
+            event["details"] = json.loads(event.pop("details_json") or "{}")
+        return {
+            "stats": stats,
+            "recent_events": events,
+            "vault": {
+                "path": str(self.settings.vault_path),
+                "exists": self.settings.vault_path.exists(),
+                "writable": os.access(self.settings.vault_path, os.W_OK),
+            },
+        }
+
+    def settings_for_ui(self) -> dict[str, Any]:
+        values = self.db.get_settings()
+        result: dict[str, Any] = {
+            "vault_path": str(self.settings.vault_path),
+            "max_upload_mb": self.settings.max_upload_mb,
+        }
+        for key, row in values.items():
+            if row["is_secret"]:
+                result[key] = "" if not row["value"] else "configured"
+            else:
+                result[key] = row["value"]
+        return result
+
+    def update_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        allowed: dict[str, bool] = {
+            "llm_enabled": False,
+            "llm_provider": False,
+            "llm_base_url": False,
+            "llm_model": False,
+            "llm_api_key": True,
+            "llm_timeout_seconds": False,
+            "review_threshold": False,
+        }
+        values: dict[str, tuple[str, bool]] = {}
+        for key, secret in allowed.items():
+            if key not in payload:
+                continue
+            value = payload[key]
+            if key == "llm_api_key" and value in {"", "configured"}:
+                continue
+            if isinstance(value, bool):
+                value = "true" if value else "false"
+            values[key] = (str(value).strip(), secret)
+        if values:
+            self.db.set_settings(values)
+            self.db.add_event("settings.updated", "Obsync settings were updated")
+        return self.settings_for_ui()
+
+    async def test_llm(self, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+        config = self._llm_config()
+        if overrides:
+            if "llm_enabled" in overrides:
+                config.enabled = bool(overrides["llm_enabled"])
+            config.provider = str(overrides.get("llm_provider", config.provider))
+            config.base_url = str(overrides.get("llm_base_url", config.base_url))
+            config.model = str(overrides.get("llm_model", config.model))
+            key = overrides.get("llm_api_key")
+            if key and key != "configured":
+                config.api_key = str(key)
+        return await LLMAnalyzer(config).test_connection()

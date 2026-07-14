@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <meta name="theme-color" content="#6d5dfc">
+    <title>Obsync</title>
+    <link rel="stylesheet" href="/assets/styles.css">
+  </head>
+  <body>
+    <div class="app-shell" id="app" hidden>
+      <aside class="sidebar" id="sidebar">
+        <div class="brand">
+          <svg class="brand-mark" viewBox="0 0 48 48" aria-hidden="true">
+            <path d="M16 11a15 15 0 0 1 21 4l3-3v11H29l3.3-3.3A9 9 0 0 0 19 17"/>
+            <path d="M32 37a15 15 0 0 1-21-4l-3 3V25h11l-3.3 3.3A9 9 0 0 0 29 31"/>
+          </svg>
+          <span>Obsync</span>
+        </div>
+        <nav class="nav" aria-label="Main navigation">
+          <button class="nav-item active" data-view="overview"><span>⌂</span>Overview</button>
+          <button class="nav-item" data-view="sources"><span>◎</span>Sources</button>
+          <button class="nav-item" data-view="documents"><span>▤</span>Documents</button>
+          <button class="nav-item" data-view="review"><span>◇</span>Review <b id="review-badge" hidden>0</b></button>
+          <button class="nav-item" data-view="settings"><span>⚙</span>Settings</button>
+        </nav>
+        <div class="sidebar-foot">
+          <div class="server-dot"><i></i><span>Server connected</span></div>
+          <span id="version-label">v0.1.0</span>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <button class="icon-button menu-button" id="menu-button" aria-label="Toggle navigation" aria-expanded="false">☰</button>
+          <div>
+            <h1 id="page-title">Overview</h1>
+            <p id="page-subtitle">Your knowledge pipeline at a glance.</p>
+          </div>
+          <div class="topbar-actions">
+            <button class="icon-button" id="refresh-button" aria-label="Refresh">↻</button>
+            <button class="icon-button" id="theme-button" aria-label="Toggle theme">◐</button>
+            <button class="avatar" id="logout-button" aria-label="Lock Obsync">O</button>
+          </div>
+        </header>
+        <section class="content" id="content" aria-live="polite"></section>
+      </main>
+    </div>
+
+    <div class="login-screen" id="login-screen">
+      <form class="login-card" id="login-form">
+        <svg class="login-mark" viewBox="0 0 48 48" aria-hidden="true">
+          <path d="M16 11a15 15 0 0 1 21 4l3-3v11H29l3.3-3.3A9 9 0 0 0 19 17"/>
+          <path d="M32 37a15 15 0 0 1-21-4l-3 3V25h11l-3.3 3.3A9 9 0 0 0 29 31"/>
+        </svg>
+        <h1>Welcome to Obsync</h1>
+        <p>Enter the admin token from your Docker logs or <code>/data/admin-token.txt</code>.</p>
+        <label for="token-input">Admin token</label>
+        <input id="token-input" type="password" autocomplete="current-password" required placeholder="admin_…">
+        <label class="check-row"><input id="remember-token" type="checkbox"> Remember on this browser</label>
+        <button class="primary full" type="submit">Open Obsync</button>
+        <p class="form-error" id="login-error" role="alert"></p>
+      </form>
+    </div>
+
+    <dialog id="modal" class="modal">
+      <div class="modal-head"><h2 id="modal-title"></h2><button class="icon-button" id="modal-close" aria-label="Close">×</button></div>
+      <div id="modal-body"></div>
+    </dialog>
+    <div class="toast" id="toast" role="status" hidden></div>
+    <script src="/assets/app.js" defer></script>
+  </body>
+</html>

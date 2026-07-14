@@ -1,0 +1,12 @@
+services:
+  obsync-agent:
+    build:
+      context: .
+    image: obsync:local
+    container_name: obsync-agent
+    restart: unless-stopped
+    command: ["agent", "run", "--config", "/config/agent.yml"]
+    volumes:
+      - "${OBSYNC_AGENT_CONFIG_DIR:-./agent-config}:/config"
+      - "${OBSYNC_SOURCE_PATH:-./source}:/source:ro"
+
