@@ -35,6 +35,33 @@ def sync_text(
     )
 
 
+def inventory(
+    client: TestClient,
+    headers: dict[str, str],
+    root_id: str,
+    scan_id: str,
+    files: dict[str, bytes],
+):
+    return client.post(
+        "/api/v1/agent/inventory",
+        headers=headers,
+        json={
+            "root_id": root_id,
+            "scan_id": scan_id,
+            "items": [
+                {
+                    "source_path": path,
+                    "source_mtime_ns": index + 1,
+                    "source_size": len(content),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                }
+                for index, (path, content) in enumerate(files.items())
+            ],
+            "complete": True,
+        },
+    )
+
+
 def test_health_ui_and_admin_auth(client: TestClient, admin_headers: dict[str, str]) -> None:
     health = client.get("/api/v1/health")
     assert health.status_code == 200
@@ -215,6 +242,143 @@ def test_full_sync_update_missing_and_rename(
     docs = client.get("/api/v1/admin/documents", headers=admin_headers).json()
     assert docs["total"] == 1
     assert docs["items"][0]["source_path"] == "Clients/Acme/signed-contract.txt"
+
+
+def test_inventory_compares_new_synced_modified_and_missing_states(
+    client: TestClient,
+    admin_headers: dict[str, str],
+    agent_headers: dict[str, str],
+    registered_root: dict,
+    app_settings,
+) -> None:
+    original = b"Initial project record"
+    discovered = inventory(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "scan-new",
+        {"Projects/record.txt": original},
+    )
+    assert discovered.status_code == 200, discovered.text
+    assert discovered.json()["counts"] == {"new": 1}
+    document = client.get(
+        f"/api/v1/admin/documents?root_id={registered_root['id']}", headers=admin_headers
+    ).json()["items"][0]
+    assert document["comparison_status"] == "new"
+
+    synced = sync_text(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "Projects/record.txt",
+        original,
+    ).json()
+    assert synced["comparison_status"] == "in-sync"
+    note = app_settings.vault_path / synced["destination_path"]
+    assert note.is_file()
+
+    matching = inventory(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "scan-matching",
+        {"Projects/record.txt": original},
+    ).json()
+    assert matching["counts"] == {"in-sync": 1}
+
+    changed = b"Revised project record"
+    modified = inventory(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "scan-modified",
+        {"Projects/record.txt": changed},
+    ).json()
+    assert modified["counts"] == {"modified": 1}
+
+    sync_text(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "Projects/record.txt",
+        changed,
+        mtime=200,
+    )
+    note.unlink()
+    missing_note = inventory(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "scan-note-missing",
+        {"Projects/record.txt": changed},
+    ).json()
+    assert missing_note["counts"] == {"vault-missing": 1}
+
+    missing_source = inventory(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "scan-source-missing",
+        {},
+    ).json()
+    assert missing_source["counts"] == {"source-missing": 1}
+
+
+def test_inventory_adopts_existing_managed_note_without_overlap(
+    client: TestClient,
+    admin_headers: dict[str, str],
+    agent_headers: dict[str, str],
+    registered_root: dict,
+    app_settings,
+) -> None:
+    from obsync.llm import Analysis
+    from obsync.markdown import render_markdown
+
+    content = b"Already represented in Obsidian"
+    source_hash = hashlib.sha256(content).hexdigest()
+    existing_path = app_settings.vault_path / "Existing" / "record.md"
+    existing_path.parent.mkdir(parents=True)
+    existing_path.write_text(
+        render_markdown(
+            document_id="historic-id",
+            source_path="Projects/existing.txt",
+            source_name="existing.txt",
+            source_hash=source_hash,
+            source_size=len(content),
+            source_mtime_ns=1,
+            machine_name="Test PC",
+            root_name="Projects",
+            mime_type="text/plain",
+            extractor="text",
+            extracted_text=content.decode(),
+            extraction_warning="",
+            truncated=False,
+            analysis=Analysis(
+                title="Existing Record",
+                summary="Existing record",
+                category="Documents",
+                document_type="note",
+                tags=["existing"],
+                confidence=0.9,
+            ),
+        ),
+        encoding="utf-8",
+    )
+
+    result = inventory(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "adopt-existing",
+        {"Projects/existing.txt": content},
+    ).json()
+    assert result["counts"] == {"in-sync": 1}
+    document = client.get(
+        f"/api/v1/admin/documents?root_id={registered_root['id']}", headers=admin_headers
+    ).json()["items"][0]
+    assert document["destination_path"] == "Existing/record.md"
+    assert document["source_hash"] == source_hash
+    assert len(list(app_settings.vault_path.rglob("*.md"))) == 1
 
 
 def test_bad_hash_and_traversal_are_rejected(

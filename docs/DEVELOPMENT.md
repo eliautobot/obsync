@@ -18,7 +18,7 @@ uv run coverage run -m pytest
 uv run coverage report
 ```
 
-The test suite covers local-only temporary Admin, remote and cross-site setup rejection, password hashing, account changes, first-run and legacy auth migration, session cookies, CSRF, expiration, login throttling, device token/enrollment behavior, native folder selection, local and remote vault writers, path security, extractors, quick LLM model discovery, LLM response normalization, generated-note preservation, complete source-to-vault synchronization, repeat updates, tombstones, rename identity, agent scanning, and UI/static delivery.
+The test suite covers local-only temporary Admin, remote and cross-site setup rejection, password hashing, account changes, first-run and legacy auth migration, session cookies, CSRF, expiration, login throttling, device token/enrollment behavior, native folder selection, source inventories, green/orange/red comparisons, existing-note adoption, local and remote vault audits/writers, path security, extractors, quick LLM model discovery, LLM response normalization, generated-note preservation, complete source-to-vault synchronization, repeat updates, tombstones, rename identity, and UI/static delivery.
 
 ## Docker validation
 
@@ -38,14 +38,15 @@ Use temporary directories for source, data, and vault:
 2. Create an administrator account and authenticated session.
 3. Create and consume an enrollment.
 4. Register a watched root.
-5. Upload a fixture from an agent client.
-6. Assert one generated Markdown note exists.
+5. Inventory a fixture and assert it is red/new.
+6. Sync it and assert the managed note is green/in-sync.
 7. Add manual text below `## My notes`.
-8. Modify and resync the source.
+8. Modify, rescan, and assert orange/modified before resyncing.
 9. Assert manual text remains.
-10. Remove the source and reconcile.
-11. Repeat with a paired desktop vault writer and complete the queued commands.
-12. Assert the note remains and is marked missing.
+10. Remove the generated note and assert red/vault-missing, then repair it.
+11. Remove the source and reconcile.
+12. Repeat with a paired desktop vault writer and complete the audit/write commands.
+13. Assert the note remains and is marked source-missing.
 
 ## Release builds
 

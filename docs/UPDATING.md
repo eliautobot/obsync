@@ -65,22 +65,22 @@ To install a specific release instead of the newest `main` branch:
 
 ```bash
 git fetch --tags
-git checkout v0.4.0
+git checkout v0.5.0
 docker compose build --pull
 docker compose up -d
 ```
 
-Replace `v0.4.0` with the desired release tag. A tag checkout is intentionally fixed to that release; check out `main` again before using `git pull` for later updates.
+Replace `v0.5.0` with the desired release tag. A tag checkout is intentionally fixed to that release; check out `main` again before using `git pull` for later updates.
 
 ## Update a server using the published Docker image
 
 Pull the desired tag, then recreate the container using the same environment, ports, data volume, and vault mount as the existing deployment:
 
 ```bash
-docker pull ghcr.io/eliautobot/obsync:0.4.0
+docker pull ghcr.io/eliautobot/obsync:0.5.0
 ```
 
-Replace `0.4.0` with the desired version. Prefer a numbered tag for predictable deployments. If your Compose file references the published image, the complete update is:
+Replace `0.5.0` with the desired version. Prefer a numbered tag for predictable deployments. If your Compose file references the published image, the complete update is:
 
 ```bash
 docker compose pull
@@ -116,7 +116,7 @@ Install the matching release tag:
 
 ```bash
 python -m pip install --upgrade \
-  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.4.0"
+  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.5.0"
 obsync --version
 obsync agent scan
 ```

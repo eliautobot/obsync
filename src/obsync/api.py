@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import socket
 import uuid
@@ -55,6 +56,20 @@ class RootRequest(BaseModel):
 class MissingRequest(BaseModel):
     root_id: str
     source_path: str
+
+
+class InventoryItem(BaseModel):
+    source_path: str
+    source_mtime_ns: int = Field(ge=0)
+    source_size: int = Field(ge=0)
+    sha256: str = Field(min_length=64, max_length=64)
+
+
+class InventoryRequest(BaseModel):
+    root_id: str
+    scan_id: str
+    items: list[InventoryItem] = Field(default_factory=list, max_length=500)
+    complete: bool = False
 
 
 class CommandCompleteRequest(BaseModel):
@@ -429,6 +444,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def scan_agent(agent_id: str, _token: AdminDependency) -> dict[str, Any]:
         return service.queue_command(agent_id, "scan")
 
+    @app.post("/api/v1/admin/agents/{agent_id}/select-source")
+    async def select_agent_source(
+        agent_id: str,
+        _token: AdminDependency,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = payload or {}
+        return service.queue_command(
+            agent_id,
+            "select_source",
+            {
+                "name": str(payload.get("name", ""))[:120],
+                "destination": str(payload.get("destination", "Obsync"))[:500],
+            },
+        )
+
+    @app.post("/api/v1/admin/roots/{root_id}/scan")
+    async def scan_root(root_id: str, _token: AdminDependency) -> dict[str, Any]:
+        root = service.db.query_one("SELECT agent_id, root_key FROM roots WHERE id = ?", (root_id,))
+        if not root:
+            raise HTTPException(status_code=404, detail="Watched folder not found")
+        return service.queue_command(root["agent_id"], "scan_root", {"root_key": root["root_key"]})
+
+    @app.post("/api/v1/admin/roots/{root_id}/sync")
+    async def sync_root(root_id: str, _token: AdminDependency) -> dict[str, Any]:
+        root = service.db.query_one("SELECT agent_id, root_key FROM roots WHERE id = ?", (root_id,))
+        if not root:
+            raise HTTPException(status_code=404, detail="Watched folder not found")
+        return service.queue_command(root["agent_id"], "sync_root", {"root_key": root["root_key"]})
+
+    @app.get("/api/v1/admin/commands/{command_id}")
+    async def command_status(command_id: str, _token: AdminDependency) -> dict[str, Any]:
+        command = service.db.query_one("SELECT * FROM commands WHERE id = ?", (command_id,))
+        if not command:
+            raise HTTPException(status_code=404, detail="Command not found")
+        command["payload"] = json.loads(command.pop("payload_json") or "{}")
+        return command
+
     @app.post("/api/v1/admin/agents/{agent_id}/select-vault")
     async def select_agent_vault(agent_id: str, _token: AdminDependency) -> dict[str, Any]:
         return service.queue_command(agent_id, "select_vault")
@@ -437,13 +490,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def documents(
         _token: AdminDependency,
         status: str = "",
+        comparison_status: str = "",
+        root_id: str = "",
         search: str = "",
         review: bool | None = None,
         limit: int = Query(100, ge=1, le=500),
         offset: int = Query(0, ge=0),
     ) -> dict[str, Any]:
         return service.list_documents(
-            status=status, search=search, review=review, limit=limit, offset=offset
+            status=status,
+            comparison_status=comparison_status,
+            root_id=root_id,
+            search=search,
+            review=review,
+            limit=limit,
+            offset=offset,
         )
 
     @app.post("/api/v1/admin/documents/{document_id}/approve")
@@ -510,6 +571,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def upsert_root(payload: RootRequest, agent: AgentDependency) -> dict[str, Any]:
         service.heartbeat(agent["id"])
         return service.upsert_root(agent["id"], payload.model_dump())
+
+    @app.get("/api/v1/agent/roots/{root_id}/pending")
+    async def pending_root(root_id: str, agent: AgentDependency) -> dict[str, Any]:
+        service.heartbeat(agent["id"])
+        return {"items": service.pending_root_documents(agent["id"], root_id)}
+
+    @app.post("/api/v1/agent/inventory")
+    async def inventory(payload: InventoryRequest, agent: AgentDependency) -> dict[str, Any]:
+        service.heartbeat(agent["id"])
+        return service.inventory_files(
+            agent=agent,
+            root_id=payload.root_id,
+            scan_id=payload.scan_id,
+            items=[item.model_dump() for item in payload.items],
+            complete=payload.complete,
+        )
 
     @app.post("/api/v1/agent/documents/sync")
     async def sync_document(

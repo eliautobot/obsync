@@ -63,7 +63,7 @@ In **Settings**, choose the provider, base URL, and model. Press **Check connect
 
 ## 3. Pair a source computer
 
-The server computer is listed automatically and does not need pairing. To add another computer, open **Sources → Add another computer**. The Windows wizard provides one complete PowerShell command. To pair manually:
+The server is listed automatically and counts as one connected computer, but its card represents the control plane—not an arbitrary desktop filesystem. If Docker is inside a VM or Docker Desktop, pair the physical desktop to browse its local folders or vault. Open **Sources → Add another computer**. The Windows wizard provides one complete PowerShell command. To pair manually:
 
 ```bash
 obsync agent pair --server https://your-server --code XXXX-XXXX-XXXX --name "Laptop"
@@ -73,15 +73,26 @@ The pairing stores a device-specific token in the user's Obsync config directory
 
 ## 4. Add folders
 
+From **Sources**, open the connected computer and choose **Add folder**. A native picker opens on that computer. Obsync inventories the selected directory without writing first, then shows:
+
+- Green: already matches Obsidian
+- Orange: source or managed note changed
+- Red: new or missing
+
+Inspect the list with **View files**, use **Scan** to compare again, and use **Sync changes** when ready.
+
+The equivalent CLI workflow is:
+
 ```bash
 obsync agent add-folder "/home/me/Documents" --name "Documents"
 obsync agent add-folder --browse
 obsync agent add-folder "/mnt/team-share/Projects" --name "Team Projects" --destination "Company Knowledge"
 obsync agent list
 obsync agent scan
+obsync agent sync
 ```
 
-After the first successful scan, run continuously:
+`scan` compares without writing. `sync` processes only new, modified, or vault-missing items. After the first successful sync, run continuously:
 
 ```bash
 obsync agent run

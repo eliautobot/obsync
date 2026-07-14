@@ -130,6 +130,27 @@ button { color: inherit; }
 .root-row { margin-top: 10px; padding: 10px; border-radius: 9px; background: var(--panel-2); font-size: 12px; }
 .root-row strong { display: block; margin-bottom: 3px; }
 .root-row code { color: var(--muted); word-break: break-all; }
+.inventory-root { display: grid; gap: 8px; }
+.root-title { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.root-title strong { margin: 0; }
+.root-title span { color: var(--muted); font-size: 11px; }
+.root-comparison, .status-legend { display: flex; flex-wrap: wrap; gap: 6px; }
+.root-actions { display: flex; align-items: center; justify-content: flex-end; gap: 5px; }
+.root-actions .secondary { padding: 6px 9px; }
+.comparison-badge { display: inline-flex; align-items: center; gap: 5px; padding: 4px 7px; border-radius: 999px; background: var(--panel-2); color: var(--muted); font-size: 10px; font-weight: 700; white-space: nowrap; }
+.comparison-badge i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.comparison-badge.good { color: var(--green); background: var(--green-soft); }
+.comparison-badge.warn { color: var(--orange); background: var(--orange-soft); }
+.comparison-badge.bad { color: var(--red); background: var(--red-soft); }
+.source-help { padding: 15px 18px; margin-bottom: 16px; }
+.source-help strong { font-size: 13px; }
+.source-help p { margin: 5px 0 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
+.inventory-file { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+.inventory-file:last-of-type { border-bottom: 0; }
+.inventory-file strong, .inventory-file small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.inventory-file strong { font-size: 12px; }
+.inventory-file small { margin-top: 3px; color: var(--muted); }
+.status-legend { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
 .source-card.server-card { border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); }
 .device-role { display: inline-flex; margin-top: 8px; padding: 3px 7px; border-radius: 999px; color: var(--accent-strong); background: var(--accent-soft); font-size: 10px; font-weight: 700; }
 
@@ -203,6 +224,7 @@ tr:last-child td { border-bottom: 0; }
 .security-copy { margin-top: 0; }
 #secure-admin-form { display: grid; gap: 14px; }
 #account-form { display: grid; gap: 14px; }
+#add-folder-form { display: grid; gap: 14px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
 .toast { position: fixed; right: 22px; bottom: 22px; z-index: 100; max-width: 380px; padding: 12px 16px; border-radius: 10px; color: #fff; background: #242532; box-shadow: var(--shadow); font-size: 13px; }
 .toast.error { background: var(--red); }
@@ -236,6 +258,8 @@ tr:last-child td { border-bottom: 0; }
   .stats { grid-template-columns: 1fr; }
   .topbar h1 { font-size: 20px; }
   .source-grid { grid-template-columns: 1fr; }
+  .root-actions { align-items: stretch; flex-direction: column; }
+  .root-actions button { width: 100%; }
   .login-card { padding: 24px; }
   .modal-actions { flex-direction: column-reverse; }
   .modal-actions button { width: 100%; }

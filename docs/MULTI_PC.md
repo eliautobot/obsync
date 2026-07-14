@@ -2,7 +2,7 @@
 
 ## One server, many sources
 
-Run one central Obsync server. It appears automatically as the first computer. Add a lightweight agent only to computers that contain additional source folders or the Obsidian vault.
+Run one central Obsync server. Its control-plane card appears automatically as the first computer. Add a lightweight agent to every desktop whose source folders or vault are outside the server process/container. A Windows host still needs a desktop agent when the server is inside Docker Desktop or a VM.
 
 ```text
 Home desktop ──────┐
@@ -29,11 +29,11 @@ For each PC:
 
 1. Create an expiring enrollment code in the central UI.
 2. Pair the agent once.
-3. Add one or more local folders.
-4. Run a one-time scan.
+3. Choose **Add folder** on that computer's card and select a local directory.
+4. Review the inventory comparison, then choose **Sync changes**.
 5. Configure the agent to start at login/boot.
 
-The central UI shows the device, its roots, last heartbeat, document count, errors, and review state. **Scan now** places a command in the device queue; the agent receives it within approximately 30 seconds.
+The central UI shows the device, its roots, last heartbeat, file counts, and comparison states. **Scan** compares without writing; **Sync changes** processes the pending red/orange items. Commands are received by the desktop agent within approximately 30 seconds.
 
 ## Network folders
 

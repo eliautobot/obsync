@@ -2,6 +2,24 @@
 
 All notable changes to Obsync will be documented here.
 
+## 0.5.0 - 2026-07-14
+
+### Added
+
+- Added **Add folder** to every connected desktop card with a remotely requested native directory picker
+- Added inventory-only scans that hash and compare every source with its managed Obsidian note before writing
+- Added green **In Obsidian**, orange **Modified**, and red **New/Missing** file states with per-folder counts and file inspection
+- Added separate **Scan** and **Sync changes** controls for each watched folder
+- Added local and desktop-vault audits that detect missing, stale, or overwritten managed notes
+- Added existing-note adoption by source computer, watched root, and relative path to prevent duplicate notes after a ledger rebuild
+- Added dynamic live watching for folders selected after the desktop agent has already started
+
+### Changed
+
+- Pairing a computer now connects it first; folders are added afterward from the central Sources page
+- Clarified that the Overview computer count includes the central server while vault/folder selectors list paired desktops
+- Periodic reconciliation now inventories, compares, and then syncs only pending changes
+
 ## 0.4.0 - 2026-07-14
 
 ### Added

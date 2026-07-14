@@ -13,6 +13,9 @@ The source stays untouched. Obsync is not a copy-for-copy file mirror; it is a l
 
 - Watches multiple folders on multiple computers
 - Detects additions, updates, renames, and missing source files
+- Scans first and compares every source with the actual managed note in Obsidian
+- Shows green **In Obsidian**, orange **Modified**, and red **New/Missing** states before syncing
+- Adopts matching existing Obsync notes so database rebuilds do not create duplicates
 - Extracts text from Markdown, text, PDF, Word, Excel, PowerPoint, HTML, email, CSV, JSON, source code, and images with optional OCR
 - Organizes documents with Ollama, LM Studio, or another OpenAI-compatible local model
 - Falls back to deterministic rules whenever the LLM is unavailable
@@ -113,26 +116,39 @@ Update Python-based desktop agents to the same release as the server, then verif
 
 ```bash
 python -m pip install --upgrade \
-  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.4.0"
+  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.5.0"
 obsync --version
 obsync agent scan
 ```
 
-Replace `v0.4.0` with the release you are installing. For standalone Windows agents, download the matching `obsync-agent-windows-x64.exe` from [GitHub Releases](https://github.com/eliautobot/obsync/releases), replace the previous executable, and restart its Task Scheduler task or agent process.
+Replace `v0.5.0` with the release you are installing. For standalone Windows agents, download the matching `obsync-agent-windows-x64.exe` from [GitHub Releases](https://github.com/eliautobot/obsync/releases), replace the previous executable, and restart its Task Scheduler task or agent process.
 
 Before any update, back up the Obsidian vault and Obsync `/data` volume. The full [Updating and rollback guide](docs/UPDATING.md) includes copy-and-paste backup commands for Linux and Windows, fixed-version installs, every agent type, verification, and safe rollback instructions.
 
 ## Computers and watched folders
 
-The computer running the Obsync server appears automatically in **Sources**. You do not need to pair it. Add a desktop agent only when folders or the Obsidian vault are on another computer.
+The Obsync server appears automatically in **Sources** and is included in the Overview computer count. That card is the control plane; it is not a paired desktop. If Docker runs inside a VM or Docker Desktop, pair the physical Windows/macOS/Linux desktop whenever its folders or vault are outside the container—even if it is the same physical machine hosting Docker. Paired desktops are what appear in the folder and vault computer selectors.
 
-Choose **Sources → Add another computer**. The Windows wizard generates one complete PowerShell command that downloads the standalone agent, pairs it, opens native folder pickers, and starts it. The equivalent manual commands are:
+Choose **Sources → Add another computer**. The Windows wizard generates one complete PowerShell command that downloads the standalone agent, pairs it, and keeps it connected. Once the computer card appears, choose **Add folder**. The folder picker opens on that computer and Obsync immediately inventories the selected directory.
+
+Each watched folder shows a file comparison before syncing:
+
+- Green **In Obsidian**: the source hash matches the managed note in the vault.
+- Orange **Modified**: the source or its managed Obsidian representation changed.
+- Red **New**: the source is not represented in Obsidian yet.
+- Red **Missing**: the expected managed note or original source is missing.
+
+Use **View files** to inspect the inventory, **Scan** to compare again without writing, and **Sync changes** to extract, classify, tag, and write only the new or changed items. Matching managed notes already in the vault are adopted instead of duplicated.
+
+The equivalent manual commands are:
 
 ```bash
 python -m pip install "obsync-app @ git+https://github.com/eliautobot/obsync.git"
 obsync agent pair --server https://obsync.example.com --code XXXX-XXXX-XXXX --name "Office PC"
 obsync agent set-vault --browse
 obsync agent add-folder --browse
+obsync agent scan
+obsync agent sync
 obsync agent run
 ```
 

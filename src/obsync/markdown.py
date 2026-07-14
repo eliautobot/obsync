@@ -168,6 +168,28 @@ def is_managed_note(content: str) -> bool:
     return GENERATED_START in content and GENERATED_END in content
 
 
+def managed_note_metadata(content: str) -> dict[str, str] | None:
+    """Return the Obsync identity fields from a managed note's frontmatter."""
+    if not is_managed_note(content) or not content.startswith("---\n"):
+        return None
+    try:
+        frontmatter, _body = content[4:].split("\n---", 1)
+        values = yaml.safe_load(frontmatter) or {}
+    except (ValueError, yaml.YAMLError):
+        return None
+    if not isinstance(values, dict) or not values.get("obsync_id"):
+        return None
+    keys = (
+        "obsync_id",
+        "obsync_status",
+        "obsync_source",
+        "obsync_machine",
+        "obsync_root",
+        "obsync_hash",
+    )
+    return {key: str(values.get(key, "")) for key in keys}
+
+
 def set_source_status(content: str, status: str) -> str:
     if not is_managed_note(content):
         raise ValueError("Existing note is not managed by Obsync")

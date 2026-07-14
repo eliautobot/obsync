@@ -9,7 +9,7 @@ Obsync is a self-hosted ingestion layer that keeps an Obsidian vault aligned wit
 - Source: <https://github.com/eliautobot/obsync>
 - License: MIT
 - Initial release: `v0.1.0`
-- Current development version: `v0.4.0` (unreleased)
+- Current development version: `v0.5.0` (unreleased)
 
 ## Product decisions
 
@@ -30,6 +30,8 @@ Version 0.2.0 replaces the long administrator token login with first-run usernam
 Version 0.3.0 simplifies first use: a fresh local installation opens as temporary passwordless **Admin**, immediately offers username/password registration, and retains a visible warning if setup is deferred. Temporary Admin is restricted to a loopback URL on the server (or an explicitly trusted setup IP), while remote clients remain locked out until registration.
 
 Version 0.4.0 adds a desktop-vault mode for vaults located in Windows Documents or on another computer, native folder selection, a corrected standalone Windows pairing flow, quick non-inference model checks, an automatic server-computer card, and administrator account settings.
+
+Version 0.5.0 adds central **Add folder** controls, inventory-only scans, visible green/orange/red source-to-vault comparison states, separate sync actions, desktop vault audits, existing-note adoption, and dynamic watching for folders added while an agent is running.
 
 ## Initial validation
 

@@ -16,6 +16,9 @@ Obsync is a one-way, continuously reconciled knowledge pipeline from arbitrary f
 - Tombstones for missing files; no automatic note deletion
 - Include and exclude globs per root
 - Agent-local SQLite state for restart and offline recovery
+- Explicit inventory pass before processing
+- Per-file vault comparison: in-sync, modified, new, vault-missing, or source-missing
+- Existing managed-note adoption to prevent overlaps and duplicate output
 
 ## Knowledge processing
 
@@ -55,6 +58,8 @@ Generated notes are grouped by destination prefix, source device, watched folder
 - Expiring browser sessions, sign-out, CSRF protection, and login throttling
 - Dashboard counts and event stream
 - Device and watched-root status
+- Native **Add folder**, per-folder **Scan**, **View files**, and **Sync changes** controls
+- Green/orange/red comparison indicators and aggregate folder counts
 - One-time device enrollment codes
 - Remote scan command
 - Searchable document table

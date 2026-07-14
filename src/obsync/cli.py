@@ -137,11 +137,27 @@ def _load_runtime(args: argparse.Namespace) -> AgentRuntime:
 
 
 def _agent_scan(args: argparse.Namespace) -> int:
-    result = asyncio.run(_load_runtime(args).scan_all())
+    result = asyncio.run(_load_runtime(args).inventory_all())
+    for name, stats in result.items():
+        counts = stats.get("counts", {})
+        print(f"{name}: {stats['files']} files compared")
+        print(
+            f"  {counts.get('in-sync', 0)} in Obsidian, "
+            f"{counts.get('modified', 0)} modified, {counts.get('new', 0)} new, "
+            f"{counts.get('vault-missing', 0) + counts.get('source-missing', 0)} missing, "
+            f"{counts.get('checking', 0)} checking vault"
+        )
+    return 1 if any(stats["errors"] for stats in result.values()) else 0
+
+
+def _agent_sync(args: argparse.Namespace) -> int:
+    runtime = _load_runtime(args)
+    asyncio.run(runtime.inventory_all())
+    result = asyncio.run(runtime.sync_pending_all())
     for name, stats in result.items():
         print(
-            f"{name}: {stats['synced']} synced, {stats['unchanged']} unchanged, "
-            f"{stats['errors']} errors, {stats['files']} files"
+            f"{name}: {stats['synced']} synced, {stats['missing']} missing, "
+            f"{stats['errors']} errors"
         )
     return 1 if any(stats["errors"] for stats in result.values()) else 0
 
@@ -207,9 +223,13 @@ def build_parser() -> argparse.ArgumentParser:
     listing.add_argument("--config", default="", help="Agent configuration path")
     listing.set_defaults(handler=_agent_list)
 
-    scan = agent_commands.add_parser("scan", help="Run one complete reconciliation")
+    scan = agent_commands.add_parser("scan", help="Compare watched folders with Obsidian")
     scan.add_argument("--config", default="", help="Agent configuration path")
     scan.set_defaults(handler=_agent_scan)
+
+    sync = agent_commands.add_parser("sync", help="Sync new, modified, or missing notes")
+    sync.add_argument("--config", default="", help="Agent configuration path")
+    sync.set_defaults(handler=_agent_sync)
 
     run = agent_commands.add_parser("run", help="Watch continuously")
     run.add_argument("--config", default="", help="Agent configuration path")

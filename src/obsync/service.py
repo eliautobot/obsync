@@ -18,6 +18,7 @@ from .extractors import extract_document
 from .llm import Analysis, LLMAnalyzer, LLMConfig
 from .markdown import (
     is_managed_note,
+    managed_note_metadata,
     merge_preserving_manual,
     render_markdown,
     set_source_status,
@@ -60,6 +61,7 @@ class ObsyncService:
         self.db = db or Database(settings.database_path)
         self.db.initialize()
         self._ensure_defaults()
+        self._inventory_vault_indexes: dict[str, dict[tuple[str, str, str], dict[str, str]]] = {}
         self._dummy_password_hash = hash_password("obsync-invalid-password")
         self._bootstrap_admin_from_env()
 
@@ -536,7 +538,17 @@ class ObsyncService:
         sql = """
             SELECT r.*, a.name AS agent_name,
                    count(d.id) AS document_count,
-                   sum(CASE WHEN d.status = 'error' THEN 1 ELSE 0 END) AS error_count
+                   sum(CASE WHEN d.status = 'error' THEN 1 ELSE 0 END) AS error_count,
+                   sum(CASE WHEN d.comparison_status = 'in-sync' THEN 1 ELSE 0 END)
+                       AS in_sync_count,
+                   sum(CASE WHEN d.comparison_status = 'modified' THEN 1 ELSE 0 END)
+                       AS modified_count,
+                   sum(CASE WHEN d.comparison_status = 'new' THEN 1 ELSE 0 END)
+                       AS new_count,
+                   sum(CASE WHEN d.comparison_status IN ('vault-missing', 'source-missing')
+                            THEN 1 ELSE 0 END) AS missing_count,
+                   sum(CASE WHEN d.comparison_status = 'checking' THEN 1 ELSE 0 END)
+                       AS checking_count
             FROM roots r
             JOIN agents a ON a.id = r.agent_id
             LEFT JOIN documents d ON d.root_id = r.id
@@ -547,6 +559,256 @@ class ObsyncService:
             params = (agent_id,)
         sql += " GROUP BY r.id ORDER BY a.name COLLATE NOCASE, r.name COLLATE NOCASE"
         return [self._decode_root(row) for row in self.db.query_all(sql, params)]
+
+    def _local_vault_index(self) -> dict[tuple[str, str, str], dict[str, str]]:
+        index: dict[tuple[str, str, str], dict[str, str]] = {}
+        if not self.settings.vault_path.is_dir():
+            return index
+        for path in self.settings.vault_path.rglob("*.md"):
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                metadata = managed_note_metadata(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError):
+                continue
+            if not metadata:
+                continue
+            key = (
+                metadata["obsync_machine"].casefold(),
+                metadata["obsync_root"].casefold(),
+                metadata["obsync_source"],
+            )
+            metadata["destination_path"] = path.relative_to(self.settings.vault_path).as_posix()
+            index.setdefault(key, metadata)
+        return index
+
+    @staticmethod
+    def _identity_key(agent_name: str, root_name: str, source_path: str) -> tuple[str, str, str]:
+        return (agent_name.casefold(), root_name.casefold(), source_path)
+
+    def _compare_local_document(
+        self,
+        document: dict[str, Any],
+        *,
+        agent_name: str,
+        root_name: str,
+        vault_index: dict[tuple[str, str, str], dict[str, str]],
+    ) -> tuple[str, str, str]:
+        destination = str(document.get("destination_path") or "")
+        metadata: dict[str, str] | None = None
+        if destination:
+            note_exists = False
+            try:
+                note_path = safe_vault_path(self.settings.vault_path, destination)
+                if note_path.is_file():
+                    note_exists = True
+                    metadata = managed_note_metadata(note_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, ValueError):
+                metadata = None
+            if metadata is None:
+                return ("modified" if note_exists else "vault-missing"), destination, ""
+        else:
+            metadata = vault_index.get(
+                self._identity_key(agent_name, root_name, str(document["source_path"]))
+            )
+            if not metadata:
+                return "new", "", ""
+            destination = metadata["destination_path"]
+
+        note_hash = str(metadata.get("obsync_hash", ""))
+        observed_hash = str(document.get("observed_hash") or document.get("source_hash") or "")
+        state = "in-sync" if note_hash and note_hash == observed_hash else "modified"
+        return state, destination, note_hash
+
+    def inventory_files(
+        self,
+        *,
+        agent: dict[str, Any],
+        root_id: str,
+        scan_id: str,
+        items: list[dict[str, Any]],
+        complete: bool = False,
+    ) -> dict[str, Any]:
+        root = self.db.query_one(
+            "SELECT * FROM roots WHERE id = ? AND agent_id = ?", (root_id, agent["id"])
+        )
+        if not root or not root["enabled"]:
+            raise ValueError("Watched folder is unknown or disabled")
+        if not scan_id or len(scan_id) > 100:
+            raise ValueError("Inventory scan id is invalid")
+        now = utc_now()
+        local_mode = self.db.get_setting("vault_mode", "local") == "local"
+        if local_mode:
+            if scan_id not in self._inventory_vault_indexes:
+                if len(self._inventory_vault_indexes) >= 8:
+                    self._inventory_vault_indexes.pop(next(iter(self._inventory_vault_indexes)))
+                self._inventory_vault_indexes[scan_id] = self._local_vault_index()
+            vault_index = self._inventory_vault_indexes[scan_id]
+        else:
+            vault_index = {}
+
+        for item in items:
+            source_path = safe_relative_path(str(item.get("source_path", ""))).as_posix()
+            observed_hash = str(item.get("sha256", "")).lower()
+            if len(observed_hash) != 64 or any(c not in "0123456789abcdef" for c in observed_hash):
+                raise ValueError(f"Inventory hash is invalid for {source_path}")
+            observed_mtime = max(0, int(item.get("source_mtime_ns", 0)))
+            observed_size = max(0, int(item.get("source_size", 0)))
+            existing = self.db.query_one(
+                "SELECT * FROM documents WHERE agent_id = ? AND root_id = ? AND source_path = ?",
+                (agent["id"], root_id, source_path),
+            )
+            if existing:
+                if existing["missing"]:
+                    comparison = (
+                        "modified"
+                        if existing["source_hash"] and existing["source_hash"] != observed_hash
+                        else "checking"
+                        if not local_mode
+                        else "in-sync"
+                    )
+                elif not existing["source_hash"]:
+                    comparison = "new"
+                elif existing["source_hash"] != observed_hash:
+                    comparison = "modified"
+                else:
+                    comparison = "checking" if not local_mode else "in-sync"
+                self.db.execute(
+                    """
+                    UPDATE documents SET observed_hash = ?, observed_mtime_ns = ?,
+                        observed_size = ?, inventory_scan_id = ?, inventory_seen_at = ?,
+                        comparison_status = ?, missing = 0, updated_at = ? WHERE id = ?
+                    """,
+                    (
+                        observed_hash,
+                        observed_mtime,
+                        observed_size,
+                        scan_id,
+                        now,
+                        comparison,
+                        now,
+                        existing["id"],
+                    ),
+                )
+                document_id = existing["id"]
+            else:
+                document_id = str(uuid.uuid4())
+                self.db.execute(
+                    """
+                    INSERT INTO documents(
+                        id, agent_id, root_id, source_path, source_name,
+                        observed_hash, observed_mtime_ns, observed_size,
+                        inventory_scan_id, inventory_seen_at, status, comparison_status,
+                        first_seen_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'discovered', 'new', ?, ?, ?)
+                    """,
+                    (
+                        document_id,
+                        agent["id"],
+                        root_id,
+                        source_path,
+                        Path(source_path).name,
+                        observed_hash,
+                        observed_mtime,
+                        observed_size,
+                        scan_id,
+                        now,
+                        now,
+                        now,
+                        now,
+                    ),
+                )
+
+            if local_mode:
+                document = self.db.query_one("SELECT * FROM documents WHERE id = ?", (document_id,))
+                assert document is not None
+                comparison, destination, note_hash = self._compare_local_document(
+                    document,
+                    agent_name=str(agent["name"]),
+                    root_name=str(root["name"]),
+                    vault_index=vault_index,
+                )
+                values: list[Any] = [comparison, destination, now]
+                source_hash_sql = ""
+                if note_hash and not document["source_hash"]:
+                    source_hash_sql = ", source_hash = ?, status = 'synced', processed_at = ?"
+                    values.extend([note_hash, now])
+                values.append(document_id)
+                self.db.execute(
+                    f"""
+                    UPDATE documents SET comparison_status = ?, destination_path = ?,
+                        updated_at = ? {source_hash_sql} WHERE id = ?
+                    """,
+                    values,
+                )
+
+        audit_commands: list[str] = []
+        if complete:
+            unseen = self.db.query_all(
+                """
+                SELECT source_path FROM documents
+                WHERE root_id = ? AND inventory_scan_id != ? AND missing = 0
+                """,
+                (root_id, scan_id),
+            )
+            for row in unseen:
+                self.mark_missing(agent["id"], root_id, row["source_path"])
+            self.db.execute(
+                "UPDATE roots SET file_count = ?, last_scan_at = ?, updated_at = ? WHERE id = ?",
+                (
+                    self.db.query_one(
+                        "SELECT count(*) AS count FROM documents "
+                        "WHERE root_id = ? AND inventory_scan_id = ?",
+                        (root_id, scan_id),
+                    )["count"],
+                    now,
+                    now,
+                    root_id,
+                ),
+            )
+            if not local_mode:
+                vault_agent = self._remote_vault_agent()
+                documents = self.db.query_all(
+                    """
+                    SELECT id, source_path, observed_hash, destination_path
+                    FROM documents WHERE root_id = ? AND inventory_scan_id = ?
+                    ORDER BY source_path
+                    """,
+                    (root_id, scan_id),
+                )
+                for start in range(0, len(documents), 100):
+                    command = self.queue_command(
+                        vault_agent["id"],
+                        "audit_vault",
+                        {
+                            "source_agent": agent["name"],
+                            "root_name": root["name"],
+                            "documents": documents[start : start + 100],
+                        },
+                    )
+                    audit_commands.append(command["id"])
+            self.db.add_event(
+                "root.inventoried",
+                f"Compared {root['name']} with the Obsidian vault",
+                agent_id=agent["id"],
+                root_id=root_id,
+            )
+            self._inventory_vault_indexes.pop(scan_id, None)
+
+        counts = self.db.query_all(
+            """
+            SELECT comparison_status, count(*) AS count FROM documents
+            WHERE root_id = ? GROUP BY comparison_status
+            """,
+            (root_id,),
+        )
+        return {
+            "root_id": root_id,
+            "scan_id": scan_id,
+            "complete": complete,
+            "counts": {row["comparison_status"]: row["count"] for row in counts},
+            "audit_commands": audit_commands,
+        }
 
     def server_info(self) -> dict[str, Any]:
         in_container = Path("/.dockerenv").exists() or Path("/run/.containerenv").exists()
@@ -723,13 +985,27 @@ class ObsyncService:
                 existing["source_path"] = source_rel
                 existing["source_name"] = Path(source_rel).name
 
-        if existing and existing["source_hash"] == actual_hash and not existing["missing"]:
+        if (
+            existing
+            and existing["source_hash"] == actual_hash
+            and not existing["missing"]
+            and existing["comparison_status"] == "in-sync"
+        ):
             self.db.execute(
                 """
-                UPDATE documents SET source_mtime_ns = ?, source_size = ?, updated_at = ?
+                UPDATE documents SET source_mtime_ns = ?, source_size = ?, observed_hash = ?,
+                    observed_mtime_ns = ?, observed_size = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (source_mtime_ns, source_size, utc_now(), existing["id"]),
+                (
+                    source_mtime_ns,
+                    source_size,
+                    actual_hash,
+                    source_mtime_ns,
+                    source_size,
+                    utc_now(),
+                    existing["id"],
+                ),
             )
             return {**self._decode_document(existing), "result": "unchanged"}
 
@@ -739,17 +1015,28 @@ class ObsyncService:
             self.db.execute(
                 """
                 UPDATE documents SET source_mtime_ns = ?, source_size = ?, source_hash = ?,
+                    observed_hash = ?, observed_mtime_ns = ?, observed_size = ?,
                     status = 'processing', missing = 0, error = '', updated_at = ? WHERE id = ?
                 """,
-                (source_mtime_ns, source_size, actual_hash, now, document_id),
+                (
+                    source_mtime_ns,
+                    source_size,
+                    actual_hash,
+                    actual_hash,
+                    source_mtime_ns,
+                    source_size,
+                    now,
+                    document_id,
+                ),
             )
         else:
             self.db.execute(
                 """
                 INSERT INTO documents(
                     id, agent_id, root_id, source_path, source_name, source_mtime_ns,
-                    source_size, source_hash, status, first_seen_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?, ?)
+                    source_size, source_hash, observed_hash, observed_mtime_ns, observed_size,
+                    status, comparison_status, first_seen_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', 'new', ?, ?, ?)
                 """,
                 (
                     document_id,
@@ -760,6 +1047,9 @@ class ObsyncService:
                     source_mtime_ns,
                     source_size,
                     actual_hash,
+                    actual_hash,
+                    source_mtime_ns,
+                    source_size,
                     now,
                     now,
                     now,
@@ -825,7 +1115,8 @@ class ObsyncService:
                 """
                 UPDATE documents SET mime_type = ?, destination_path = ?, title = ?, category = ?,
                     tags_json = ?, summary = ?, analysis_json = ?, status = ?,
-                    llm_status = ?, confidence = ?, needs_review = ?, missing = 0, error = '',
+                    comparison_status = ?, llm_status = ?, confidence = ?, needs_review = ?,
+                    missing = 0, error = '',
                     processed_at = ?, updated_at = ? WHERE id = ?
                 """,
                 (
@@ -837,6 +1128,11 @@ class ObsyncService:
                     analysis.summary,
                     json.dumps(analysis.as_dict(), ensure_ascii=False),
                     status,
+                    "in-sync"
+                    if not remote_vault
+                    else existing.get("comparison_status", "new")
+                    if existing
+                    else "new",
                     "analyzed" if analysis.provider != "rules" else "rules",
                     analysis.confidence,
                     int(needs_review),
@@ -919,7 +1215,11 @@ class ObsyncService:
                     self._atomic_write(note_path, updated)
         now = utc_now()
         self.db.execute(
-            "UPDATE documents SET missing = 1, updated_at = ? WHERE id = ?", (now, document["id"])
+            """
+            UPDATE documents SET missing = 1, comparison_status = 'source-missing',
+                updated_at = ? WHERE id = ?
+            """,
+            (now, document["id"]),
         )
         self.db.add_event(
             "document.missing",
@@ -936,6 +1236,8 @@ class ObsyncService:
         self,
         *,
         status: str = "",
+        comparison_status: str = "",
+        root_id: str = "",
         search: str = "",
         review: bool | None = None,
         limit: int = 100,
@@ -946,6 +1248,12 @@ class ObsyncService:
         if status:
             clauses.append("d.status = ?")
             params.append(status)
+        if comparison_status:
+            clauses.append("d.comparison_status = ?")
+            params.append(comparison_status)
+        if root_id:
+            clauses.append("d.root_id = ?")
+            params.append(root_id)
         if search:
             clauses.append("(d.title LIKE ? OR d.source_path LIKE ? OR d.summary LIKE ?)")
             term = f"%{search}%"
@@ -967,6 +1275,22 @@ class ObsyncService:
             [*params, max(1, min(limit, 500)), max(0, offset)],
         )
         return {"items": [self._decode_document(row) for row in rows], "total": count["count"]}
+
+    def pending_root_documents(self, agent_id: str, root_id: str) -> list[dict[str, Any]]:
+        root = self.db.query_one(
+            "SELECT id FROM roots WHERE id = ? AND agent_id = ? AND enabled = 1",
+            (root_id, agent_id),
+        )
+        if not root:
+            raise ValueError("Watched folder is unknown or disabled")
+        return self.db.query_all(
+            """
+            SELECT id, source_path, comparison_status FROM documents
+            WHERE root_id = ? AND comparison_status != 'in-sync'
+            ORDER BY source_path
+            """,
+            (root_id,),
+        )
 
     @staticmethod
     def _decode_document(row: dict[str, Any]) -> dict[str, Any]:
@@ -1032,14 +1356,15 @@ class ObsyncService:
             now = utc_now()
             self.db.execute(
                 """
-                UPDATE documents SET status = ?, error = ?, processed_at = ?, updated_at = ?
-                WHERE id = ?
+                UPDATE documents SET status = ?, error = ?, processed_at = ?, updated_at = ?,
+                    comparison_status = ? WHERE id = ?
                 """,
                 (
                     "synced" if ok else "error",
                     "" if ok else result[:2000],
                     now if ok else None,
                     now,
+                    "in-sync" if ok else "vault-missing",
                     document_id,
                 ),
             )
@@ -1053,6 +1378,46 @@ class ObsyncService:
                 level="info" if ok else "error",
                 agent_id=agent_id,
                 document_id=document_id,
+            )
+        elif command["command"] == "audit_vault" and ok:
+            try:
+                audit_rows = json.loads(result)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("Vault audit returned invalid data") from exc
+            if not isinstance(audit_rows, list):
+                raise ValueError("Vault audit returned invalid data")
+            now = utc_now()
+            for row in audit_rows:
+                if not isinstance(row, dict):
+                    continue
+                audit_document_id = str(row.get("document_id", ""))
+                document = self.db.query_one(
+                    "SELECT * FROM documents WHERE id = ?", (audit_document_id,)
+                )
+                if not document:
+                    continue
+                comparison = str(row.get("comparison_status", ""))
+                if comparison not in {"in-sync", "modified", "new", "vault-missing"}:
+                    continue
+                destination = str(row.get("destination_path", ""))
+                note_hash = str(row.get("note_hash", ""))
+                values: list[Any] = [comparison, destination[:2000], now]
+                source_hash_sql = ""
+                if note_hash and not document["source_hash"]:
+                    source_hash_sql = ", source_hash = ?, status = 'synced', processed_at = ?"
+                    values.extend([note_hash, now])
+                values.append(audit_document_id)
+                self.db.execute(
+                    f"""
+                    UPDATE documents SET comparison_status = ?, destination_path = ?,
+                        updated_at = ? {source_hash_sql} WHERE id = ?
+                    """,
+                    values,
+                )
+            self.db.add_event(
+                "vault.audited",
+                f"Compared {len(audit_rows)} files with the desktop Obsidian vault",
+                agent_id=agent_id,
             )
 
     def overview(self) -> dict[str, Any]:

@@ -112,6 +112,11 @@ CREATE TABLE IF NOT EXISTS documents (
     source_mtime_ns INTEGER NOT NULL DEFAULT 0,
     source_size INTEGER NOT NULL DEFAULT 0,
     source_hash TEXT NOT NULL DEFAULT '',
+    observed_hash TEXT NOT NULL DEFAULT '',
+    observed_mtime_ns INTEGER NOT NULL DEFAULT 0,
+    observed_size INTEGER NOT NULL DEFAULT 0,
+    inventory_scan_id TEXT NOT NULL DEFAULT '',
+    inventory_seen_at TEXT,
     mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
     destination_path TEXT NOT NULL DEFAULT '',
     title TEXT NOT NULL DEFAULT '',
@@ -120,6 +125,7 @@ CREATE TABLE IF NOT EXISTS documents (
     summary TEXT NOT NULL DEFAULT '',
     analysis_json TEXT NOT NULL DEFAULT '{}',
     status TEXT NOT NULL DEFAULT 'queued',
+    comparison_status TEXT NOT NULL DEFAULT 'new',
     llm_status TEXT NOT NULL DEFAULT 'pending',
     confidence REAL NOT NULL DEFAULT 0,
     needs_review INTEGER NOT NULL DEFAULT 0,
@@ -136,7 +142,6 @@ CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status, updated_at 
 CREATE INDEX IF NOT EXISTS idx_documents_review ON documents(needs_review, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(source_hash);
 CREATE INDEX IF NOT EXISTS idx_documents_agent_root ON documents(agent_id, root_id);
-
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     level TEXT NOT NULL,
@@ -192,6 +197,39 @@ class Database:
             }.items():
                 if name not in agent_columns:
                     connection.execute(f"ALTER TABLE agents ADD COLUMN {name} {declaration}")
+            document_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(documents)").fetchall()
+            }
+            for name, declaration in {
+                "observed_hash": "TEXT NOT NULL DEFAULT ''",
+                "observed_mtime_ns": "INTEGER NOT NULL DEFAULT 0",
+                "observed_size": "INTEGER NOT NULL DEFAULT 0",
+                "inventory_scan_id": "TEXT NOT NULL DEFAULT ''",
+                "inventory_seen_at": "TEXT",
+                "comparison_status": "TEXT NOT NULL DEFAULT 'new'",
+            }.items():
+                if name not in document_columns:
+                    connection.execute(f"ALTER TABLE documents ADD COLUMN {name} {declaration}")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_documents_comparison "
+                "ON documents(comparison_status, updated_at DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_documents_inventory "
+                "ON documents(root_id, inventory_scan_id)"
+            )
+            connection.execute(
+                """
+                UPDATE documents
+                SET comparison_status = CASE
+                    WHEN missing = 1 THEN 'source-missing'
+                    WHEN status = 'synced' THEN 'in-sync'
+                    WHEN destination_path = '' THEN 'new'
+                    ELSE comparison_status
+                END
+                WHERE comparison_status = 'new'
+                """
+            )
             enrollment_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(enrollments)").fetchall()
@@ -200,9 +238,9 @@ class Database:
                 connection.execute("ALTER TABLE enrollments ADD COLUMN agent_id TEXT")
             row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
-                connection.execute("INSERT INTO schema_meta(version) VALUES (3)")
-            elif int(row["version"]) < 3:
-                connection.execute("UPDATE schema_meta SET version = 3")
+                connection.execute("INSERT INTO schema_meta(version) VALUES (4)")
+            elif int(row["version"]) < 4:
+                connection.execute("UPDATE schema_meta SET version = 4")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

@@ -33,6 +33,7 @@ The agent runs beside source folders. It can optionally be selected as the singl
 - Missing-source notices
 - Polling for central scan/retry commands
 - Native folder selection for watched roots and an optional vault
+- Source inventory manifests and desktop-vault audits
 - Safe atomic writes restricted to Obsync-managed notes below the selected vault
 
 Every network connection starts from the agent. No inbound port is required on a watched device.
@@ -49,22 +50,24 @@ The server sends extracted text, metadata, and an allowlist of candidate related
 ## Data flow
 
 ```text
-1. OS event or periodic rescan
-2. Agent waits until size and modification time settle
-3. Agent compares local mtime/size/hash ledger
-4. Agent uploads changed file + relative-path manifest
-5. Server checks agent token, root ownership, size, hash, and safe path
-6. Extractor produces bounded plain text
-7. LLM returns structured classification, or rules provide fallback
-8. Server chooses/stabilizes destination and renders Markdown
-9. Server merges the preserved manual section
-10. Server writes atomically under `/vault`, or queues the managed note for the selected desktop vault writer
-11. SQLite ledger and event stream are updated
+1. User adds a folder, an OS event occurs, or periodic reconciliation starts
+2. Agent inventories stable files with relative paths, size, modification time, and SHA-256
+3. Server compares the manifest with its ledger and the active Obsidian vault writer
+4. Existing managed notes are adopted by source identity instead of duplicated
+5. UI reports in-sync, modified, new, vault-missing, and source-missing states
+6. Sync uploads only pending source files
+7. Server checks agent token, root ownership, size, hash, and safe path
+8. Extractor produces bounded plain text
+9. LLM returns structured classification, or rules provide fallback
+10. Server chooses/stabilizes destination and renders Markdown
+11. Server merges the preserved manual section
+12. Server writes atomically under `/vault`, or queues the managed note for the selected desktop vault writer
+13. SQLite ledger, comparison state, and event stream are updated
 ```
 
 ## Identity and idempotency
 
-A source document is identified by `(agent_id, root_id, relative_path)`. Each gets an immutable UUID. Content SHA-256 makes repeated events idempotent. Rename hints let the server update the existing row and note rather than creating a new identity.
+A source document is identified by `(agent_id, root_id, relative_path)`. Each gets an immutable UUID. Content SHA-256 makes repeated events idempotent. Rename hints let the server update the existing row and note rather than creating a new identity. If the processing database is rebuilt, a vault audit matches managed notes by source computer, watched-root name, and relative path before creating anything new.
 
 The server keeps the first safe destination path after classification. Later content changes update that path in place. A future explicit reorganization feature may move notes with backlink-aware review, but routine synchronization does not.
 

@@ -328,6 +328,103 @@ function statCard(label, value, icon, style = "") {
   return `<article class="stat-card ${style}"><span class="label">${label}</span><span class="stat-icon">${icon}</span><strong>${value}</strong></article>`;
 }
 
+const comparisonMeta = {
+  "in-sync": ["In Obsidian", "good"],
+  modified: ["Modified", "warn"],
+  new: ["New", "bad"],
+  "vault-missing": ["Missing from Obsidian", "bad"],
+  "source-missing": ["Source missing", "bad"],
+  checking: ["Checking vault", "neutral"],
+};
+
+function comparisonBadge(status, count = null) {
+  const [label, style] = comparisonMeta[status] || [status || "Unknown", "neutral"];
+  const suffix = count === null ? "" : ` ${count}`;
+  return `<span class="comparison-badge ${style}"><i></i>${escapeHtml(label)}${suffix}</span>`;
+}
+
+async function pollCommand(commandId, message = "Working on the desktop…") {
+  toast(message);
+  for (let attempt = 0; attempt < 180; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    const command = await api(`/api/v1/admin/commands/${commandId}`);
+    if (command.status === "completed") return command;
+    if (command.status === "failed") throw new Error(command.result || "Desktop command failed.");
+  }
+  throw new Error("The desktop did not finish the request. Make sure its Obsync agent is running.");
+}
+
+async function waitForRootStable(rootId) {
+  for (let attempt = 0; attempt < 90; attempt += 1) {
+    const data = await api(`/api/v1/admin/documents?root_id=${encodeURIComponent(rootId)}&limit=500`);
+    const busy = data.items.some((item) => ["checking"].includes(item.comparison_status)
+      || ["processing", "pending-write"].includes(item.status));
+    if (!busy) return data;
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+  throw new Error("The vault comparison is still pending. Make sure the selected vault computer is online.");
+}
+
+async function openAddFolder(agent) {
+  const modal = $("#modal");
+  $("#modal-title").textContent = "Add folder to sync";
+  $("#modal-body").innerHTML = `
+    <p class="modal-note">The folder browser will open on <strong>${escapeHtml(agent.name)}</strong>. Obsync scans the folder first and compares every file with the vault before anything is written.</p>
+    <form id="add-folder-form">
+      <div class="field"><label for="folder-name">Folder name <small>(optional)</small></label><input id="folder-name" placeholder="Client files"></div>
+      <div class="field"><label for="folder-destination">Obsidian destination</label><input id="folder-destination" value="Obsync" required><small>Generated notes stay under this folder in the vault.</small></div>
+      <p class="inline-status">After selecting the folder, red files are new or missing, orange files changed, and green files already match Obsidian.</p>
+      <div class="modal-actions"><button class="secondary" type="button" id="folder-cancel">Cancel</button><button class="primary" type="submit">Open folder browser</button></div>
+    </form>`;
+  modal.showModal();
+  $("#folder-cancel").addEventListener("click", () => modal.close());
+  $("#add-folder-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const submit = $('#add-folder-form button[type="submit"]');
+    submit.disabled = true;
+    try {
+      const command = await api(`/api/v1/admin/agents/${agent.id}/select-source`, {
+        method: "POST",
+        body: {
+          name: $("#folder-name").value.trim(),
+          destination: $("#folder-destination").value.trim() || "Obsync",
+        },
+      });
+      $("#modal-body").innerHTML = `<p class="inline-status"><span class="connection-wait"><i></i>Choose the folder on ${escapeHtml(agent.name)}. Obsync will scan and compare it immediately.</span></p><p class="modal-note">Keep the Obsync agent running on that computer while the picker is open.</p>`;
+      const completed = await pollCommand(command.id, `Folder browser requested on ${agent.name}.`);
+      const result = JSON.parse(completed.result || "{}");
+      const rootId = result.inventory?.root_id;
+      if (rootId) await waitForRootStable(rootId);
+      modal.close();
+      toast("Folder added and compared with Obsidian.");
+      await navigate("sources");
+    } catch (error) {
+      modal.close();
+      toast(error.message, true);
+    } finally {
+      submit.disabled = false;
+    }
+  });
+}
+
+async function openRootFiles(root) {
+  const modal = $("#modal");
+  $("#modal-title").textContent = root.name;
+  $("#modal-body").innerHTML = '<div class="skeleton"></div>';
+  modal.showModal();
+  try {
+    const data = await api(`/api/v1/admin/documents?root_id=${encodeURIComponent(root.id)}&limit=500`);
+    const rows = data.items.map((doc) => `<div class="inventory-file">
+      ${comparisonBadge(doc.comparison_status)}
+      <div><strong>${escapeHtml(doc.source_name)}</strong><small title="${escapeHtml(doc.source_path)}">${escapeHtml(doc.source_path)}</small></div>
+    </div>`).join("");
+    $("#modal-body").innerHTML = `${rows || '<div class="empty">No files found in the latest scan.</div>'}
+      <div class="status-legend">${comparisonBadge("in-sync")}${comparisonBadge("modified")}${comparisonBadge("new")}${comparisonBadge("vault-missing")}</div>`;
+  } catch (error) {
+    $("#modal-body").innerHTML = `<p class="form-error">${escapeHtml(error.message)}</p>`;
+  }
+}
+
 async function renderOverview() {
   const data = await api("/api/v1/admin/overview");
   state.overview = data;
@@ -366,12 +463,23 @@ async function renderSources() {
   state.roots = rootData.items;
   const cards = state.agents.map((agent) => {
     const roots = state.roots.filter((root) => root.agent_id === agent.id);
-    const rootRows = roots.map((root) => `<div class="root-row"><strong>${escapeHtml(root.name)} · ${root.document_count || 0} docs</strong><code>${escapeHtml(root.path)}</code></div>`).join("");
+    const rootRows = roots.map((root) => `<div class="root-row inventory-root">
+      <div class="root-title"><strong>${escapeHtml(root.name)}</strong><span>${root.file_count || root.document_count || 0} files</span></div>
+      <code>${escapeHtml(root.path)}</code>
+      <div class="root-comparison">
+        ${comparisonBadge("in-sync", root.in_sync_count || 0)}
+        ${comparisonBadge("modified", root.modified_count || 0)}
+        ${comparisonBadge("new", root.new_count || 0)}
+        ${comparisonBadge("vault-missing", root.missing_count || 0)}
+        ${root.checking_count ? comparisonBadge("checking", root.checking_count) : ""}
+      </div>
+      <div class="root-actions"><button class="quiet view-root" data-root="${root.id}">View files</button><button class="quiet scan-root" data-root="${root.id}">Scan</button><button class="secondary sync-root" data-root="${root.id}">Sync changes</button></div>
+    </div>`).join("");
     return `<article class="source-card">
       <div class="source-top"><span class="device-icon">${agent.os_name === "Windows" ? "▣" : "◫"}</span><div><h3>${escapeHtml(agent.name)}</h3><p>${escapeHtml(agent.os_name)} · seen ${relativeTime(agent.last_seen_at)}</p>${agent.vault_ready ? '<span class="device-role">VAULT WRITER READY</span>' : ""}</div><span class="status-pill ${agent.status}">${agent.status}</span></div>
       ${rootRows || '<div class="root-row">No watched folders registered yet.</div>'}
       ${agent.vault_path ? `<div class="root-row"><strong>Obsidian vault</strong><code>${escapeHtml(agent.vault_path)}</code></div>` : ""}
-      <div class="source-stats"><span>${agent.document_count || 0} documents</span><button class="quiet scan-device" data-agent="${agent.id}">Scan now</button></div>
+      <div class="source-stats"><span>${agent.document_count || 0} files indexed</span><button class="primary add-folder" data-agent="${agent.id}">+ Add folder</button></div>
     </article>`;
   }).join("");
   const serverPath = server.vault_host_path || server.vault_path;
@@ -380,11 +488,32 @@ async function renderSources() {
     <div class="root-row"><strong>Server vault mount</strong><code>${escapeHtml(serverPath)}</code></div>
     <div class="source-stats"><span>Processes files and coordinates every desktop</span></div>
   </article>`;
-  $("#content").innerHTML = `<div class="section-head"><div><h2>Computers</h2><p>The Obsync server is active automatically. Add a desktop agent only for folders or an Obsidian vault on another computer.</p></div><button class="primary" id="add-device">+ Add another computer</button></div><div class="source-grid">${serverCard}${cards}</div>`;
+  const emptyHelp = state.agents.length ? "" : '<div class="panel source-help"><strong>1 connected computer means this Obsync server.</strong><p>Pair the Windows, Linux, or macOS computer that contains your source folders. It will then appear here and in the vault computer selector.</p></div>';
+  $("#content").innerHTML = `<div class="section-head"><div><h2>Computers and folders</h2><p>Add folders, scan them against Obsidian, inspect differences, then sync only what changed.</p></div><button class="primary" id="add-device">+ Add another computer</button></div>${emptyHelp}<div class="source-grid">${serverCard}${cards}</div>`;
   $("#add-device").addEventListener("click", openEnrollment);
-  $$(".scan-device").forEach((button) => button.addEventListener("click", async () => {
-    try { await api(`/api/v1/admin/agents/${button.dataset.agent}/scan`, { method: "POST" }); toast("Scan queued. The device will begin within 30 seconds."); }
-    catch (error) { toast(error.message, true); }
+  $$(".add-folder").forEach((button) => button.addEventListener("click", () => {
+    const agent = state.agents.find((item) => item.id === button.dataset.agent);
+    if (agent?.status !== "online") { toast("That computer is offline. Start its Obsync agent first.", true); return; }
+    openAddFolder(agent);
+  }));
+  $$(".view-root").forEach((button) => button.addEventListener("click", () => {
+    openRootFiles(state.roots.find((root) => root.id === button.dataset.root));
+  }));
+  $$(".scan-root").forEach((button) => button.addEventListener("click", async () => {
+    try {
+      const command = await api(`/api/v1/admin/roots/${button.dataset.root}/scan`, { method: "POST" });
+      await pollCommand(command.id, "Comparing folder with Obsidian…");
+      await waitForRootStable(button.dataset.root);
+      toast("Scan complete."); await navigate("sources");
+    } catch (error) { toast(error.message, true); }
+  }));
+  $$(".sync-root").forEach((button) => button.addEventListener("click", async () => {
+    try {
+      const command = await api(`/api/v1/admin/roots/${button.dataset.root}/sync`, { method: "POST" });
+      await pollCommand(command.id, "Syncing new and modified files…");
+      await waitForRootStable(button.dataset.root);
+      toast("Folder sync complete."); await navigate("sources");
+    } catch (error) { toast(error.message, true); }
   }));
 }
 
@@ -451,13 +580,13 @@ async function openEnrollment() {
         `& $exe agent pair --server ${powerShellQuote(server)} --code ${powerShellQuote(enrollment.code)} --name ${powerShellQuote(label)}`,
       ];
       if (hasVault) lines.push("& $exe agent set-vault --browse");
-      lines.push("& $exe agent add-folder --browse", "& $exe agent run");
+      lines.push("& $exe agent run");
       const command = lines.join("\n");
       $("#modal-body").innerHTML = `
         <p class="modal-note">This one-time code expires in 20 minutes.</p><div class="pair-code">${escapeHtml(enrollment.code)}</div>
         <div class="pair-steps">
           <div class="pair-step"><p><strong>1.</strong> On the Windows PC, open PowerShell.</p></div>
-          <div class="pair-step"><p><strong>2.</strong> Paste this complete setup command. It downloads the agent, pairs it, opens a folder browser, and starts syncing.</p><div class="code-block" id="pair-command">${escapeHtml(command)}</div><button class="secondary copy-command" id="copy-pair-command" type="button">Copy setup command</button></div>
+          <div class="pair-step"><p><strong>2.</strong> Paste this complete setup command. It downloads the agent, pairs this computer, and keeps it connected.</p><div class="code-block" id="pair-command">${escapeHtml(command)}</div><button class="secondary copy-command" id="copy-pair-command" type="button">Copy setup command</button></div>
           <div class="pair-step"><p><strong>3.</strong> Keep that PowerShell window open during this alpha release.</p></div>
         </div>
         <p class="inline-status" id="pairing-status"><span class="connection-wait"><i></i>Waiting for ${escapeHtml(label)} to connect…</span></p>
@@ -474,16 +603,16 @@ function statusClass(status) {
 
 async function renderDocuments(reviewOnly) {
   const title = reviewOnly ? "Review queue" : "Knowledge documents";
-  $("#content").innerHTML = `<div class="section-head"><div><h2>${title}</h2><p>${reviewOnly ? "Approve classifications that fell below your confidence threshold." : "Every generated note and its current sync state."}</p></div></div><div class="toolbar"><div class="search"><input id="doc-search" placeholder="Search title, source, or summary…"></div><select id="doc-status"><option value="">All states</option><option value="synced">Synced</option><option value="error">Errors</option><option value="processing">Processing</option></select></div><div id="doc-results"><div class="skeleton"></div></div>`;
+  $("#content").innerHTML = `<div class="section-head"><div><h2>${title}</h2><p>${reviewOnly ? "Approve classifications that fell below your confidence threshold." : "Every source file and how it compares with Obsidian."}</p></div></div><div class="toolbar"><div class="search"><input id="doc-search" placeholder="Search title, source, or summary…"></div><select id="doc-status"><option value="">All comparisons</option><option value="in-sync">In Obsidian</option><option value="modified">Modified</option><option value="new">New</option><option value="vault-missing">Missing from Obsidian</option><option value="source-missing">Source missing</option></select></div><div id="doc-results"><div class="skeleton"></div></div>`;
   const load = async () => {
-    const query = new URLSearchParams({ search: $("#doc-search").value, status: $("#doc-status").value, limit: "200" });
+    const query = new URLSearchParams({ search: $("#doc-search").value, comparison_status: $("#doc-status").value, limit: "200" });
     if (reviewOnly) query.set("review", "true");
     const data = await api(`/api/v1/admin/documents?${query}`);
     const rows = data.items.map((doc) => `<tr>
       <td><div class="doc-title">${escapeHtml(doc.title || doc.source_name)}</div><div class="doc-path" title="${escapeHtml(doc.source_path)}">${escapeHtml(doc.source_path)}</div></td>
       <td>${escapeHtml(doc.agent_name)}<br><small>${escapeHtml(doc.root_name)}</small></td>
       <td>${(doc.tags || []).slice(0, 4).map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join("")}</td>
-      <td><span class="state ${statusClass(doc.status)}">${escapeHtml(doc.status)}</span>${doc.missing ? '<br><small>source missing</small>' : ""}</td>
+      <td>${comparisonBadge(doc.comparison_status)}<br><small>${escapeHtml(doc.status)}</small></td>
       <td>${Math.round((doc.confidence || 0) * 100)}%</td>
       <td>${reviewOnly ? `<button class="quiet approve" data-id="${doc.id}">Approve</button>` : ""}${doc.status === "error" ? `<button class="quiet retry" data-id="${doc.id}">Retry</button>` : ""}</td>
     </tr>`).join("");
@@ -510,7 +639,7 @@ async function renderSettings() {
   state.agents = agentData.items;
   const enabled = settings.llm_enabled === "true";
   const vaultMode = settings.vault_mode || "local";
-  const vaultOptions = state.agents.map((agent) => `<option value="${agent.id}" ${agent.id === settings.vault_agent_id ? "selected" : ""}>${escapeHtml(agent.name)} — ${agent.vault_ready ? escapeHtml(agent.vault_path) : "vault not selected"}</option>`).join("");
+  const vaultOptions = state.agents.map((agent) => `<option value="${agent.id}" ${agent.id === settings.vault_agent_id ? "selected" : ""}>${escapeHtml(agent.name)} — ${agent.status}${agent.vault_ready ? ` — ${escapeHtml(agent.vault_path)}` : ""}</option>`).join("");
   const hostVault = settings.vault_host_path || settings.vault_path;
   $("#content").innerHTML = `<form class="settings-layout" id="settings-form">
     <section class="settings-card"><h3>Obsidian vault</h3><p>Choose where Obsync writes generated Markdown. The server mount is the default; a paired desktop can write directly to a vault on Windows or another computer.</p>
@@ -522,9 +651,9 @@ async function renderSettings() {
         <div class="field"><label>${settings.runtime === "docker" ? "Host vault folder" : "Vault folder"}</label><input value="${escapeHtml(hostVault)}" disabled><small>${settings.runtime === "docker" ? `Inside Docker this is mounted as ${escapeHtml(settings.vault_path)}. Docker mounts can only be changed when the container is created.` : "This native Obsync process writes directly to this folder."}</small></div>
       </div>
       <div id="agent-vault-settings" hidden>
-        <div class="field"><label for="vault-agent">Computer containing the vault</label><select id="vault-agent"><option value="">Choose a computer…</option>${vaultOptions}</select><small>Select the Windows PC where your Obsidian vault lives, then click Browse. The folder picker opens on that computer.</small></div>
+        <div class="field"><label for="vault-agent">Computer containing the vault</label><select id="vault-agent"><option value="">${state.agents.length ? "Choose a paired computer…" : "No desktop computers paired"}</option>${vaultOptions}</select><small>The Overview computer count includes the Obsync server. A Windows PC appears here only after its desktop agent is paired and connected.</small></div>
         <div class="settings-actions"><button class="secondary" type="button" id="browse-vault">Browse for vault on that computer</button><button class="quiet" type="button" id="add-vault-computer">+ Add computer</button></div>
-        <p class="inline-status" id="vault-agent-status">${state.agents.length ? "Choose a paired computer." : "No desktop computers are connected yet."}</p>
+        <p class="inline-status" id="vault-agent-status">${state.agents.length ? "Choose a paired computer." : "The Obsync server is connected, but no desktop computer is paired yet."}</p>
       </div>
     </section>
     <section class="settings-card"><h3>Local AI organization</h3><p>Use Ollama, LM Studio, or another OpenAI-compatible local server. Obsync keeps syncing with deterministic rules if the model is offline.</p>
