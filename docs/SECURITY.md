@@ -2,7 +2,10 @@
 
 ## Authentication
 
-- First launch creates one administrator username/password account.
+- A fresh server grants temporary passwordless `Admin` access only through a loopback URL on the server host, or from an address explicitly listed in `OBSYNC_LOCAL_SETUP_IPS`.
+- Temporary Admin opens a security prompt immediately and displays a persistent warning until the account is secured.
+- Remote clients receive a setup-required screen and cannot use temporary Admin.
+- Registering a username/password permanently disables temporary Admin and any pre-0.2 administrator token.
 - Passwords are salted and hashed with scrypt; plaintext passwords are not stored.
 - Browser sessions use random, expiring HttpOnly + SameSite cookies.
 - State-changing admin requests require a separate CSRF value.
@@ -15,6 +18,8 @@
 ## Network exposure
 
 The Compose default binds the selected port on all interfaces to support multi-PC use. Run Obsync on a private LAN/VPN or behind an HTTPS reverse proxy. Set `OBSYNC_BIND_IP=127.0.0.1` when remote agents are not needed.
+
+Temporary Admin requires both a local client path and a loopback request target such as `http://localhost:7769`. This prevents a same-host reverse proxy with a public hostname from inheriting passwordless setup access. State-changing temporary-Admin requests are restricted to same-origin browser traffic. `OBSYNC_LOCAL_SETUP_IPS` is an explicit override for headless installations; trust only a specific management IP and remove it immediately after registration.
 
 Do not publish Ollama or LM Studio directly to the Internet. The Obsync server should reach them over the host bridge, LAN, or VPN.
 
@@ -41,7 +46,7 @@ LLMs are not security boundaries. Keep the vault backed up and review generated 
 
 ## Secrets
 
-- Prefer interactive browser setup so no plaintext password remains in deployment configuration.
+- Prefer local interactive browser setup so no plaintext password remains in deployment configuration.
 - Optional `OBSYNC_ADMIN_USERNAME` and `OBSYNC_ADMIN_PASSWORD` values are for unattended first boot only; remove them after the account is created.
 - Set `OBSYNC_SECURE_COOKIES=true` when the UI is served exclusively over HTTPS.
 - Pre-0.2 `OBSYNC_ADMIN_TOKEN` values are accepted only until the one-time username/password migration completes.

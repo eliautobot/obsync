@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import ipaddress
 import os
+import socket
 import uuid
+from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import urlsplit
 
 from fastapi import (
     Depends,
@@ -101,9 +105,15 @@ def require_admin(
         session["_raw_token"] = session_token
         return session
     token = _bearer(authorization)
-    if not service.verify_admin(token):
-        raise HTTPException(status_code=401, detail="Sign in required")
-    return {"legacy": True}
+    if service.verify_admin(token):
+        return {"legacy": True}
+    if not service.has_admin_account() and _is_local_admin_request(request, service.settings):
+        if request.method not in {"GET", "HEAD", "OPTIONS"} and not _same_origin_request(request):
+            raise HTTPException(
+                status_code=403, detail="Cross-site temporary admin request blocked"
+            )
+        return {"temporary": True, "username": "Admin"}
+    raise HTTPException(status_code=401, detail="Sign in required")
 
 
 def require_agent(
@@ -122,6 +132,62 @@ AgentDependency = Annotated[dict[str, Any], Depends(require_agent)]
 
 def _client_ip(request: Request) -> str:
     return request.client.host if request.client else ""
+
+
+@lru_cache(maxsize=1)
+def _container_gateway_ips() -> frozenset[str]:
+    """Return container-host gateway addresses without trusting a normal host's router."""
+    if not (Path("/.dockerenv").exists() or Path("/run/.containerenv").exists()):
+        return frozenset()
+    route_file = Path("/proc/net/route")
+    if not route_file.is_file():
+        return frozenset()
+    gateways: set[str] = set()
+    for line in route_file.read_text(encoding="utf-8", errors="ignore").splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 4 or fields[1] != "00000000":
+            continue
+        try:
+            if int(fields[3], 16) & 2:
+                gateways.add(socket.inet_ntoa(bytes.fromhex(fields[2])[::-1]))
+        except (OSError, ValueError):
+            continue
+    return frozenset(gateways)
+
+
+def _is_local_admin_request(request: Request, settings: Settings) -> bool:
+    client_value = _client_ip(request)
+    try:
+        client_ip = ipaddress.ip_address(client_value)
+    except ValueError:
+        return False
+    if client_value in settings.local_setup_ips:
+        return True
+    if not (client_ip.is_loopback or client_value in _container_gateway_ips()):
+        return False
+    target = (request.url.hostname or "").strip().casefold().rstrip(".")
+    if target == "localhost" or target.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(target).is_loopback
+    except ValueError:
+        return False
+
+
+def _same_origin_request(request: Request) -> bool:
+    if request.headers.get("sec-fetch-site", "").lower() == "cross-site":
+        return False
+    origin = request.headers.get("origin", "").strip()
+    if not origin:
+        return True
+    parsed = urlsplit(origin)
+    expected_port = request.url.port or (443 if request.url.scheme == "https" else 80)
+    actual_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return (
+        parsed.scheme.lower() == request.url.scheme.lower()
+        and (parsed.hostname or "").lower() == (request.url.hostname or "").lower()
+        and actual_port == expected_port
+    )
 
 
 def _set_session_cookies(
@@ -202,16 +268,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"name": "Obsync", "version": __version__, "authentication": "session"}
 
     @app.get("/api/v1/auth/status")
-    async def auth_status() -> dict[str, bool]:
-        return service.setup_status()
+    async def auth_status(request: Request) -> dict[str, bool]:
+        status = service.setup_status()
+        local = _is_local_admin_request(request, settings)
+        return {
+            **status,
+            "account_registered": not status["setup_required"],
+            "temporary_admin_available": status["setup_required"] and local,
+        }
 
     @app.post("/api/v1/auth/setup")
     def auth_setup(payload: SetupRequest, request: Request, response: Response) -> dict[str, Any]:
+        local = _is_local_admin_request(request, settings)
+        if local and not _same_origin_request(request):
+            raise HTTPException(status_code=403, detail="Cross-site account setup blocked")
+        if not local and not settings.admin_token and not service.has_admin_account():
+            raise HTTPException(
+                status_code=403,
+                detail="Create the administrator account from the Obsync server itself",
+            )
         try:
             user = service.create_admin_account(
                 payload.username,
                 payload.password,
                 legacy_token=payload.legacy_token,
+                trusted_local=local,
             )
         except ValueError as exc:
             status = 401 if "token is incorrect" in str(exc) else 400
@@ -232,6 +313,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/v1/auth/login")
     def auth_login(payload: LoginRequest, request: Request, response: Response) -> dict[str, Any]:
         if not service.has_admin_account():
+            if (
+                _is_local_admin_request(request, settings)
+                and payload.username.strip().casefold() == "admin"
+                and not payload.password
+            ):
+                if not _same_origin_request(request):
+                    raise HTTPException(
+                        status_code=403, detail="Cross-site temporary admin login blocked"
+                    )
+                return {"authenticated": True, "username": "Admin", "temporary": True}
             raise HTTPException(status_code=409, detail="Complete admin account setup first")
         try:
             session = service.login_admin(
@@ -273,8 +364,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def admin_session(session: AdminDependency) -> dict[str, Any]:
         return {
             "authenticated": True,
-            "username": session.get("username", "admin"),
+            "username": session.get("username", "Admin"),
             "legacy": bool(session.get("legacy")),
+            "temporary": bool(session.get("temporary")),
+            "account_registered": not bool(session.get("temporary") or session.get("legacy")),
         }
 
     @app.get("/api/v1/admin/overview")

@@ -59,7 +59,9 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-Open `http://SERVER_IP:7769` and create the administrator username and password. The first browser to reach a fresh server can create the account, so complete setup immediately on a trusted private network. The default Compose file exposes port `7769`; use a private LAN/VPN or an HTTPS reverse proxy for remote access.
+On the computer running Obsync, open `http://localhost:7769`. A fresh installation opens automatically as temporary **Admin** with no password and immediately asks you to register a local username and password. You may choose **Continue for now**, but a security warning remains visible and other computers cannot use the temporary login.
+
+After the administrator account is secured, open `http://SERVER_IP:7769` from other computers and sign in normally. The default Compose file exposes port `7769`; use a private LAN/VPN or an HTTPS reverse proxy for remote access.
 
 Example `.env` additions:
 
@@ -76,9 +78,9 @@ Passwords are hashed with scrypt in `/data/obsync.db`. Browser sessions use expi
 docker compose exec -it obsync obsync admin reset-password --username admin
 ```
 
-For unattended deployments, `OBSYNC_ADMIN_USERNAME` and `OBSYNC_ADMIN_PASSWORD` can create the first account. Remove both values from `.env` after the first successful start. Set `OBSYNC_SECURE_COOKIES=true` when the UI is served exclusively over HTTPS.
+For headless or unattended deployments, `OBSYNC_ADMIN_USERNAME` and `OBSYNC_ADMIN_PASSWORD` can create the first account. Remove both values from `.env` after the first successful start. As a short-lived alternative, `OBSYNC_LOCAL_SETUP_IPS` can trust a comma-separated management IP for initial setup; remove it immediately after securing the account. Set `OBSYNC_SECURE_COOKIES=true` when the UI is served exclusively over HTTPS.
 
-Upgrading from v0.1.0 is automatic. Obsync asks for the old admin token once, then disables token access after the username/password account is created.
+Upgrading from v0.1.0 is automatic. Local setup can replace the token directly; a remote browser asks for the old admin token once. Token access is disabled after the username/password account is created.
 
 ## Add a watched computer
 

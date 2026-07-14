@@ -14,6 +14,8 @@ services:
       # Pre-0.2 migration only. Ignored after a username/password account exists.
       OBSYNC_ADMIN_TOKEN: "${OBSYNC_ADMIN_TOKEN:-}"
       OBSYNC_SECURE_COOKIES: "${OBSYNC_SECURE_COOKIES:-false}"
+      # Headless setup override only. Remove immediately after account registration.
+      OBSYNC_LOCAL_SETUP_IPS: "${OBSYNC_LOCAL_SETUP_IPS:-}"
       OBSYNC_DATA_DIR: /data
       OBSYNC_VAULT_PATH: /vault
       OBSYNC_MAX_UPLOAD_MB: "${OBSYNC_MAX_UPLOAD_MB:-100}"

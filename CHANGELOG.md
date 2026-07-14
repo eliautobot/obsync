@@ -2,6 +2,17 @@
 
 All notable changes to Obsync will be documented here.
 
+## 0.3.0 - 2026-07-14
+
+### Changed
+
+- Fresh local installations now open as a temporary passwordless `Admin`
+- Added an immediate account-security prompt with a **Continue for now** option
+- Added a persistent warning banner until a username and password are registered
+- Limited temporary Admin access to a local loopback URL or an explicitly trusted setup IP
+- Blocked remote, cross-site, and forged-Host attempts from using temporary Admin access
+- Preserved the v0.1.0 token-migration path for remote upgrades
+
 ## 0.2.0 - 2026-07-14
 
 ### Changed

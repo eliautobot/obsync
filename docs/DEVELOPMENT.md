@@ -18,7 +18,7 @@ uv run coverage run -m pytest
 uv run coverage report
 ```
 
-The test suite covers password hashing, first-run and legacy auth migration, session cookies, CSRF, expiration, login throttling, device token/enrollment behavior, path security, extractors, LLM response normalization, generated-note preservation, complete source-to-vault synchronization, repeat updates, tombstones, rename identity, agent scanning, and UI/static delivery.
+The test suite covers local-only temporary Admin, remote and cross-site setup rejection, password hashing, first-run and legacy auth migration, session cookies, CSRF, expiration, login throttling, device token/enrollment behavior, path security, extractors, LLM response normalization, generated-note preservation, complete source-to-vault synchronization, repeat updates, tombstones, rename identity, agent scanning, and UI/static delivery.
 
 ## Docker validation
 

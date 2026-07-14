@@ -27,7 +27,7 @@
         </nav>
         <div class="sidebar-foot">
           <div class="server-dot"><i></i><span>Server connected</span></div>
-          <span id="version-label">v0.2.0</span>
+          <span id="version-label">v0.3.0</span>
         </div>
       </aside>
 
@@ -44,6 +44,14 @@
             <button class="avatar" id="logout-button" aria-label="Sign out">O</button>
           </div>
         </header>
+        <section class="security-banner" id="security-banner" role="alert" hidden>
+          <div class="security-banner-icon" aria-hidden="true">!</div>
+          <div>
+            <strong>Administrator account not secured</strong>
+            <p>The temporary Admin login has no password. Register a local username and password to protect this Obsync server.</p>
+          </div>
+          <button class="primary" id="secure-admin-button" type="button">Secure administrator account</button>
+        </section>
         <section class="content" id="content" aria-live="polite"></section>
       </main>
     </div>
@@ -56,26 +64,32 @@
         </svg>
         <h1 id="auth-title">Sign in to Obsync</h1>
         <p id="auth-description">Use the administrator login for this Obsync server.</p>
-        <div class="field" id="legacy-token-field" hidden>
-          <label for="legacy-token-input">Current admin token</label>
-          <input id="legacy-token-input" type="password" autocomplete="off" placeholder="Required once to upgrade">
-          <small>This is needed once to securely replace the old token login.</small>
+        <div class="auth-fields" id="auth-fields">
+          <div class="field" id="legacy-token-field" hidden>
+            <label for="legacy-token-input">Current admin token</label>
+            <input id="legacy-token-input" type="password" autocomplete="off" placeholder="Required once to upgrade">
+            <small>This is needed once to securely replace the old token login.</small>
+          </div>
+          <div class="field" id="username-field">
+            <label for="username-input">Username</label>
+            <input id="username-input" type="text" autocomplete="username" required maxlength="64" placeholder="admin">
+          </div>
+          <div class="field" id="password-field">
+            <label for="password-input">Password</label>
+            <input id="password-input" type="password" autocomplete="current-password" required placeholder="Your password">
+          </div>
+          <div class="field" id="confirm-password-field" hidden>
+            <label for="confirm-password-input">Confirm password</label>
+            <input id="confirm-password-input" type="password" autocomplete="new-password" placeholder="Repeat your password">
+            <small>Use at least 10 characters. A memorable passphrase works well.</small>
+          </div>
+          <label class="check-row"><input id="remember-login" type="checkbox"> Keep me signed in</label>
+          <button class="primary full" id="auth-submit" type="submit">Sign in</button>
         </div>
-        <div class="field">
-          <label for="username-input">Username</label>
-          <input id="username-input" type="text" autocomplete="username" required maxlength="64" placeholder="admin">
+        <div class="setup-help" id="setup-help" hidden>
+          <strong>Administrator setup required</strong>
+          <p>For security, the temporary passwordless Admin is available only on the computer running Obsync. Open <code id="local-setup-url">http://localhost:7769</code> there to secure the account.</p>
         </div>
-        <div class="field">
-          <label for="password-input">Password</label>
-          <input id="password-input" type="password" autocomplete="current-password" required placeholder="Your password">
-        </div>
-        <div class="field" id="confirm-password-field" hidden>
-          <label for="confirm-password-input">Confirm password</label>
-          <input id="confirm-password-input" type="password" autocomplete="new-password" placeholder="Repeat your password">
-          <small>Use at least 10 characters. A memorable passphrase works well.</small>
-        </div>
-        <label class="check-row"><input id="remember-login" type="checkbox"> Keep me signed in</label>
-        <button class="primary full" id="auth-submit" type="submit">Sign in</button>
         <p class="form-error" id="login-error" role="alert"></p>
       </form>
     </div>

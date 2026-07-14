@@ -49,7 +49,9 @@ Generated notes are grouped by destination prefix, source device, watched folder
 
 - Responsive minimal interface
 - Automatic system/light/dark theme with manual toggle
-- First-run administrator username/password setup with safe v0.1.0 token migration
+- Automatic local temporary Admin with immediate account-security prompt
+- Persistent unsecured-account warning and remote setup lockout until registration
+- First-run username/password registration with safe v0.1.0 token migration
 - Expiring browser sessions, sign-out, CSRF protection, and login throttling
 - Dashboard counts and event stream
 - Device and watched-root status

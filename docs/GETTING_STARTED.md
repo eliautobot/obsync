@@ -22,9 +22,9 @@ docker compose ps
 curl http://127.0.0.1:7769/api/v1/health
 ```
 
-Open the UI immediately on a trusted private network, create the administrator username/password, and verify that **System → Obsidian vault** says **Ready**. A password must contain at least 10 characters; a memorable passphrase is recommended.
+On the Docker host, open `http://localhost:7769`. Obsync opens automatically as temporary **Admin** with no password, then prompts you to secure the account. Create a username and a password of at least 10 characters; a memorable passphrase is recommended. If you select **Continue for now**, the dashboard remains usable locally and displays a persistent security warning, but other computers cannot use the temporary Admin.
 
-For unattended first boot, set both `OBSYNC_ADMIN_USERNAME` and `OBSYNC_ADMIN_PASSWORD`, start the server once, and then remove those plaintext values from `.env`. If the UI is available only over HTTPS, also set `OBSYNC_SECURE_COOKIES=true`.
+For unattended first boot, set both `OBSYNC_ADMIN_USERNAME` and `OBSYNC_ADMIN_PASSWORD`, start the server once, and then remove those plaintext values from `.env`. A headless server may instead set `OBSYNC_LOCAL_SETUP_IPS` to one trusted management IP for initial setup; remove it as soon as the account is secured. If the UI is available only over HTTPS, also set `OBSYNC_SECURE_COOKIES=true`.
 
 To recover a forgotten login:
 
@@ -34,7 +34,7 @@ docker compose exec -it obsync obsync admin reset-password --username admin
 
 ### Upgrade from v0.1.0
 
-On the first visit after upgrading, choose a username/password and enter the old admin token once. If the old token was remembered in that browser, Obsync fills it automatically. Once setup succeeds, the old token can no longer access the admin API.
+On the Docker host, visit `http://localhost:7769` and secure the temporary Admin directly. When upgrading through a remote browser, choose a username/password and enter the old admin token once. If the old token was remembered in that browser, Obsync fills it automatically. Once setup succeeds, the old token can no longer access the admin API.
 
 ### Windows Docker host
 

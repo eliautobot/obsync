@@ -100,12 +100,18 @@ class ObsyncService:
         *,
         legacy_token: str = "",
         bootstrap: bool = False,
+        trusted_local: bool = False,
     ) -> dict[str, Any]:
         username = validate_username(username)
         validate_password(password)
         if self.has_admin_account():
             raise ValueError("Admin account setup is already complete")
-        if self.settings.admin_token and not bootstrap and not self.verify_admin(legacy_token):
+        if (
+            self.settings.admin_token
+            and not bootstrap
+            and not trusted_local
+            and not self.verify_admin(legacy_token)
+        ):
             raise ValueError("The current admin token is incorrect")
         now = utc_now()
         with self.db.transaction() as connection:

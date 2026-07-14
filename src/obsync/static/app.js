@@ -3,6 +3,7 @@ const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
 const state = {
   authMode: "login",
+  session: null,
   view: "overview",
   overview: null,
   agents: [],
@@ -77,8 +78,11 @@ function clearLegacyToken() {
 
 function showLogin(message = "") {
   state.authMode = "login";
+  state.session = null;
   $("#app").hidden = true;
   $("#login-screen").hidden = false;
+  $("#auth-fields").hidden = false;
+  $("#setup-help").hidden = true;
   $("#auth-title").textContent = "Sign in to Obsync";
   $("#auth-description").textContent = "Use the administrator login for this Obsync server.";
   $("#legacy-token-field").hidden = true;
@@ -91,8 +95,11 @@ function showLogin(message = "") {
 
 function showSetup(legacyMigrationRequired) {
   state.authMode = "setup";
+  state.session = null;
   $("#app").hidden = true;
   $("#login-screen").hidden = false;
+  $("#auth-fields").hidden = false;
+  $("#setup-help").hidden = true;
   $("#auth-title").textContent = legacyMigrationRequired ? "Upgrade your login" : "Create your admin account";
   $("#auth-description").textContent = legacyMigrationRequired
     ? "Choose an easier username and password. Your current token is needed only this once."
@@ -110,23 +117,106 @@ function showSetup(legacyMigrationRequired) {
   }
 }
 
-async function openApp() {
+function showSetupRequired() {
+  state.authMode = "blocked";
+  state.session = null;
+  $("#app").hidden = true;
+  $("#login-screen").hidden = false;
+  $("#auth-title").textContent = "Finish setup on the Obsync server";
+  $("#auth-description").textContent = "The passwordless Admin is limited to the computer running Obsync.";
+  $("#auth-fields").hidden = true;
+  $("#setup-help").hidden = false;
+  $("#local-setup-url").textContent = `http://localhost:${location.port || "7769"}`;
+  $("#login-error").textContent = "";
+}
+
+function updateSecurityState(session) {
+  const temporary = Boolean(session?.temporary);
+  $("#security-banner").hidden = !temporary;
+  $("#logout-button").textContent = (session?.username || "O").slice(0, 1).toUpperCase();
+  $("#logout-button").setAttribute(
+    "aria-label",
+    temporary ? "Secure administrator account" : "Sign out",
+  );
+}
+
+async function openSecuritySetup() {
+  const modal = $("#modal");
+  $("#modal-title").textContent = "Secure administrator account";
+  $("#modal-body").innerHTML = `
+    <p class="modal-note security-copy">The temporary <strong>Admin</strong> login has no password. Create a local username and password before exposing Obsync to other devices.</p>
+    <form id="secure-admin-form">
+      <div class="field"><label for="secure-username">Username</label><input id="secure-username" autocomplete="username" maxlength="64" value="admin" required></div>
+      <div class="field"><label for="secure-password">Password</label><input id="secure-password" type="password" autocomplete="new-password" placeholder="At least 10 characters" required></div>
+      <div class="field"><label for="secure-confirm">Confirm password</label><input id="secure-confirm" type="password" autocomplete="new-password" placeholder="Repeat your password" required></div>
+      <label class="check-row"><input id="secure-remember" type="checkbox" checked> Keep me signed in</label>
+      <p class="form-error" id="secure-admin-error" role="alert"></p>
+      <div class="modal-actions"><button class="secondary" id="continue-temporary" type="button">Continue for now</button><button class="primary" type="submit">Secure account</button></div>
+    </form>`;
+  modal.showModal();
+  $("#continue-temporary").addEventListener("click", () => modal.close());
+  $("#secure-admin-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const username = $("#secure-username").value.trim();
+    const password = $("#secure-password").value;
+    const confirm = $("#secure-confirm").value;
+    const submit = $('#secure-admin-form button[type="submit"]');
+    $("#secure-admin-error").textContent = "";
+    if (password !== confirm) {
+      $("#secure-admin-error").textContent = "Passwords do not match.";
+      return;
+    }
+    submit.disabled = true;
+    try {
+      const session = await api("/api/v1/auth/setup", {
+        method: "POST",
+        authRequest: true,
+        body: { username, password, remember: $("#secure-remember").checked },
+      });
+      state.session = { ...session, temporary: false, account_registered: true };
+      updateSecurityState(state.session);
+      clearLegacyToken();
+      modal.close();
+      toast("Administrator account secured.");
+    } catch (error) {
+      $("#secure-admin-error").textContent = error.message;
+    } finally {
+      submit.disabled = false;
+    }
+  });
+}
+
+async function openApp(session, promptToSecure = false) {
+  state.session = session;
   clearLegacyToken();
   $("#login-screen").hidden = true;
   $("#app").hidden = false;
+  updateSecurityState(session);
   await navigate("overview");
+  if (session?.temporary && promptToSecure) await openSecuritySetup();
 }
 
 async function bootstrapAuth() {
   try {
     const status = await api("/api/v1/auth/status", { authRequest: true });
     if (status.setup_required) {
-      showSetup(status.legacy_migration_required);
+      if (status.temporary_admin_available) {
+        await openApp({
+          authenticated: true,
+          username: "Admin",
+          temporary: true,
+          account_registered: false,
+        }, true);
+      } else if (status.legacy_migration_required) {
+        showSetup(true);
+      } else {
+        showSetupRequired();
+      }
       return;
     }
     clearLegacyToken();
     const session = await api("/api/v1/admin/session", { authRequest: true });
-    if (session.authenticated) await openApp();
+    if (session.authenticated) await openApp(session);
   } catch (error) {
     showLogin(error.message === "Sign in required" ? "" : error.message);
   }
@@ -359,7 +449,8 @@ $("#login-form").addEventListener("submit", async (event) => {
     $("#password-input").value = "";
     $("#confirm-password-input").value = "";
     $("#legacy-token-input").value = "";
-    await openApp();
+    const session = await api("/api/v1/admin/session", { authRequest: true });
+    await openApp(session);
   } catch (error) {
     $("#login-error").textContent = error.message;
   } finally {
@@ -367,10 +458,15 @@ $("#login-form").addEventListener("submit", async (event) => {
   }
 });
 $("#logout-button").addEventListener("click", async () => {
+  if (state.session?.temporary) {
+    await openSecuritySetup();
+    return;
+  }
   try { await api("/api/v1/auth/logout", { method: "POST" }); }
   catch (_error) { /* A missing/expired session still means the user is signed out. */ }
   showLogin();
 });
+$("#secure-admin-button").addEventListener("click", openSecuritySetup);
 $("#theme-button").addEventListener("click", () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark"));
 $("#refresh-button").addEventListener("click", () => navigate(state.view));
 $("#menu-button").addEventListener("click", () => {

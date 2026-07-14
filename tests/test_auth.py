@@ -11,14 +11,21 @@ from obsync.config import Settings
 PASSWORD = "correct horse battery staple"
 
 
-def make_client(tmp_path: Path, *, legacy_token: str = "") -> tuple[TestClient, object]:
+def make_client(
+    tmp_path: Path,
+    *,
+    legacy_token: str = "",
+    trusted_local: bool = True,
+) -> tuple[TestClient, object]:
     settings = Settings(
         data_dir=tmp_path / "data",
         vault_path=tmp_path / "vault",
         admin_token=legacy_token,
     )
     app = create_app(settings)
-    return TestClient(app), app
+    client_ip = "127.0.0.1" if trusted_local else "203.0.113.10"
+    base_url = "http://localhost:7769" if trusted_local else "http://obsync.example:7769"
+    return TestClient(app, client=(client_ip, 50000), base_url=base_url), app
 
 
 def setup_account(client: TestClient, *, legacy_token: str = "") -> str:
@@ -42,6 +49,8 @@ def test_first_run_setup_uses_hashed_credentials_and_secure_cookies(tmp_path: Pa
     assert client.get("/api/v1/auth/status").json() == {
         "setup_required": True,
         "legacy_migration_required": False,
+        "account_registered": False,
+        "temporary_admin_available": True,
     }
     response = client.post(
         "/api/v1/auth/setup",
@@ -65,7 +74,11 @@ def test_first_run_setup_uses_hashed_credentials_and_secure_cookies(tmp_path: Pa
 
 
 def test_legacy_token_is_required_once_then_disabled(tmp_path: Path) -> None:
-    client, _app = make_client(tmp_path, legacy_token="old-admin-token")
+    client, _app = make_client(
+        tmp_path,
+        legacy_token="old-admin-token",
+        trusted_local=False,
+    )
     status = client.get("/api/v1/auth/status").json()
     assert status["setup_required"] is True
     assert status["legacy_migration_required"] is True
@@ -90,6 +103,88 @@ def test_legacy_token_is_required_once_then_disabled(tmp_path: Path) -> None:
         ).status_code
         == 401
     )
+
+
+def test_temporary_admin_is_local_only_and_passwordless(tmp_path: Path) -> None:
+    local, _app = make_client(tmp_path)
+    status = local.get("/api/v1/auth/status").json()
+    assert status["temporary_admin_available"] is True
+    session = local.get("/api/v1/admin/session")
+    assert session.status_code == 200
+    assert session.json() == {
+        "authenticated": True,
+        "username": "Admin",
+        "legacy": False,
+        "temporary": True,
+        "account_registered": False,
+    }
+    login = local.post(
+        "/api/v1/auth/login",
+        json={"username": "Admin", "password": "", "remember": False},
+    )
+    assert login.status_code == 200
+    assert login.json()["temporary"] is True
+    assert not local.cookies.get("obsync_session")
+
+    remote, _remote_app = make_client(tmp_path / "remote", trusted_local=False)
+    remote_status = remote.get("/api/v1/auth/status").json()
+    assert remote_status["temporary_admin_available"] is False
+    assert remote.get("/api/v1/admin/session").status_code == 401
+    assert (
+        remote.post(
+            "/api/v1/auth/login",
+            json={"username": "Admin", "password": "", "remember": False},
+        ).status_code
+        == 409
+    )
+    assert (
+        remote.post(
+            "/api/v1/auth/setup",
+            json={"username": "owner", "password": PASSWORD},
+        ).status_code
+        == 403
+    )
+
+
+def test_temporary_admin_rejects_cross_site_writes_and_host_spoofing(tmp_path: Path) -> None:
+    local, _app = make_client(tmp_path)
+    hostile_headers = {
+        "Origin": "https://evil.example",
+        "Sec-Fetch-Site": "cross-site",
+    }
+    assert (
+        local.post("/api/v1/admin/enrollments", headers=hostile_headers, json={}).status_code == 403
+    )
+    assert (
+        local.post(
+            "/api/v1/auth/setup",
+            headers=hostile_headers,
+            json={"username": "owner", "password": PASSWORD},
+        ).status_code
+        == 403
+    )
+
+    remote, _remote_app = make_client(tmp_path / "remote", trusted_local=False)
+    assert (
+        remote.get(
+            "/api/v1/admin/session",
+            headers={"Host": "203.0.113.10:7769"},
+        ).status_code
+        == 401
+    )
+
+    proxied_settings = Settings(
+        data_dir=tmp_path / "proxied-data",
+        vault_path=tmp_path / "proxied-vault",
+        admin_token="",
+    )
+    proxied = TestClient(
+        create_app(proxied_settings),
+        client=("127.0.0.1", 50000),
+        base_url="https://obsync.example",
+    )
+    assert proxied.get("/api/v1/auth/status").json()["temporary_admin_available"] is False
+    assert proxied.get("/api/v1/admin/session").status_code == 401
 
 
 def test_login_csrf_logout_and_expired_session(tmp_path: Path) -> None:

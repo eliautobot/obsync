@@ -8,7 +8,7 @@ The server is the control plane and sole vault writer. It provides:
 
 - FastAPI HTTP API and embedded web UI
 - SQLite processing ledger in WAL mode
-- Scrypt-hashed administrator credentials and expiring browser sessions
+- Local-only temporary Admin bootstrap followed by scrypt-hashed credentials and expiring browser sessions
 - One-time enrollment and hashed device tokens
 - Upload staging with size limits and SHA-256 verification
 - Format-specific extraction
@@ -95,5 +95,7 @@ SQLite and single-server vault writing are intentional. Obsidian vaults are file
         ▼
 [Mounted Obsidian vault]
 ```
+
+Before registration, temporary Admin is accepted only when the network peer is loopback/the Docker host gateway and the request targets a loopback hostname, or when the peer was explicitly allowlisted for setup. It has no reusable credential; cross-site writes are rejected. A remote browser cannot claim a fresh server. After registration, temporary access disappears.
 
 Administrator passwords are scrypt-hashed. Random browser session and CSRF values are stored only as SHA-256 digests; the session credential is held in an HttpOnly, SameSite cookie. Login attempts are rate limited. Agent tokens have separate privileges, and enrollment codes are single-use and expire. Production deployments should terminate TLS at a private reverse proxy or run entirely over a private VPN/LAN.

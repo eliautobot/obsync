@@ -22,6 +22,10 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_list(name: str) -> tuple[str, ...]:
+    return tuple(value.strip() for value in os.getenv(name, "").split(",") if value.strip())
+
+
 @dataclass(slots=True)
 class Settings:
     data_dir: Path
@@ -37,6 +41,7 @@ class Settings:
     secure_cookies: bool = False
     session_hours: int = 12
     remembered_session_days: int = 30
+    local_setup_ips: tuple[str, ...] = ()
     log_level: str = "info"
 
     @classmethod
@@ -61,6 +66,7 @@ class Settings:
             secure_cookies=_env_bool("OBSYNC_SECURE_COOKIES", False),
             session_hours=max(1, _env_int("OBSYNC_SESSION_HOURS", 12)),
             remembered_session_days=max(1, _env_int("OBSYNC_REMEMBERED_SESSION_DAYS", 30)),
+            local_setup_ips=_env_list("OBSYNC_LOCAL_SETUP_IPS"),
             log_level=os.getenv("OBSYNC_LOG_LEVEL", "info"),
         )
 

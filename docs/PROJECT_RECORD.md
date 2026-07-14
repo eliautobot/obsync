@@ -9,7 +9,7 @@ Obsync is a self-hosted ingestion layer that keeps an Obsidian vault aligned wit
 - Source: <https://github.com/eliautobot/obsync>
 - License: MIT
 - Initial release: `v0.1.0`
-- Current release: `v0.2.0`
+- Current release: `v0.3.0`
 
 ## Product decisions
 
@@ -26,6 +26,8 @@ Obsync is a self-hosted ingestion layer that keeps an Obsidian vault aligned wit
 ## Authentication update
 
 Version 0.2.0 replaces the long administrator token login with first-run username/password setup. It uses scrypt password hashing, expiring HttpOnly sessions, CSRF protection, login throttling, a recovery command, and a one-time migration that disables the old token after account creation.
+
+Version 0.3.0 simplifies first use: a fresh local installation opens as temporary passwordless **Admin**, immediately offers username/password registration, and retains a visible warning if setup is deferred. Temporary Admin is restricted to a loopback URL on the server (or an explicitly trusted setup IP), while remote clients remain locked out until registration.
 
 ## Initial validation
 
