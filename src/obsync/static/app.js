@@ -8,6 +8,7 @@ const state = {
   overview: null,
   agents: [],
   roots: [],
+  server: null,
 };
 
 function cookie(name) {
@@ -133,11 +134,76 @@ function showSetupRequired() {
 function updateSecurityState(session) {
   const temporary = Boolean(session?.temporary);
   $("#security-banner").hidden = !temporary;
-  $("#logout-button").textContent = (session?.username || "O").slice(0, 1).toUpperCase();
-  $("#logout-button").setAttribute(
-    "aria-label",
-    temporary ? "Secure administrator account" : "Sign out",
-  );
+  $("#account-button").textContent = (session?.username || "O").slice(0, 1).toUpperCase();
+  $("#account-menu-name").textContent = session?.username || "Admin";
+  $("#account-settings-button").textContent = temporary
+    ? "Secure administrator account"
+    : "Account settings";
+}
+
+function closeAccountMenu() {
+  $("#account-menu").hidden = true;
+  $("#account-button").setAttribute("aria-expanded", "false");
+}
+
+async function performLogout() {
+  closeAccountMenu();
+  if (state.session?.temporary) {
+    showLogin();
+    return;
+  }
+  try { await api("/api/v1/auth/logout", { method: "POST" }); }
+  catch (_error) { /* A missing/expired session still means the user is signed out. */ }
+  showLogin();
+}
+
+async function openAccountSettings() {
+  closeAccountMenu();
+  if (state.session?.temporary) {
+    await openSecuritySetup();
+    return;
+  }
+  const modal = $("#modal");
+  $("#modal-title").textContent = "Account settings";
+  $("#modal-body").innerHTML = `
+    <form id="account-form">
+      <div class="field"><label for="account-username">Username</label><input id="account-username" autocomplete="username" maxlength="64" value="${escapeHtml(state.session?.username || "admin")}" required></div>
+      <div class="field"><label for="account-current-password">Current password</label><input id="account-current-password" type="password" autocomplete="current-password" required></div>
+      <div class="field"><label for="account-new-password">New password <small>(optional)</small></label><input id="account-new-password" type="password" autocomplete="new-password" placeholder="Leave blank to keep current password"></div>
+      <div class="field"><label for="account-confirm-password">Confirm new password</label><input id="account-confirm-password" type="password" autocomplete="new-password"></div>
+      <p class="form-error" id="account-error" role="alert"></p>
+      <div class="modal-actions"><button class="secondary" type="button" id="account-cancel">Cancel</button><button class="primary" type="submit">Save changes</button></div>
+    </form>`;
+  modal.showModal();
+  $("#account-cancel").addEventListener("click", () => modal.close());
+  $("#account-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const newPassword = $("#account-new-password").value;
+    if (newPassword !== $("#account-confirm-password").value) {
+      $("#account-error").textContent = "New passwords do not match.";
+      return;
+    }
+    const submit = $('#account-form button[type="submit"]');
+    submit.disabled = true;
+    try {
+      const account = await api("/api/v1/admin/account", {
+        method: "PUT",
+        body: {
+          username: $("#account-username").value.trim(),
+          current_password: $("#account-current-password").value,
+          new_password: newPassword,
+        },
+      });
+      state.session.username = account.username;
+      updateSecurityState(state.session);
+      modal.close();
+      toast("Account settings updated.");
+    } catch (error) {
+      $("#account-error").textContent = error.message;
+    } finally {
+      submit.disabled = false;
+    }
+  });
 }
 
 async function openSecuritySetup() {
@@ -207,8 +273,6 @@ async function bootstrapAuth() {
           temporary: true,
           account_registered: false,
         }, true);
-      } else if (status.legacy_migration_required) {
-        showSetup(true);
       } else {
         showSetupRequired();
       }
@@ -276,7 +340,7 @@ async function renderOverview() {
   $("#content").innerHTML = `
     <div class="stats">
       ${statCard("Synced documents", stats.synced, "↗", "good")}
-      ${statCard("Connected devices", `${stats.online_agents}/${stats.agents}`, "◎")}
+      ${statCard("Connected computers", `${stats.online_computers}/${stats.computers}`, "◎")}
       ${statCard("Needs review", stats.review, "◇", stats.review ? "warn" : "")}
       ${statCard("Errors", stats.errors, "!", stats.errors ? "bad" : "")}
     </div>
@@ -294,21 +358,29 @@ async function renderOverview() {
 }
 
 async function renderSources() {
-  const [agentData, rootData] = await Promise.all([
-    api("/api/v1/admin/agents"), api("/api/v1/admin/roots"),
+  const [server, agentData, rootData] = await Promise.all([
+    api("/api/v1/admin/server"), api("/api/v1/admin/agents"), api("/api/v1/admin/roots"),
   ]);
+  state.server = server;
   state.agents = agentData.items;
   state.roots = rootData.items;
   const cards = state.agents.map((agent) => {
     const roots = state.roots.filter((root) => root.agent_id === agent.id);
     const rootRows = roots.map((root) => `<div class="root-row"><strong>${escapeHtml(root.name)} · ${root.document_count || 0} docs</strong><code>${escapeHtml(root.path)}</code></div>`).join("");
     return `<article class="source-card">
-      <div class="source-top"><span class="device-icon">${agent.os_name === "Windows" ? "▣" : "◫"}</span><div><h3>${escapeHtml(agent.name)}</h3><p>${escapeHtml(agent.os_name)} · seen ${relativeTime(agent.last_seen_at)}</p></div><span class="status-pill ${agent.status}">${agent.status}</span></div>
+      <div class="source-top"><span class="device-icon">${agent.os_name === "Windows" ? "▣" : "◫"}</span><div><h3>${escapeHtml(agent.name)}</h3><p>${escapeHtml(agent.os_name)} · seen ${relativeTime(agent.last_seen_at)}</p>${agent.vault_ready ? '<span class="device-role">VAULT WRITER READY</span>' : ""}</div><span class="status-pill ${agent.status}">${agent.status}</span></div>
       ${rootRows || '<div class="root-row">No watched folders registered yet.</div>'}
+      ${agent.vault_path ? `<div class="root-row"><strong>Obsidian vault</strong><code>${escapeHtml(agent.vault_path)}</code></div>` : ""}
       <div class="source-stats"><span>${agent.document_count || 0} documents</span><button class="quiet scan-device" data-agent="${agent.id}">Scan now</button></div>
     </article>`;
-  }).join("") || '<div class="empty"><div class="empty-icon">◎</div><p>No devices yet. Pair your first computer to begin.</p></div>';
-  $("#content").innerHTML = `<div class="section-head"><div><h2>Connected devices</h2><p>Agents connect outbound to this server and never expose watched PCs.</p></div><button class="primary" id="add-device">+ Add device</button></div><div class="source-grid">${cards}</div>`;
+  }).join("");
+  const serverPath = server.vault_host_path || server.vault_path;
+  const serverCard = `<article class="source-card server-card">
+    <div class="source-top"><span class="device-icon">◆</span><div><h3>${escapeHtml(server.name)}</h3><p>${server.container ? "Docker container" : escapeHtml(server.os_name)} · ${escapeHtml(server.hostname)}</p><span class="device-role">ALWAYS CONNECTED</span></div><span class="status-pill">online</span></div>
+    <div class="root-row"><strong>Server vault mount</strong><code>${escapeHtml(serverPath)}</code></div>
+    <div class="source-stats"><span>Processes files and coordinates every desktop</span></div>
+  </article>`;
+  $("#content").innerHTML = `<div class="section-head"><div><h2>Computers</h2><p>The Obsync server is active automatically. Add a desktop agent only for folders or an Obsidian vault on another computer.</p></div><button class="primary" id="add-device">+ Add another computer</button></div><div class="source-grid">${serverCard}${cards}</div>`;
   $("#add-device").addEventListener("click", openEnrollment);
   $$(".scan-device").forEach((button) => button.addEventListener("click", async () => {
     try { await api(`/api/v1/admin/agents/${button.dataset.agent}/scan`, { method: "POST" }); toast("Scan queued. The device will begin within 30 seconds."); }
@@ -316,22 +388,82 @@ async function renderSources() {
   }));
 }
 
+function powerShellQuote(value) {
+  return `'${String(value).replaceAll("'", "''")}'`;
+}
+
+async function copyText(value) {
+  try {
+    await navigator.clipboard.writeText(value);
+  } catch (_error) {
+    const input = document.createElement("textarea");
+    input.value = value;
+    input.style.position = "fixed";
+    input.style.opacity = "0";
+    document.body.append(input);
+    input.select();
+    document.execCommand("copy");
+    input.remove();
+  }
+  toast("Command copied.");
+}
+
+async function pollEnrollment(enrollmentId) {
+  for (let attempt = 0; attempt < 600; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    if (!$("#modal").open || !$("#pairing-status")) return;
+    try {
+      const status = await api(`/api/v1/admin/enrollments/${enrollmentId}`);
+      if (status.connected) {
+        $("#pairing-status").className = "inline-status good";
+        $("#pairing-status").textContent = `${status.agent.name} connected successfully. It will appear on this page after you close this window.`;
+        return;
+      }
+    } catch (_error) { /* Keep polling while the one-time code is active. */ }
+  }
+}
+
 async function openEnrollment() {
   const modal = $("#modal");
   $("#modal-title").textContent = "Add a computer";
-  $("#modal-body").innerHTML = '<p class="modal-note">Name this device so it is easy to recognize.</p><div class="field"><label>Device label</label><input id="device-label" placeholder="Office PC"></div><br><button class="primary full" id="create-code">Create pairing code</button>';
+  const suggestedServer = state.server?.public_url || location.origin;
+  $("#modal-body").innerHTML = `
+    <p class="modal-note">The Obsync server is already connected. Use this only to add a Windows, Linux, or macOS computer whose folders are outside the server.</p>
+    <div class="field"><label for="device-label">Device label</label><input id="device-label" placeholder="Office PC"></div>
+    <div class="field"><label for="pair-server-url">Server address reachable from that computer</label><input id="pair-server-url" value="${escapeHtml(suggestedServer)}"><small>Do not use localhost for a different computer.</small></div>
+    <label class="check-row"><input id="device-has-vault" type="checkbox"> This computer contains the Obsidian vault</label>
+    <button class="primary full" id="create-code">Create Windows setup command</button>`;
   modal.showModal();
   $("#create-code").addEventListener("click", async () => {
     try {
-      const label = $("#device-label").value;
+      const label = $("#device-label").value.trim() || "Windows PC";
+      const server = $("#pair-server-url").value.trim().replace(/\/$/, "");
+      if (!/^https?:\/\//i.test(server)) throw new Error("Enter a complete http:// or https:// server address.");
+      if (/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?::|\/|$)/i.test(server)) {
+        throw new Error("localhost points back to the other computer. Use this server's LAN or Tailscale address.");
+      }
+      const hasVault = $("#device-has-vault").checked;
       const enrollment = await api("/api/v1/admin/enrollments", { method: "POST", body: { label } });
-      const server = location.origin;
+      const download = "https://github.com/eliautobot/obsync/releases/latest/download/obsync-agent-windows-x64.exe";
+      const lines = [
+        `$exe = Join-Path $env:USERPROFILE 'Downloads\\obsync-agent-windows-x64.exe'`,
+        `Invoke-WebRequest -Uri ${powerShellQuote(download)} -OutFile $exe`,
+        `& $exe agent pair --server ${powerShellQuote(server)} --code ${powerShellQuote(enrollment.code)} --name ${powerShellQuote(label)}`,
+      ];
+      if (hasVault) lines.push("& $exe agent set-vault --browse");
+      lines.push("& $exe agent add-folder --browse", "& $exe agent run");
+      const command = lines.join("\n");
       $("#modal-body").innerHTML = `
         <p class="modal-note">This one-time code expires in 20 minutes.</p><div class="pair-code">${escapeHtml(enrollment.code)}</div>
-        <p><strong>1.</strong> Install Obsync Agent on the other computer.</p>
-        <p><strong>2.</strong> Pair it:</p><div class="code-block">obsync agent pair --server ${escapeHtml(server)} --code ${escapeHtml(enrollment.code)} --name "${escapeHtml(label || "My PC")}"</div>
-        <p><strong>3.</strong> Add any folder and start:</p><div class="code-block">obsync agent add-folder "PATH_TO_FOLDER"<br>obsync agent run</div>
-        <p class="modal-note">The agent makes outbound HTTPS requests only. Repeat this for every Windows, Linux, macOS, NAS, or network-share host.</p>`;
+        <div class="pair-steps">
+          <div class="pair-step"><p><strong>1.</strong> On the Windows PC, open PowerShell.</p></div>
+          <div class="pair-step"><p><strong>2.</strong> Paste this complete setup command. It downloads the agent, pairs it, opens a folder browser, and starts syncing.</p><div class="code-block" id="pair-command">${escapeHtml(command)}</div><button class="secondary copy-command" id="copy-pair-command" type="button">Copy setup command</button></div>
+          <div class="pair-step"><p><strong>3.</strong> Keep that PowerShell window open during this alpha release.</p></div>
+        </div>
+        <p class="inline-status" id="pairing-status"><span class="connection-wait"><i></i>Waiting for ${escapeHtml(label)} to connect…</span></p>
+        <p class="modal-note">Prefer a manual download? <a href="${download}" target="_blank" rel="noreferrer">Download the Windows agent</a>. Linux users can install the Python package and use the same <code>agent pair</code> command.</p>`;
+      $("#copy-pair-command").addEventListener("click", () => copyText(command));
+      pollEnrollment(enrollment.id);
     } catch (error) { toast(error.message, true); }
   });
 }
@@ -372,10 +504,29 @@ async function renderDocuments(reviewOnly) {
 }
 
 async function renderSettings() {
-  const settings = await api("/api/v1/admin/settings");
+  const [settings, agentData] = await Promise.all([
+    api("/api/v1/admin/settings"), api("/api/v1/admin/agents"),
+  ]);
+  state.agents = agentData.items;
   const enabled = settings.llm_enabled === "true";
+  const vaultMode = settings.vault_mode || "local";
+  const vaultOptions = state.agents.map((agent) => `<option value="${agent.id}" ${agent.id === settings.vault_agent_id ? "selected" : ""}>${escapeHtml(agent.name)} — ${agent.vault_ready ? escapeHtml(agent.vault_path) : "vault not selected"}</option>`).join("");
+  const hostVault = settings.vault_host_path || settings.vault_path;
   $("#content").innerHTML = `<form class="settings-layout" id="settings-form">
-    <section class="settings-card"><h3>Obsidian vault</h3><p>The container path where generated Markdown is written.</p><div class="field"><label>Mounted vault path</label><input value="${escapeHtml(settings.vault_path)}" disabled><small>Change the Docker volume mount to point at a different vault.</small></div></section>
+    <section class="settings-card"><h3>Obsidian vault</h3><p>Choose where Obsync writes generated Markdown. The server mount is the default; a paired desktop can write directly to a vault on Windows or another computer.</p>
+      <div class="vault-mode-grid">
+        <label class="vault-choice"><input type="radio" name="vault-mode" value="local" ${vaultMode === "local" ? "checked" : ""}><span><strong>Server-mounted vault</strong><small>Best when the vault is mounted into Docker or Obsync runs natively beside it.</small></span></label>
+        <label class="vault-choice"><input type="radio" name="vault-mode" value="agent" ${vaultMode === "agent" ? "checked" : ""}><span><strong>Vault on a desktop</strong><small>Best when the vault is in Documents on Windows while the server runs elsewhere.</small></span></label>
+      </div>
+      <div id="local-vault-settings">
+        <div class="field"><label>${settings.runtime === "docker" ? "Host vault folder" : "Vault folder"}</label><input value="${escapeHtml(hostVault)}" disabled><small>${settings.runtime === "docker" ? `Inside Docker this is mounted as ${escapeHtml(settings.vault_path)}. Docker mounts can only be changed when the container is created.` : "This native Obsync process writes directly to this folder."}</small></div>
+      </div>
+      <div id="agent-vault-settings" hidden>
+        <div class="field"><label for="vault-agent">Computer containing the vault</label><select id="vault-agent"><option value="">Choose a computer…</option>${vaultOptions}</select><small>Select the Windows PC where your Obsidian vault lives, then click Browse. The folder picker opens on that computer.</small></div>
+        <div class="settings-actions"><button class="secondary" type="button" id="browse-vault">Browse for vault on that computer</button><button class="quiet" type="button" id="add-vault-computer">+ Add computer</button></div>
+        <p class="inline-status" id="vault-agent-status">${state.agents.length ? "Choose a paired computer." : "No desktop computers are connected yet."}</p>
+      </div>
+    </section>
     <section class="settings-card"><h3>Local AI organization</h3><p>Use Ollama, LM Studio, or another OpenAI-compatible local server. Obsync keeps syncing with deterministic rules if the model is offline.</p>
       <div class="field-grid">
         <label class="check-row full-width"><input id="llm-enabled" type="checkbox" ${enabled ? "checked" : ""}> Enable AI classification</label>
@@ -386,11 +537,38 @@ async function renderSettings() {
         <div class="field"><label>Review below</label><input id="review-threshold" type="number" min="0" max="1" step="0.05" value="${escapeHtml(settings.review_threshold || ".65")}"><small>0.65 means below 65% confidence.</small></div>
         <div class="field"><label>Model timeout (seconds)</label><input id="llm-timeout" type="number" min="5" max="600" value="${escapeHtml(settings.llm_timeout_seconds || "120")}"></div>
       </div>
-      <div class="settings-actions"><button class="primary" type="submit">Save settings</button><button class="secondary" type="button" id="test-llm">Test connection</button></div>
+      <div class="settings-actions"><button class="primary" type="submit">Save settings</button><button class="secondary" type="button" id="test-llm">Check connection</button></div>
+      <p class="inline-status" id="llm-test-status" hidden></p>
     </section>
     <section class="settings-card"><h3>Safety defaults</h3><p>Obsync never edits, moves, or deletes source files. Missing sources are marked in their note and kept. Manual text below “My notes” is preserved on every update.</p></section>
   </form>`;
   $("#llm-provider").value = settings.llm_provider || "ollama";
+  const updateVaultMode = () => {
+    const mode = $('input[name="vault-mode"]:checked').value;
+    $("#local-vault-settings").hidden = mode !== "local";
+    $("#agent-vault-settings").hidden = mode !== "agent";
+  };
+  $$('input[name="vault-mode"]').forEach((input) => input.addEventListener("change", updateVaultMode));
+  updateVaultMode();
+  $("#vault-agent").addEventListener("change", () => {
+    const agent = state.agents.find((item) => item.id === $("#vault-agent").value);
+    $("#vault-agent-status").className = `inline-status ${agent?.vault_ready ? "good" : ""}`;
+    $("#vault-agent-status").textContent = agent?.vault_ready
+      ? `Ready: ${agent.vault_path}`
+      : agent ? "No vault selected on this computer yet." : "Choose a paired computer.";
+  });
+  $("#vault-agent").dispatchEvent(new Event("change"));
+  $("#browse-vault").addEventListener("click", async () => {
+    const agentId = $("#vault-agent").value;
+    if (!agentId) { toast("Choose a computer first.", true); return; }
+    try {
+      await api(`/api/v1/admin/agents/${agentId}/select-vault`, { method: "POST" });
+      $("#vault-agent-status").className = "inline-status";
+      $("#vault-agent-status").textContent = "Folder browser requested. Choose the vault on that computer, then refresh Settings.";
+      toast("Folder browser sent to the desktop.");
+    } catch (error) { toast(error.message, true); }
+  });
+  $("#add-vault-computer").addEventListener("click", openEnrollment);
   $("#settings-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     try { await api("/api/v1/admin/settings", { method: "PUT", body: settingsPayload() }); toast("Settings saved."); }
@@ -398,14 +576,21 @@ async function renderSettings() {
   });
   $("#test-llm").addEventListener("click", async () => {
     const button = $("#test-llm"); button.disabled = true; button.textContent = "Testing…";
-    try { const result = await api("/api/v1/admin/settings/test-llm", { method: "POST", body: settingsPayload() }); toast(result.message, !result.ok); }
-    catch (error) { toast(error.message, true); }
-    finally { button.disabled = false; button.textContent = "Test connection"; }
+    const status = $("#llm-test-status"); status.hidden = false; status.className = "inline-status"; status.textContent = "Checking the model server…";
+    try {
+      const result = await api("/api/v1/admin/settings/test-llm", { method: "POST", body: settingsPayload() });
+      status.className = `inline-status ${result.ok ? "good" : "bad"}`;
+      status.textContent = result.message;
+      if (!$("#llm-model").value && result.suggested_model) $("#llm-model").value = result.suggested_model;
+    } catch (error) { status.className = "inline-status bad"; status.textContent = error.message; }
+    finally { button.disabled = false; button.textContent = "Check connection"; }
   });
 }
 
 function settingsPayload() {
   return {
+    vault_mode: $('input[name="vault-mode"]:checked')?.value || "local",
+    vault_agent_id: $("#vault-agent")?.value || "",
     llm_enabled: $("#llm-enabled").checked,
     llm_provider: $("#llm-provider").value,
     llm_base_url: $("#llm-url").value.trim(),
@@ -457,14 +642,19 @@ $("#login-form").addEventListener("submit", async (event) => {
     button.disabled = false;
   }
 });
-$("#logout-button").addEventListener("click", async () => {
-  if (state.session?.temporary) {
-    await openSecuritySetup();
-    return;
-  }
-  try { await api("/api/v1/auth/logout", { method: "POST" }); }
-  catch (_error) { /* A missing/expired session still means the user is signed out. */ }
-  showLogin();
+$("#account-button").addEventListener("click", (event) => {
+  event.stopPropagation();
+  const menu = $("#account-menu");
+  menu.hidden = !menu.hidden;
+  $("#account-button").setAttribute("aria-expanded", String(!menu.hidden));
+});
+$("#account-settings-button").addEventListener("click", openAccountSettings);
+$("#sign-out-button").addEventListener("click", performLogout);
+document.addEventListener("click", (event) => {
+  if (!event.target.closest(".account-control")) closeAccountMenu();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") closeAccountMenu();
 });
 $("#secure-admin-button").addEventListener("click", openSecuritySetup);
 $("#theme-button").addEventListener("click", () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark"));

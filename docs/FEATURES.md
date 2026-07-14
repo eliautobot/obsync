@@ -61,11 +61,15 @@ Generated notes are grouped by destination prefix, source device, watched folder
 - Error retry commands
 - Review approval workflow
 - LLM configuration and connection test
+- Fast model discovery that does not start inference
+- Automatic server computer plus optional paired desktops
+- Native desktop folder picker for watched roots and the vault
+- Account menu with administrator username/password management and explicit sign-out
 
 ## Safety guarantees
 
 - Source folders are read-only from Obsync's perspective
-- The server writes only below the mounted vault path
+- The active writer writes only below the configured mounted or desktop vault path
 - Path traversal is rejected
 - Non-Obsync note collisions are never overwritten
 - Writes use a temporary sibling file followed by an atomic replace

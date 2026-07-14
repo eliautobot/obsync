@@ -9,12 +9,12 @@ Obsync is a self-hosted ingestion layer that keeps an Obsidian vault aligned wit
 - Source: <https://github.com/eliautobot/obsync>
 - License: MIT
 - Initial release: `v0.1.0`
-- Current release: `v0.3.0`
+- Current development version: `v0.4.0` (unreleased)
 
 ## Product decisions
 
 - Source files are read-only. Obsync never moves, edits, or deletes them.
-- Only the central server writes generated notes into the vault.
+- The central server owns the ledger; exactly one active server mount or paired desktop performs managed vault writes.
 - Agents connect outbound, so watched computers do not require inbound ports.
 - Generated sections can be safely replaced; text below **My notes** is preserved.
 - Missing sources are marked, not deleted.
@@ -28,6 +28,8 @@ Obsync is a self-hosted ingestion layer that keeps an Obsidian vault aligned wit
 Version 0.2.0 replaces the long administrator token login with first-run username/password setup. It uses scrypt password hashing, expiring HttpOnly sessions, CSRF protection, login throttling, a recovery command, and a one-time migration that disables the old token after account creation.
 
 Version 0.3.0 simplifies first use: a fresh local installation opens as temporary passwordless **Admin**, immediately offers username/password registration, and retains a visible warning if setup is deferred. Temporary Admin is restricted to a loopback URL on the server (or an explicitly trusted setup IP), while remote clients remain locked out until registration.
+
+Version 0.4.0 adds a desktop-vault mode for vaults located in Windows Documents or on another computer, native folder selection, a corrected standalone Windows pairing flow, quick non-inference model checks, an automatic server-computer card, and administrator account settings.
 
 ## Initial validation
 

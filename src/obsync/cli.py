@@ -13,6 +13,7 @@ import uvicorn
 from . import __version__
 from .agent import AgentConfig, AgentRuntime, default_config_path, pair_agent
 from .config import Settings
+from .desktop import choose_directory
 from .service import ObsyncService
 
 
@@ -85,8 +86,13 @@ def _agent_pair(args: argparse.Namespace) -> int:
 def _agent_add(args: argparse.Namespace) -> int:
     config_path = Path(args.config).expanduser() if args.config else default_config_path()
     config = AgentConfig.load(config_path)
+    selected = (
+        choose_directory("Choose a folder for Obsync to watch")
+        if getattr(args, "browse", False) or not args.path
+        else Path(args.path)
+    )
     root = config.add_root(
-        Path(args.path),
+        selected,
         name=args.name,
         destination=args.destination,
     )
@@ -95,11 +101,26 @@ def _agent_add(args: argparse.Namespace) -> int:
     return 0
 
 
+def _agent_set_vault(args: argparse.Namespace) -> int:
+    config_path = Path(args.config).expanduser() if args.config else default_config_path()
+    config = AgentConfig.load(config_path)
+    selected = (
+        choose_directory("Choose your Obsidian vault", config.vault_path)
+        if args.browse or not args.path
+        else Path(args.path)
+    )
+    vault = config.set_vault(selected)
+    config.save(config_path)
+    print(f"Obsidian vault set to {vault}")
+    return 0
+
+
 def _agent_list(args: argparse.Namespace) -> int:
     config_path = Path(args.config).expanduser() if args.config else default_config_path()
     config = AgentConfig.load(config_path)
     print(f"Server: {config.server_url or '(not paired)'}")
     print(f"Device: {config.name or '(unnamed)'}")
+    print(f"Obsidian vault: {config.vault_path or '(not selected)'}")
     if not config.roots:
         print("Watched folders: none")
     else:
@@ -112,7 +133,7 @@ def _agent_list(args: argparse.Namespace) -> int:
 
 def _load_runtime(args: argparse.Namespace) -> AgentRuntime:
     config_path = Path(args.config).expanduser() if args.config else default_config_path()
-    return AgentRuntime(AgentConfig.load(config_path))
+    return AgentRuntime(AgentConfig.load(config_path), config_path=config_path)
 
 
 def _agent_scan(args: argparse.Namespace) -> int:
@@ -167,11 +188,20 @@ def build_parser() -> argparse.ArgumentParser:
     pair.set_defaults(handler=_agent_pair)
 
     add = agent_commands.add_parser("add-folder", help="Add a local or network folder")
-    add.add_argument("path", help="Folder to watch")
+    add.add_argument("path", nargs="?", default="", help="Folder to watch")
+    add.add_argument("--browse", action="store_true", help="Choose the folder in a window")
     add.add_argument("--name", default="", help="Friendly folder name")
     add.add_argument("--destination", default="Obsync", help="Vault destination prefix")
     add.add_argument("--config", default="", help="Agent configuration path")
     add.set_defaults(handler=_agent_add)
+
+    vault = agent_commands.add_parser(
+        "set-vault", help="Make this computer the Obsidian vault writer"
+    )
+    vault.add_argument("path", nargs="?", default="", help="Obsidian vault folder")
+    vault.add_argument("--browse", action="store_true", help="Choose the vault in a window")
+    vault.add_argument("--config", default="", help="Agent configuration path")
+    vault.set_defaults(handler=_agent_set_vault)
 
     listing = agent_commands.add_parser("list", help="Show pairing and watched folders")
     listing.add_argument("--config", default="", help="Agent configuration path")

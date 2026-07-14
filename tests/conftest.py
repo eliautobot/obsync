@@ -27,7 +27,11 @@ def app(app_settings: Settings):
 
 @pytest.fixture
 def client(app) -> TestClient:
-    return TestClient(app)
+    return TestClient(
+        app,
+        client=("127.0.0.1", 50000),
+        base_url="http://localhost:7769",
+    )
 
 
 @pytest.fixture

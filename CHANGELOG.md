@@ -2,6 +2,26 @@
 
 All notable changes to Obsync will be documented here.
 
+## 0.4.0 - 2026-07-14
+
+### Added
+
+- Added two vault modes: a Docker/server-mounted vault or a vault written by a paired desktop agent
+- Added a native folder picker for Windows, Linux, and macOS desktop agents
+- Added remotely requested vault selection from the web settings page
+- Added an automatic always-connected server computer card to the Sources page
+- Added complete Windows pairing commands that download and invoke the standalone agent executable
+- Added account settings for changing the administrator username and password
+- Added an account menu with explicit settings and sign-out actions
+- Added a complete server and desktop-agent update, backup, verification, and rollback guide
+
+### Changed
+
+- Replaced inference-based model testing with quick model-list discovery for Ollama, LM Studio, and OpenAI-compatible endpoints
+- Capped model connection checks at 15 seconds and report discovered/model-mismatch details
+- Clarified that additional agents are optional when all source folders and the vault are available to the server
+- Preserved the server's processing ledger while allowing exactly one selected desktop agent to perform safe managed-note writes
+
 ## 0.3.0 - 2026-07-14
 
 ### Changed

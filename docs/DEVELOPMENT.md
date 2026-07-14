@@ -18,7 +18,7 @@ uv run coverage run -m pytest
 uv run coverage report
 ```
 
-The test suite covers local-only temporary Admin, remote and cross-site setup rejection, password hashing, first-run and legacy auth migration, session cookies, CSRF, expiration, login throttling, device token/enrollment behavior, path security, extractors, LLM response normalization, generated-note preservation, complete source-to-vault synchronization, repeat updates, tombstones, rename identity, agent scanning, and UI/static delivery.
+The test suite covers local-only temporary Admin, remote and cross-site setup rejection, password hashing, account changes, first-run and legacy auth migration, session cookies, CSRF, expiration, login throttling, device token/enrollment behavior, native folder selection, local and remote vault writers, path security, extractors, quick LLM model discovery, LLM response normalization, generated-note preservation, complete source-to-vault synchronization, repeat updates, tombstones, rename identity, agent scanning, and UI/static delivery.
 
 ## Docker validation
 
@@ -44,7 +44,8 @@ Use temporary directories for source, data, and vault:
 8. Modify and resync the source.
 9. Assert manual text remains.
 10. Remove the source and reconcile.
-11. Assert the note remains and is marked missing.
+11. Repeat with a paired desktop vault writer and complete the queued commands.
+12. Assert the note remains and is marked missing.
 
 ## Release builds
 

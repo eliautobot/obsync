@@ -3,7 +3,11 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+import httpx
+import pytest
 from fastapi.testclient import TestClient
+
+from obsync.agent import AgentConfig, AgentRuntime, AgentState
 
 
 def sync_text(
@@ -51,10 +55,102 @@ def test_enrollment_is_single_use(client: TestClient, admin_headers: dict[str, s
         "hostname": "laptop",
         "os_name": "Windows",
     }
-    assert client.post("/api/v1/agents/register", json=payload).status_code == 200
+    registered = client.post("/api/v1/agents/register", json=payload)
+    assert registered.status_code == 200
+    status = client.get(
+        f"/api/v1/admin/enrollments/{enrollment['id']}", headers=admin_headers
+    ).json()
+    assert status["connected"] is True
+    assert status["agent"]["id"] == registered.json()["agent_id"]
     second = client.post("/api/v1/agents/register", json=payload)
     assert second.status_code == 400
     assert "already used" in second.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_desktop_agent_can_write_the_obsidian_vault(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    enrolled_agent: dict[str, str],
+    agent_headers: dict[str, str],
+    registered_root: dict,
+    tmp_path: Path,
+) -> None:
+    desktop_vault = tmp_path / "windows-vault"
+    desktop_vault.mkdir()
+    heartbeat = client.post(
+        "/api/v1/agent/heartbeat",
+        headers=agent_headers,
+        json={
+            "agent_version": "0.4.0",
+            "vault_path": str(desktop_vault),
+            "vault_ready": True,
+            "vault_error": "",
+        },
+    )
+    assert heartbeat.status_code == 200
+    settings = client.put(
+        "/api/v1/admin/settings",
+        headers=admin_headers,
+        json={"vault_mode": "agent", "vault_agent_id": enrolled_agent["agent_id"]},
+    )
+    assert settings.status_code == 200
+    assert settings.json()["vault_mode"] == "agent"
+
+    synced = sync_text(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "Projects/remote-note.txt",
+        b"A note written to the Windows Obsidian vault.",
+    )
+    assert synced.status_code == 200, synced.text
+    assert synced.json()["result"] == "queued"
+    assert synced.json()["status"] == "pending-write"
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+        headers={"Authorization": f"Bearer {enrolled_agent['agent_token']}"},
+    ) as async_client:
+        runtime = AgentRuntime(
+            AgentConfig(
+                server_url="http://testserver",
+                agent_id=enrolled_agent["agent_id"],
+                agent_token=enrolled_agent["agent_token"],
+                name="Test PC",
+                vault_path=str(desktop_vault),
+            ),
+            state=AgentState(tmp_path / "remote-agent-state.db"),
+            client=async_client,
+        )
+        await runtime.process_commands_once()
+
+        note = next(desktop_vault.rglob("*.md"))
+        assert "written to the Windows Obsidian vault" in note.read_text(encoding="utf-8")
+        document = client.get("/api/v1/admin/documents", headers=admin_headers).json()["items"][0]
+        assert document["status"] == "synced"
+
+        missing = client.post(
+            "/api/v1/agent/documents/missing",
+            headers=agent_headers,
+            json={
+                "root_id": registered_root["id"],
+                "source_path": "Projects/remote-note.txt",
+            },
+        )
+        assert missing.status_code == 200
+        await runtime.process_commands_once()
+        assert "obsync_status: source-missing" in note.read_text(encoding="utf-8")
+
+    server = client.get("/api/v1/admin/server", headers=admin_headers).json()
+    assert server["name"] == "Obsync server"
+    assert (
+        client.get("/api/v1/admin/overview", headers=admin_headers).json()["vault"]["mode"]
+        == "agent"
+    )
 
 
 def test_full_sync_update_missing_and_rename(

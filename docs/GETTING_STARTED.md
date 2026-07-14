@@ -5,13 +5,14 @@
 Requirements:
 
 - Docker Engine with Compose v2
-- A writable Obsidian vault path on the server host
+- A writable Obsidian vault path on the server host, or a paired desktop that contains the vault
 - A private network, VPN, or HTTPS reverse proxy if agents connect across machines
 
-Clone the repository, create `.env`, and set the vault path:
+Clone the repository and create `.env`. For a server-mounted vault, set its host path:
 
 ```dotenv
 OBSYNC_VAULT_HOST_PATH=/absolute/path/to/MyVault
+OBSYNC_PUBLIC_URL=https://obsync.example.com
 ```
 
 Start and verify:
@@ -34,7 +35,7 @@ docker compose exec -it obsync obsync admin reset-password --username admin
 
 ### Upgrade from v0.1.0
 
-On the Docker host, visit `http://localhost:7769` and secure the temporary Admin directly. When upgrading through a remote browser, choose a username/password and enter the old admin token once. If the old token was remembered in that browser, Obsync fills it automatically. Once setup succeeds, the old token can no longer access the admin API.
+On the Docker host, visit `http://localhost:7769` and secure the temporary Admin directly. Remote browsers show a setup-required message until this is complete. Once setup succeeds, the old token can no longer access the admin API.
 
 ### Windows Docker host
 
@@ -44,6 +45,8 @@ Docker Desktop accepts Windows paths in Compose environment variables. In PowerS
 $env:OBSYNC_VAULT_HOST_PATH = "C:\Users\me\Documents\My Vault"
 docker compose up -d --build
 ```
+
+Docker cannot open a browser-based folder picker for arbitrary host folders after the container starts. The host path must be mounted when Docker starts. If the vault is in Windows Documents on a different PC, use **Settings → Obsidian vault → Vault on a desktop** instead; the paired desktop agent opens the native Windows folder picker and writes the managed Markdown locally.
 
 Keep the vault on a local filesystem whenever possible. If it is itself on a synced/cloud folder, test carefully for filesystem locking behavior.
 
@@ -56,11 +59,11 @@ The model endpoint must be reachable from the server container.
 - Ollama default port: `11434`
 - LM Studio default port: `1234`
 
-In **Settings**, choose the provider, base URL, and loaded model. Press **Test connection**. Do not expose an unauthenticated LLM port to the public Internet.
+In **Settings**, choose the provider, base URL, and model. Press **Check connection**. This performs a bounded model-list request and does not start inference, so a cold model does not cause a false timeout. Do not expose an unauthenticated LLM port to the public Internet.
 
 ## 3. Pair a source computer
 
-Create a code under **Sources → Add device**. Install the agent from a release executable or Python package, then pair:
+The server computer is listed automatically and does not need pairing. To add another computer, open **Sources → Add another computer**. The Windows wizard provides one complete PowerShell command. To pair manually:
 
 ```bash
 obsync agent pair --server https://your-server --code XXXX-XXXX-XXXX --name "Laptop"
@@ -72,6 +75,7 @@ The pairing stores a device-specific token in the user's Obsync config directory
 
 ```bash
 obsync agent add-folder "/home/me/Documents" --name "Documents"
+obsync agent add-folder --browse
 obsync agent add-folder "/mnt/team-share/Projects" --name "Team Projects" --destination "Company Knowledge"
 obsync agent list
 obsync agent scan
@@ -82,6 +86,14 @@ After the first successful scan, run continuously:
 ```bash
 obsync agent run
 ```
+
+If this computer also contains the Obsidian vault, select it once and then choose that computer in the server's **Settings** page:
+
+```bash
+obsync agent set-vault --browse
+```
+
+Only one paired computer is selected as the vault writer at a time. Obsync validates destination paths, writes atomically, and refuses to overwrite files it does not own.
 
 ## 5. Run the agent in the background
 
@@ -133,3 +145,5 @@ Start with a test folder and vault backup. Confirm:
 - LLM confidence is calibrated appropriately
 - Editing below **My notes** survives a source update
 - Removing a source marks the note missing without deleting it
+
+For future server and desktop-agent releases, follow [Updating Obsync](UPDATING.md). It includes pre-update backups, Docker and source-based upgrade commands, verification, and rollback.

@@ -263,24 +263,75 @@ class LLMAnalyzer:
             return str(response.json()["choices"][0]["message"]["content"])
 
     async def test_connection(self) -> dict[str, Any]:
-        if not self.config.active:
+        provider = self.config.provider.strip().lower()
+        if provider in {"", "off"} or not self.config.base_url:
             return {"ok": False, "message": "LLM integration is disabled or incomplete."}
         try:
-            result = await self.analyze(
-                source_path="connection-test.txt",
-                text="Quarterly planning notes for the operations team.",
-                mime_type="text/plain",
-                candidates=[],
-            )
-        except (httpx.HTTPError, ValueError) as exc:
-            return {"ok": False, "message": str(exc)}
-        if result.provider == "rules":
+            base_url = validate_base_url(self.config.base_url)
+            timeout_seconds = max(3, min(self.config.timeout_seconds, 15))
+            timeout = httpx.Timeout(timeout_seconds, connect=min(5, timeout_seconds))
+            headers: dict[str, str] = {}
+            if self.config.api_key:
+                headers["Authorization"] = f"Bearer {self.config.api_key}"
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                if provider == "ollama":
+                    response = await client.get(f"{base_url}/api/tags")
+                    response.raise_for_status()
+                    models = [
+                        str(item.get("name") or item.get("model") or "").strip()
+                        for item in response.json().get("models", [])
+                        if isinstance(item, dict)
+                    ]
+                elif provider in {"lmstudio", "openai", "openai-compatible"}:
+                    url = base_url if base_url.endswith("/v1") else f"{base_url}/v1"
+                    response = await client.get(f"{url}/models", headers=headers)
+                    response.raise_for_status()
+                    models = [
+                        str(item.get("id") or "").strip()
+                        for item in response.json().get("data", [])
+                        if isinstance(item, dict)
+                    ]
+                else:
+                    raise ValueError(f"Unsupported LLM provider: {self.config.provider}")
+        except (httpx.HTTPError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
             return {
                 "ok": False,
-                "message": "The model did not return a usable response; Obsync used rules instead.",
+                "message": f"Could not reach {self.config.provider}: {exc}",
             }
+
+        models = [model for model in models if model]
+        if not models:
+            return {
+                "ok": False,
+                "message": f"Connected to {self.config.provider}, but it reported no models.",
+                "models": [],
+            }
+        selected = self.config.model.strip()
+        if selected:
+            selected_key = selected.casefold()
+            matches = {
+                name.casefold()
+                for name in models
+                if name.casefold() == selected_key
+                or name.casefold().removesuffix(":latest") == selected_key.removesuffix(":latest")
+            }
+            if not matches:
+                preview = ", ".join(models[:5])
+                return {
+                    "ok": False,
+                    "message": (
+                        f"Connected to {self.config.provider}, but '{selected}' is not available. "
+                        f"Available: {preview}"
+                    ),
+                    "models": models,
+                }
         return {
             "ok": True,
-            "message": f"Connected to {result.provider} using {result.model}.",
-            "sample": result.as_dict(),
+            "message": (
+                f"Connected to {self.config.provider}; '{selected}' is available."
+                if selected
+                else f"Connected to {self.config.provider}; found {len(models)} model(s)."
+            ),
+            "models": models,
+            "suggested_model": selected or models[0],
         }

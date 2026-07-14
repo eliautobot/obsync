@@ -41,7 +41,7 @@ NAS/share  ─┘                                     │
                                         Obsidian
 ```
 
-Each watched computer makes outbound connections to the central server. Watched computers do not need inbound firewall ports. The central server owns the processing ledger and is the only component that writes generated notes into the vault.
+Each watched computer makes outbound connections to the central server. Watched computers do not need inbound firewall ports. The central server owns the processing ledger. It can write to a Docker-mounted vault itself, or delegate safe managed-note writes to one selected desktop agent when the vault lives in Windows Documents or on another computer.
 
 Read [Architecture](docs/ARCHITECTURE.md) and [Multi-PC setup](docs/MULTI_PC.md) for the full design.
 
@@ -49,7 +49,7 @@ Read [Architecture](docs/ARCHITECTURE.md) and [Multi-PC setup](docs/MULTI_PC.md)
 
 1. Clone the repository and enter it.
 2. Copy `.env.example` to `.env`.
-3. Point `OBSYNC_VAULT_HOST_PATH` at the Obsidian vault in `.env` or the Compose command.
+3. Start with the included vault mount, or point `OBSYNC_VAULT_HOST_PATH` at a host-accessible vault. A vault on another desktop can be selected later from **Settings**.
 4. Start the server.
 
 ```bash
@@ -67,6 +67,7 @@ Example `.env` additions:
 
 ```dotenv
 OBSYNC_VAULT_HOST_PATH=/absolute/path/to/your/ObsidianVault
+OBSYNC_PUBLIC_URL=https://obsync.example.com
 OBSYNC_BIND_IP=0.0.0.0
 PUID=1000
 PGID=1000
@@ -80,22 +81,65 @@ docker compose exec -it obsync obsync admin reset-password --username admin
 
 For headless or unattended deployments, `OBSYNC_ADMIN_USERNAME` and `OBSYNC_ADMIN_PASSWORD` can create the first account. Remove both values from `.env` after the first successful start. As a short-lived alternative, `OBSYNC_LOCAL_SETUP_IPS` can trust a comma-separated management IP for initial setup; remove it immediately after securing the account. Set `OBSYNC_SECURE_COOKIES=true` when the UI is served exclusively over HTTPS.
 
-Upgrading from v0.1.0 is automatic. Local setup can replace the token directly; a remote browser asks for the old admin token once. Token access is disabled after the username/password account is created.
+Upgrading from v0.1.0 is automatic. Open Obsync locally on the server to replace the old token with a username and password; remote browsers show where setup must be completed. Token access is disabled after the account is created.
 
-## Add a watched computer
+## Updating
 
-In the web UI, choose **Sources → Add device** and create a one-time pairing code. On the watched computer:
+Update the Docker server first, then update each paired desktop agent to the same release. Obsync keeps its database in the `/data` volume and keeps the vault separate, so recreating the application container does not erase accounts, pairings, watched folders, or notes.
+
+For a server installed by cloning this repository, run these commands from the Obsync folder:
+
+```bash
+git status --short
+git pull --ff-only
+docker compose build --pull
+docker compose up -d
+docker compose ps
+curl --fail http://127.0.0.1:7769/api/v1/health
+```
+
+`git status --short` should return no output before you pull. Keep your existing `.env` file; do not replace it with `.env.example` during an update.
+
+If your Compose file uses the published `ghcr.io/eliautobot/obsync` image instead of building from the repository, run:
+
+```bash
+docker compose pull
+docker compose up -d
+docker compose ps
+curl --fail http://127.0.0.1:7769/api/v1/health
+```
+
+Update Python-based desktop agents to the same release as the server, then verify and scan:
+
+```bash
+python -m pip install --upgrade \
+  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.4.0"
+obsync --version
+obsync agent scan
+```
+
+Replace `v0.4.0` with the release you are installing. For standalone Windows agents, download the matching `obsync-agent-windows-x64.exe` from [GitHub Releases](https://github.com/eliautobot/obsync/releases), replace the previous executable, and restart its Task Scheduler task or agent process.
+
+Before any update, back up the Obsidian vault and Obsync `/data` volume. The full [Updating and rollback guide](docs/UPDATING.md) includes copy-and-paste backup commands for Linux and Windows, fixed-version installs, every agent type, verification, and safe rollback instructions.
+
+## Computers and watched folders
+
+The computer running the Obsync server appears automatically in **Sources**. You do not need to pair it. Add a desktop agent only when folders or the Obsidian vault are on another computer.
+
+Choose **Sources → Add another computer**. The Windows wizard generates one complete PowerShell command that downloads the standalone agent, pairs it, opens native folder pickers, and starts it. The equivalent manual commands are:
 
 ```bash
 python -m pip install "obsync-app @ git+https://github.com/eliautobot/obsync.git"
 obsync agent pair --server https://obsync.example.com --code XXXX-XXXX-XXXX --name "Office PC"
-obsync agent add-folder "/path/to/source" --name "Projects"
+obsync agent set-vault --browse
+obsync agent add-folder --browse
 obsync agent run
 ```
 
-On Windows, quote paths normally:
+The `set-vault` command is optional. Use it only when that desktop contains the Obsidian vault. To enter a known path instead of browsing:
 
 ```powershell
+obsync agent set-vault "C:\Users\me\Documents\My Vault"
 obsync agent add-folder "C:\Users\me\Documents\Projects" --name "Projects"
 obsync agent run
 ```
@@ -110,7 +154,7 @@ Open **Settings → Local AI organization**.
 - LM Studio: base URL such as `http://host.docker.internal:1234`, then select the model loaded in LM Studio
 - OpenAI-compatible: use any compatible local endpoint and optional API key
 
-Use **Test connection** before saving. If the model stops, Obsync continues syncing using filenames, folders, extensions, and extracted text; those notes enter review when confidence is below the configured threshold.
+Use **Check connection** before saving. The check lists available models instead of running inference, so it is fast and does not wait for a cold model to load. If the model stops, Obsync continues syncing using filenames, folders, extensions, and extracted text; those notes enter review when confidence is below the configured threshold.
 
 ## Generated-note safety
 
@@ -133,6 +177,7 @@ If a destination collision is not already an Obsync-managed note, processing sto
 - [Features and behavior](docs/FEATURES.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Getting started](docs/GETTING_STARTED.md)
+- [Updating and rollback](docs/UPDATING.md)
 - [Multi-PC and network shares](docs/MULTI_PC.md)
 - [Supported files](docs/SUPPORTED_FILES.md)
 - [Security model](docs/SECURITY.md)

@@ -28,11 +28,12 @@ Do not publish Ollama or LM Studio directly to the Internet. The Obsync server s
 - Source files are opened read-only by agents.
 - Symlinked source files are skipped.
 - Upload paths must be relative and cannot contain `..`.
-- Destination paths are resolved and verified to remain below the vault mount.
+- Destination paths are resolved and verified to remain below the mounted or selected desktop vault.
 - UUID suffixes prevent common filename collisions.
 - Existing files without Obsync ownership markers are not overwritten.
 - Atomic sibling writes reduce partial-file risk.
 - Missing sources do not delete generated notes.
+- Desktop vault writers accept only server-authenticated commands, use atomic writes, and refuse non-Obsync collisions.
 
 Mount source directories read-only when running an agent in Docker.
 

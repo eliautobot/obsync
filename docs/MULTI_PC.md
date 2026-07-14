@@ -2,13 +2,13 @@
 
 ## One server, many sources
 
-Choose the computer or server that can write the Obsidian vault. Run the Obsync server there. Every other computer runs only the lightweight agent.
+Run one central Obsync server. It appears automatically as the first computer. Add a lightweight agent only to computers that contain additional source folders or the Obsidian vault.
 
 ```text
 Home desktop ──────┐
-Office Windows PC ─┼── outbound HTTPS/Tailscale ── Obsync server ── Obsidian vault
+Office Windows PC ─┼── outbound HTTPS/Tailscale ── Obsync server ─┬─ mounted vault
 Linux workstation ─┤
-NAS folders ───────┘
+NAS folders ───────┘                                         └─ or selected desktop vault writer
 ```
 
 Because agents connect outward, the source PCs need no inbound port forwarding. The server needs one reachable HTTP(S) endpoint.
@@ -49,9 +49,13 @@ The account running the agent needs read permission only. The server never attem
 
 The agent does not mark a successful local state until the central server accepts the upload. If either side is offline, the next reconciliation retries changed files. A full rescan also detects updates that occurred while the agent was stopped.
 
-## Vault on a different PC
+## Vault placement
 
-The Obsidian app does not have to run on the source computers. It can run on the same PC as the server or on another PC that receives the vault through an existing vault-sync system. Obsync's responsibility ends after writing Markdown to the mounted server-side vault.
+Obsync supports two explicit modes:
 
-For the fewest conflicts, make the server's mounted vault the authoritative generated-note location and let Obsidian/Obsidian Sync handle normal vault availability to other personal devices.
+1. **Server-mounted vault:** Docker receives a host folder as `/vault`. This is simplest when the vault is on the server or a reliably mounted share. Docker mounts are established at container startup, so a web page cannot browse arbitrary Windows host folders later.
+2. **Vault on a desktop:** pair the desktop, run `obsync agent set-vault --browse`, and select it in **Settings**. The native agent writes only validated Obsync-managed notes into that local vault. This is the recommended mode when the vault is in Windows Documents and the server runs elsewhere.
 
+Only one vault writer is active. The server remains the authoritative ledger and queues idempotent write/status commands when a desktop is selected. If that desktop is offline, documents remain pending and complete after the agent reconnects.
+
+The Obsidian app does not need to be open, but the selected desktop agent must be running for remote writes. Keep the generated-note location backed up and avoid pointing multiple Obsync servers at the same output tree.

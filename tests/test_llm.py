@@ -154,3 +154,78 @@ async def test_disabled_llm_connection_test() -> None:
     result = await LLMAnalyzer(LLMConfig()).test_connection()
     assert result["ok"] is False
     assert "disabled" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_ollama_connection_test_uses_fast_model_list(monkeypatch) -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(
+            200,
+            json={"models": [{"name": "qwen3:8b"}, {"model": "llama3:latest"}]},
+        )
+
+    transport = httpx.MockTransport(handler)
+
+    class MockClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = transport
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", MockClient)
+    analyzer = LLMAnalyzer(
+        LLMConfig(
+            enabled=True,
+            provider="ollama",
+            base_url="http://ollama:11434",
+            model="qwen3:8b",
+            timeout_seconds=120,
+        )
+    )
+    connected = await analyzer.test_connection()
+    assert connected["ok"] is True
+    assert connected["models"] == ["qwen3:8b", "llama3:latest"]
+    assert calls == ["/api/tags"]
+
+    analyzer.config.model = "missing"
+    missing = await analyzer.test_connection()
+    assert missing["ok"] is False
+    assert "not available" in missing["message"]
+
+
+@pytest.mark.asyncio
+async def test_lmstudio_connection_test_discovers_model_and_reports_http_error(monkeypatch) -> None:
+    mode = "ok"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/models"
+        assert request.headers["Authorization"] == "Bearer secret"
+        if mode == "error":
+            return httpx.Response(503, text="loading")
+        return httpx.Response(200, json={"data": [{"id": "local-model"}]})
+
+    transport = httpx.MockTransport(handler)
+
+    class MockClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = transport
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", MockClient)
+    analyzer = LLMAnalyzer(
+        LLMConfig(
+            provider="lmstudio",
+            base_url="http://lmstudio:1234",
+            api_key="secret",
+        )
+    )
+    connected = await analyzer.test_connection()
+    assert connected["ok"] is True
+    assert connected["suggested_model"] == "local-model"
+
+    mode = "error"
+    failed = await analyzer.test_connection()
+    assert failed["ok"] is False
+    assert "Could not reach lmstudio" in failed["message"]

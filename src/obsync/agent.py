@@ -8,6 +8,7 @@ import os
 import platform
 import socket
 import sqlite3
+import tempfile
 import uuid
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field
@@ -20,6 +21,9 @@ from platformdirs import user_config_path, user_data_path
 from watchfiles import Change, awatch
 
 from . import __version__
+from .desktop import choose_directory
+from .markdown import is_managed_note, merge_preserving_manual, set_source_status
+from .security import safe_vault_path
 
 
 def default_config_path() -> Path:
@@ -55,6 +59,7 @@ class AgentConfig:
     verify_tls: bool = True
     scan_interval_seconds: int = 300
     settle_seconds: float = 1.5
+    vault_path: str = ""
     roots: list[RootConfig] = field(default_factory=list)
 
     @classmethod
@@ -96,6 +101,15 @@ class AgentConfig:
         )
         self.roots.append(root)
         return root
+
+    def set_vault(self, path: Path) -> Path:
+        resolved = path.expanduser().resolve()
+        if not resolved.is_dir():
+            raise ValueError(f"Vault folder does not exist: {resolved}")
+        if not os.access(resolved, os.W_OK):
+            raise ValueError(f"Vault folder is not writable: {resolved}")
+        self.vault_path = str(resolved)
+        return resolved
 
 
 class AgentState:
@@ -202,12 +216,14 @@ class AgentRuntime:
         *,
         state: AgentState | None = None,
         client: httpx.AsyncClient | None = None,
+        config_path: Path | None = None,
     ):
         if not config.server_url or not config.agent_token:
             raise ValueError("Agent is not paired. Run 'obsync agent pair' first.")
         self.config = config
         self.state = state or AgentState()
         self._external_client = client
+        self.config_path = config_path or default_config_path()
         self._root_ids: dict[str, str] = {}
         self._stop = asyncio.Event()
 
@@ -365,7 +381,71 @@ class AgentRuntime:
         return results
 
     async def heartbeat_once(self) -> None:
-        await self._request("POST", "/api/v1/agent/heartbeat", json={"agent_version": __version__})
+        vault = Path(self.config.vault_path).expanduser() if self.config.vault_path else None
+        vault_ready = bool(vault and vault.is_dir() and os.access(vault, os.W_OK))
+        await self._request(
+            "POST",
+            "/api/v1/agent/heartbeat",
+            json={
+                "agent_version": __version__,
+                "vault_path": str(vault) if vault else "",
+                "vault_ready": vault_ready,
+                "vault_error": "" if vault_ready or not vault else "Vault folder is unavailable",
+            },
+        )
+
+    @staticmethod
+    def _atomic_write(path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temp_name = tempfile.mkstemp(prefix=".obsync-", suffix=".tmp", dir=path.parent)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, path)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
+
+    def _write_vault_note(self, payload: dict[str, Any]) -> str:
+        if not self.config.vault_path:
+            raise ValueError("No Obsidian vault is selected on this computer")
+        destination = safe_vault_path(
+            Path(self.config.vault_path), str(payload.get("destination_path", ""))
+        )
+        content = str(payload.get("content", ""))
+        if not content:
+            raise ValueError("Vault write has no Markdown content")
+        if destination.exists():
+            current = destination.read_text(encoding="utf-8")
+            if not is_managed_note(current):
+                raise ValueError(
+                    f"Destination already exists and is not managed: {payload['destination_path']}"
+                )
+            content = merge_preserving_manual(current, content)
+        self._atomic_write(destination, content)
+        return str(destination)
+
+    def _set_remote_source_status(self, payload: dict[str, Any]) -> str:
+        if not self.config.vault_path:
+            raise ValueError("No Obsidian vault is selected on this computer")
+        destination = safe_vault_path(
+            Path(self.config.vault_path), str(payload.get("destination_path", ""))
+        )
+        if not destination.exists():
+            raise ValueError(f"Managed note is missing: {payload['destination_path']}")
+        current = destination.read_text(encoding="utf-8")
+        if not is_managed_note(current):
+            raise ValueError(
+                f"Destination exists and is not managed: {payload['destination_path']}"
+            )
+        updated = set_source_status(
+            current,
+            str(payload.get("source_status", "source-missing")),
+        )
+        self._atomic_write(destination, updated)
+        return str(destination)
 
     async def process_commands_once(self) -> None:
         response = await self._request("GET", "/api/v1/agent/commands")
@@ -380,6 +460,17 @@ class AgentRuntime:
                     root = next(r for r in self.config.roots if r.root_key == payload["root_key"])
                     path = Path(root.path) / payload["source_path"]
                     result = json.dumps(await self.sync_file(root, path))
+                elif command["command"] == "write_note":
+                    result = self._write_vault_note(command.get("payload", {}))
+                elif command["command"] == "set_source_status":
+                    result = self._set_remote_source_status(command.get("payload", {}))
+                elif command["command"] == "select_vault":
+                    selected = choose_directory(
+                        "Choose your Obsidian vault", self.config.vault_path
+                    )
+                    result = str(self.config.set_vault(selected))
+                    self.config.save(self.config_path)
+                    await self.heartbeat_once()
                 else:
                     raise ValueError(f"Unknown command: {command['command']}")
             except Exception as exc:

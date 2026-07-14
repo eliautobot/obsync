@@ -73,31 +73,49 @@ def test_first_run_setup_uses_hashed_credentials_and_secure_cookies(tmp_path: Pa
     assert client.get("/api/v1/admin/session").json()["username"] == "owner"
 
 
-def test_legacy_token_is_required_once_then_disabled(tmp_path: Path) -> None:
-    client, _app = make_client(
+def test_legacy_install_must_be_secured_locally_then_token_is_disabled(tmp_path: Path) -> None:
+    remote, _app = make_client(
         tmp_path,
         legacy_token="old-admin-token",
         trusted_local=False,
     )
-    status = client.get("/api/v1/auth/status").json()
+    status = remote.get("/api/v1/auth/status").json()
     assert status["setup_required"] is True
-    assert status["legacy_migration_required"] is True
+    assert status["legacy_migration_required"] is False
     assert (
-        client.get(
+        remote.get(
             "/api/v1/admin/overview",
             headers={"Authorization": "Bearer old-admin-token"},
         ).status_code
         == 200
     )
-    wrong = client.post(
+    blocked = remote.post(
         "/api/v1/auth/setup",
-        json={"username": "admin", "password": PASSWORD, "legacy_token": "wrong"},
+        json={
+            "username": "admin",
+            "password": PASSWORD,
+            "legacy_token": "old-admin-token",
+        },
     )
-    assert wrong.status_code == 401
-    setup_account(client, legacy_token="old-admin-token")
-    client.cookies.clear()
+    assert blocked.status_code == 403
+    assert blocked.json()["detail"] == (
+        "Create the administrator account from the Obsync server itself"
+    )
+
+    local_settings = Settings(
+        data_dir=tmp_path / "data",
+        vault_path=tmp_path / "vault",
+        admin_token="old-admin-token",
+    )
+    local = TestClient(
+        create_app(local_settings),
+        client=("127.0.0.1", 50000),
+        base_url="http://localhost:7769",
+    )
+    setup_account(local)
+    local.cookies.clear()
     assert (
-        client.get(
+        local.get(
             "/api/v1/admin/overview",
             headers={"Authorization": "Bearer old-admin-token"},
         ).status_code
@@ -276,3 +294,51 @@ def test_password_policy_and_duplicate_setup(tmp_path: Path) -> None:
         json={"username": "other", "password": PASSWORD},
     )
     assert duplicate.status_code == 400
+
+
+def test_account_settings_change_username_and_password(tmp_path: Path) -> None:
+    client, _app = make_client(tmp_path)
+    csrf = setup_account(client)
+    wrong = client.put(
+        "/api/v1/admin/account",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "username": "owner",
+            "current_password": "wrong password",
+            "new_password": "a new secure password",
+        },
+    )
+    assert wrong.status_code == 401
+
+    updated = client.put(
+        "/api/v1/admin/account",
+        headers={"X-CSRF-Token": csrf},
+        json={
+            "username": "owner",
+            "current_password": PASSWORD,
+            "new_password": "a new secure password",
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json()["username"] == "owner"
+    assert client.get("/api/v1/admin/session").json()["username"] == "owner"
+
+    client.cookies.clear()
+    assert (
+        client.post(
+            "/api/v1/auth/login",
+            json={"username": "admin", "password": PASSWORD, "remember": False},
+        ).status_code
+        == 401
+    )
+    assert (
+        client.post(
+            "/api/v1/auth/login",
+            json={
+                "username": "owner",
+                "password": "a new secure password",
+                "remember": False,
+            },
+        ).status_code
+        == 200
+    )

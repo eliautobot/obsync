@@ -18,6 +18,9 @@ services:
       OBSYNC_LOCAL_SETUP_IPS: "${OBSYNC_LOCAL_SETUP_IPS:-}"
       OBSYNC_DATA_DIR: /data
       OBSYNC_VAULT_PATH: /vault
+      # Display the host-side path in Settings while /vault remains the container mount.
+      OBSYNC_VAULT_HOST_PATH: "${OBSYNC_VAULT_HOST_PATH:-./vault}"
+      OBSYNC_PUBLIC_URL: "${OBSYNC_PUBLIC_URL:-}"
       OBSYNC_MAX_UPLOAD_MB: "${OBSYNC_MAX_UPLOAD_MB:-100}"
       OBSYNC_MAX_EXTRACT_CHARS: "${OBSYNC_MAX_EXTRACT_CHARS:-200000}"
       OBSYNC_LOG_LEVEL: "${OBSYNC_LOG_LEVEL:-info}"

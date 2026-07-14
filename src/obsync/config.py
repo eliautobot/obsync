@@ -31,6 +31,8 @@ class Settings:
     data_dir: Path
     vault_path: Path
     admin_token: str
+    vault_host_path: str = ""
+    public_url: str = ""
     admin_username: str = ""
     admin_password: str = ""
     host: str = "0.0.0.0"
@@ -56,6 +58,8 @@ class Settings:
             data_dir=data_dir,
             vault_path=vault_path,
             admin_token=admin_token,
+            vault_host_path=os.getenv("OBSYNC_VAULT_HOST_PATH", "").strip(),
+            public_url=os.getenv("OBSYNC_PUBLIC_URL", "").strip().rstrip("/"),
             admin_username=os.getenv("OBSYNC_ADMIN_USERNAME", "").strip(),
             admin_password=os.getenv("OBSYNC_ADMIN_PASSWORD", ""),
             host=os.getenv("OBSYNC_HOST", "0.0.0.0"),

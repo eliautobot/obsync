@@ -75,6 +75,12 @@ class LoginRequest(BaseModel):
     remember: bool = False
 
 
+class AccountUpdateRequest(BaseModel):
+    username: str
+    current_password: str
+    new_password: str = ""
+
+
 def _bearer(value: str | None) -> str:
     if not value:
         return ""
@@ -273,6 +279,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         local = _is_local_admin_request(request, settings)
         return {
             **status,
+            "legacy_migration_required": status["legacy_migration_required"] and local,
             "account_registered": not status["setup_required"],
             "temporary_admin_available": status["setup_required"] and local,
         }
@@ -282,7 +289,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         local = _is_local_admin_request(request, settings)
         if local and not _same_origin_request(request):
             raise HTTPException(status_code=403, detail="Cross-site account setup blocked")
-        if not local and not settings.admin_token and not service.has_admin_account():
+        if not local and not service.has_admin_account():
             raise HTTPException(
                 status_code=403,
                 detail="Create the administrator account from the Obsync server itself",
@@ -374,6 +381,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def overview(_token: AdminDependency) -> dict[str, Any]:
         return service.overview()
 
+    @app.get("/api/v1/admin/server")
+    async def server_info(_token: AdminDependency) -> dict[str, Any]:
+        return service.server_info()
+
+    @app.put("/api/v1/admin/account")
+    async def update_account(
+        payload: AccountUpdateRequest,
+        session: AdminDependency,
+    ) -> dict[str, Any]:
+        if session.get("temporary") or session.get("legacy") or not session.get("user_id"):
+            raise HTTPException(status_code=409, detail="Secure the administrator account first")
+        try:
+            return service.update_admin_account(
+                int(session["user_id"]),
+                current_password=payload.current_password,
+                username=payload.username,
+                new_password=payload.new_password,
+                keep_session_token=str(session.get("_raw_token", "")),
+            )
+        except ValueError as exc:
+            status = 401 if "Current password" in str(exc) else 400
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+
     @app.get("/api/v1/admin/agents")
     async def agents(_token: AdminDependency) -> dict[str, Any]:
         return {"items": service.list_agents()}
@@ -391,9 +421,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             label=str(payload.get("label", "")), minutes=int(payload.get("minutes", 20))
         )
 
+    @app.get("/api/v1/admin/enrollments/{enrollment_id}")
+    async def enrollment_status(enrollment_id: str, _token: AdminDependency) -> dict[str, Any]:
+        return service.enrollment_status(enrollment_id)
+
     @app.post("/api/v1/admin/agents/{agent_id}/scan")
     async def scan_agent(agent_id: str, _token: AdminDependency) -> dict[str, Any]:
         return service.queue_command(agent_id, "scan")
+
+    @app.post("/api/v1/admin/agents/{agent_id}/select-vault")
+    async def select_agent_vault(agent_id: str, _token: AdminDependency) -> dict[str, Any]:
+        return service.queue_command(agent_id, "select_vault")
 
     @app.get("/api/v1/admin/documents")
     async def documents(
@@ -458,8 +496,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return service.register_agent(payload.code, payload.model_dump(exclude={"code"}))
 
     @app.post("/api/v1/agent/heartbeat")
-    async def heartbeat(payload: dict[str, str], agent: AgentDependency) -> dict[str, bool]:
-        service.heartbeat(agent["id"], payload.get("agent_version", ""))
+    async def heartbeat(payload: dict[str, Any], agent: AgentDependency) -> dict[str, bool]:
+        service.heartbeat(
+            agent["id"],
+            str(payload.get("agent_version", "")),
+            vault_path=str(payload.get("vault_path", "")) if "vault_path" in payload else None,
+            vault_ready=bool(payload.get("vault_ready")) if "vault_ready" in payload else None,
+            vault_error=str(payload.get("vault_error", "")) if "vault_error" in payload else None,
+        )
         return {"ok": True}
 
     @app.post("/api/v1/agent/roots")

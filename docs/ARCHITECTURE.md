@@ -4,7 +4,7 @@
 
 ### Central server
 
-The server is the control plane and sole vault writer. It provides:
+The server is the control plane and authoritative processing ledger. It provides:
 
 - FastAPI HTTP API and embedded web UI
 - SQLite processing ledger in WAL mode
@@ -13,17 +13,17 @@ The server is the control plane and sole vault writer. It provides:
 - Upload staging with size limits and SHA-256 verification
 - Format-specific extraction
 - Optional local-LLM classification
-- Atomic generated-note writes
+- Atomic local generated-note writes or authenticated remote write commands
 - Review queue, event history, and remote command queue
 
-The Docker container receives two persistent mounts:
+The Docker container receives two persistent mounts in server-mounted mode:
 
 - `/data`: database, administrator sessions, and temporary uploads
 - `/vault`: an Obsidian vault or a dedicated folder inside one
 
 ### Watch agent
 
-The agent runs beside source folders. It never needs access to the Obsidian vault. It provides:
+The agent runs beside source folders. It can optionally be selected as the single vault writer when the vault is on that desktop. It provides:
 
 - OS filesystem events through `watchfiles`
 - Periodic reconciliation to catch missed events or offline changes
@@ -32,6 +32,8 @@ The agent runs beside source folders. It never needs access to the Obsidian vaul
 - Multipart upload over HTTP(S)
 - Missing-source notices
 - Polling for central scan/retry commands
+- Native folder selection for watched roots and an optional vault
+- Safe atomic writes restricted to Obsync-managed notes below the selected vault
 
 Every network connection starts from the agent. No inbound port is required on a watched device.
 
@@ -39,8 +41,8 @@ Every network connection starts from the agent. No inbound port is required on a
 
 The server—not each agent—connects to the configured model endpoint. Supported protocols:
 
-- Ollama `/api/chat`
-- OpenAI-compatible `/v1/chat/completions`, including LM Studio
+- Ollama `/api/chat` for classification and `/api/tags` for connection checks
+- OpenAI-compatible `/v1/chat/completions` for classification and `/v1/models` for connection checks, including LM Studio
 
 The server sends extracted text, metadata, and an allowlist of candidate related-note titles. It rejects related links not present in that allowlist.
 
@@ -56,7 +58,7 @@ The server sends extracted text, metadata, and an allowlist of candidate related
 7. LLM returns structured classification, or rules provide fallback
 8. Server chooses/stabilizes destination and renders Markdown
 9. Server merges the preserved manual section
-10. Atomic replace writes the note under /vault
+10. Server writes atomically under `/vault`, or queues the managed note for the selected desktop vault writer
 11. SQLite ledger and event stream are updated
 ```
 
@@ -82,7 +84,7 @@ Obsync replaces the properties and generated region. Text following `## My notes
 
 ## Scaling model
 
-SQLite and single-server vault writing are intentional. Obsidian vaults are filesystem-oriented, and one writer prevents conflicting output. A single server comfortably coordinates many agents and typical personal/team document collections. Upload and LLM work can later move to a bounded worker queue without changing the agent protocol.
+SQLite and a single selected vault writer are intentional. Obsidian vaults are filesystem-oriented, and one writer prevents conflicting output. A single server comfortably coordinates many agents and typical personal/team document collections. Upload and LLM work can later move to a bounded worker queue without changing the agent protocol.
 
 ## Trust boundaries
 
@@ -93,7 +95,7 @@ SQLite and single-server vault writing are intentional. Obsidian vaults are file
 [Authenticated server process]
         │ validated relative destination
         ▼
-[Mounted Obsidian vault]
+[Mounted vault or selected desktop vault writer]
 ```
 
 Before registration, temporary Admin is accepted only when the network peer is loopback/the Docker host gateway and the request targets a loopback hostname, or when the peer was explicitly allowlisted for setup. It has no reusable credential; cross-site writes are rejected. A remote browser cannot claim a fresh server. After registration, temporary access disappears.

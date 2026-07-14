@@ -3,8 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
+import socket
 import tempfile
 import uuid
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -34,6 +37,8 @@ from .security import (
 )
 
 DEFAULT_SETTINGS: dict[str, tuple[str, bool]] = {
+    "vault_mode": ("local", False),
+    "vault_agent_id": ("", False),
     "llm_enabled": ("false", False),
     "llm_provider": ("ollama", False),
     "llm_base_url": ("", False),
@@ -308,6 +313,39 @@ class ObsyncService:
         self.db.add_event("auth.admin_reset", f"Admin credentials reset for {username}")
         return {"id": user_id, "username": username}
 
+    def update_admin_account(
+        self,
+        user_id: int,
+        *,
+        current_password: str,
+        username: str,
+        new_password: str = "",
+        keep_session_token: str = "",
+    ) -> dict[str, Any]:
+        username = validate_username(username)
+        if new_password:
+            validate_password(new_password)
+        user = self.db.query_one("SELECT * FROM admin_users WHERE id = ?", (user_id,))
+        if not user or not verify_password(current_password, str(user["password_hash"])):
+            raise ValueError("Current password is incorrect")
+        password_hash = hash_password(new_password) if new_password else user["password_hash"]
+        now = utc_now()
+        with self.db.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE admin_users SET username = ?, password_hash = ?, updated_at = ? WHERE id = ?
+                """,
+                (username, password_hash, now, user_id),
+            )
+            if new_password:
+                keep_hash = hash_token(keep_session_token) if keep_session_token else ""
+                connection.execute(
+                    "DELETE FROM admin_sessions WHERE user_id = ? AND token_hash != ?",
+                    (user_id, keep_hash),
+                )
+        self.db.add_event("auth.admin_updated", f"Admin account updated for {username}")
+        return {"id": user_id, "username": username}
+
     def create_enrollment(self, label: str = "", minutes: int = 20) -> dict[str, Any]:
         code = new_enrollment_code()
         enrollment_id = str(uuid.uuid4())
@@ -360,8 +398,8 @@ class ObsyncService:
                 ),
             )
             connection.execute(
-                "UPDATE enrollments SET used_at = ? WHERE id = ?",
-                (now.isoformat(), enrollment["id"]),
+                "UPDATE enrollments SET used_at = ?, agent_id = ? WHERE id = ?",
+                (now.isoformat(), agent_id, enrollment["id"]),
             )
         self.db.add_event("agent.registered", f"Device {name} joined Obsync", agent_id=agent_id)
         return {"agent_id": agent_id, "agent_token": token, "name": name}
@@ -374,15 +412,55 @@ class ObsyncService:
             return None
         return row
 
-    def heartbeat(self, agent_id: str, version: str = "") -> None:
+    def enrollment_status(self, enrollment_id: str) -> dict[str, Any]:
+        enrollment = self.db.query_one(
+            "SELECT id, label, expires_at, used_at, agent_id FROM enrollments WHERE id = ?",
+            (enrollment_id,),
+        )
+        if not enrollment:
+            raise ValueError("Enrollment not found")
+        agent = None
+        if enrollment.get("agent_id"):
+            agent = self.db.query_one(
+                "SELECT id, name, hostname, os_name, last_seen_at FROM agents WHERE id = ?",
+                (enrollment["agent_id"],),
+            )
+        enrollment["connected"] = bool(agent)
+        enrollment["agent"] = agent
+        return enrollment
+
+    def heartbeat(
+        self,
+        agent_id: str,
+        version: str = "",
+        *,
+        vault_path: str | None = None,
+        vault_ready: bool | None = None,
+        vault_error: str | None = None,
+    ) -> None:
         now = utc_now()
         self.db.execute(
             """
             UPDATE agents SET status = 'online', last_seen_at = ?, updated_at = ?,
-                              agent_version = CASE WHEN ? = '' THEN agent_version ELSE ? END
+                              agent_version = CASE WHEN ? = '' THEN agent_version ELSE ? END,
+                              vault_path = CASE WHEN ? IS NULL THEN vault_path ELSE ? END,
+                              vault_ready = CASE WHEN ? IS NULL THEN vault_ready ELSE ? END,
+                              vault_error = CASE WHEN ? IS NULL THEN vault_error ELSE ? END
             WHERE id = ?
             """,
-            (now, now, version, version[:50], agent_id),
+            (
+                now,
+                now,
+                version,
+                version[:50],
+                vault_path,
+                (vault_path or "")[:2000],
+                vault_ready,
+                int(bool(vault_ready)),
+                vault_error,
+                (vault_error or "")[:1000],
+                agent_id,
+            ),
         )
 
     def list_agents(self) -> list[dict[str, Any]]:
@@ -469,6 +547,54 @@ class ObsyncService:
             params = (agent_id,)
         sql += " GROUP BY r.id ORDER BY a.name COLLATE NOCASE, r.name COLLATE NOCASE"
         return [self._decode_root(row) for row in self.db.query_all(sql, params)]
+
+    def server_info(self) -> dict[str, Any]:
+        in_container = Path("/.dockerenv").exists() or Path("/run/.containerenv").exists()
+        return {
+            "name": "Obsync server",
+            "hostname": socket.gethostname(),
+            "os_name": platform.system(),
+            "os_version": platform.release(),
+            "container": in_container,
+            "vault_path": str(self.settings.vault_path),
+            "vault_host_path": self.settings.vault_host_path,
+            "vault_writable": self.settings.vault_path.exists()
+            and os.access(self.settings.vault_path, os.W_OK),
+            "public_url": self.settings.public_url,
+        }
+
+    def vault_status(self) -> dict[str, Any]:
+        mode = self.db.get_setting("vault_mode", "local")
+        if mode == "agent":
+            agent_id = self.db.get_setting("vault_agent_id", "")
+            agent = self.db.query_one("SELECT * FROM agents WHERE id = ?", (agent_id,))
+            return {
+                "mode": "agent",
+                "agent_id": agent_id,
+                "agent_name": agent["name"] if agent else "",
+                "path": agent["vault_path"] if agent else "",
+                "exists": bool(agent and agent["vault_ready"]),
+                "writable": bool(agent and agent["vault_ready"] and agent["enabled"]),
+            }
+        return {
+            "mode": "local",
+            "agent_id": "",
+            "agent_name": "Obsync server",
+            "path": str(self.settings.vault_path),
+            "host_path": self.settings.vault_host_path,
+            "exists": self.settings.vault_path.exists(),
+            "writable": self.settings.vault_path.exists()
+            and os.access(self.settings.vault_path, os.W_OK),
+        }
+
+    def _remote_vault_agent(self) -> dict[str, Any] | None:
+        if self.db.get_setting("vault_mode", "local") != "agent":
+            return None
+        agent_id = self.db.get_setting("vault_agent_id", "")
+        agent = self.db.query_one("SELECT * FROM agents WHERE id = ? AND enabled = 1", (agent_id,))
+        if not agent or not agent["vault_ready"] or not agent["vault_path"]:
+            raise ValueError("The selected desktop vault is unavailable")
+        return agent
 
     @staticmethod
     def _decode_root(row: dict[str, Any]) -> dict[str, Any]:
@@ -664,8 +790,6 @@ class ObsyncService:
                     analysis=analysis,
                 )
             )
-            destination_path = safe_vault_path(self.settings.vault_path, destination)
-
             generated = render_markdown(
                 document_id=document_id,
                 source_path=source_rel,
@@ -682,20 +806,25 @@ class ObsyncService:
                 truncated=extracted.truncated,
                 analysis=analysis,
             )
-            if destination_path.exists():
-                current = destination_path.read_text(encoding="utf-8")
-                if not is_managed_note(current):
-                    raise ValueError(
-                        f"Destination already exists and is not managed: {destination}"
-                    )
-                generated = merge_preserving_manual(current, generated)
-            self._atomic_write(destination_path, generated)
+            remote_vault = self._remote_vault_agent()
+            status = "pending-write" if remote_vault else "synced"
+            processed_at = None if remote_vault else utc_now()
+            if not remote_vault:
+                destination_path = safe_vault_path(self.settings.vault_path, destination)
+                if destination_path.exists():
+                    current = destination_path.read_text(encoding="utf-8")
+                    if not is_managed_note(current):
+                        raise ValueError(
+                            f"Destination already exists and is not managed: {destination}"
+                        )
+                    generated = merge_preserving_manual(current, generated)
+                self._atomic_write(destination_path, generated)
 
-            processed_at = utc_now()
+            updated_at = utc_now()
             self.db.execute(
                 """
                 UPDATE documents SET mime_type = ?, destination_path = ?, title = ?, category = ?,
-                    tags_json = ?, summary = ?, analysis_json = ?, status = 'synced',
+                    tags_json = ?, summary = ?, analysis_json = ?, status = ?,
                     llm_status = ?, confidence = ?, needs_review = ?, missing = 0, error = '',
                     processed_at = ?, updated_at = ? WHERE id = ?
                 """,
@@ -707,17 +836,32 @@ class ObsyncService:
                     json.dumps(analysis.tags, ensure_ascii=False),
                     analysis.summary,
                     json.dumps(analysis.as_dict(), ensure_ascii=False),
+                    status,
                     "analyzed" if analysis.provider != "rules" else "rules",
                     analysis.confidence,
                     int(needs_review),
                     processed_at,
-                    processed_at,
+                    updated_at,
                     document_id,
                 ),
             )
+            if remote_vault:
+                self.queue_command(
+                    remote_vault["id"],
+                    "write_note",
+                    {
+                        "document_id": document_id,
+                        "destination_path": destination,
+                        "content": generated,
+                    },
+                )
             self.db.add_event(
-                "document.synced",
-                f"Synced {source_rel} to {destination}",
+                "document.write_queued" if remote_vault else "document.synced",
+                (
+                    f"Queued {source_rel} for {remote_vault['name']}"
+                    if remote_vault
+                    else f"Synced {source_rel} to {destination}"
+                ),
                 agent_id=agent["id"],
                 root_id=root_id,
                 document_id=document_id,
@@ -725,7 +869,10 @@ class ObsyncService:
             )
             row = self.db.query_one("SELECT * FROM documents WHERE id = ?", (document_id,))
             assert row is not None
-            return {**self._decode_document(row), "result": "synced"}
+            return {
+                **self._decode_document(row),
+                "result": "queued" if remote_vault else "synced",
+            }
         except Exception as exc:
             self.db.execute(
                 "UPDATE documents SET status = 'error', error = ?, updated_at = ? WHERE id = ?",
@@ -752,10 +899,24 @@ class ObsyncService:
         if document["missing"]:
             return {"result": "unchanged", **self._decode_document(document)}
         if document["destination_path"]:
-            note_path = safe_vault_path(self.settings.vault_path, document["destination_path"])
-            if note_path.exists():
-                updated = set_source_status(note_path.read_text(encoding="utf-8"), "source-missing")
-                self._atomic_write(note_path, updated)
+            remote_vault = self._remote_vault_agent()
+            if remote_vault:
+                self.queue_command(
+                    remote_vault["id"],
+                    "set_source_status",
+                    {
+                        "document_id": document["id"],
+                        "destination_path": document["destination_path"],
+                        "source_status": "source-missing",
+                    },
+                )
+            else:
+                note_path = safe_vault_path(self.settings.vault_path, document["destination_path"])
+                if note_path.exists():
+                    updated = set_source_status(
+                        note_path.read_text(encoding="utf-8"), "source-missing"
+                    )
+                    self._atomic_write(note_path, updated)
         now = utc_now()
         self.db.execute(
             "UPDATE documents SET missing = 1, updated_at = ? WHERE id = ?", (now, document["id"])
@@ -853,6 +1014,11 @@ class ObsyncService:
         return rows
 
     def complete_command(self, agent_id: str, command_id: str, result: str, ok: bool) -> None:
+        command = self.db.query_one(
+            "SELECT * FROM commands WHERE id = ? AND agent_id = ?", (command_id, agent_id)
+        )
+        if not command:
+            raise ValueError("Unknown command")
         self.db.execute(
             """
             UPDATE commands SET status = ?, result = ?, completed_at = ?
@@ -860,27 +1026,59 @@ class ObsyncService:
             """,
             ("completed" if ok else "failed", result[:4000], utc_now(), command_id, agent_id),
         )
+        payload = json.loads(command.get("payload_json") or "{}")
+        document_id = str(payload.get("document_id", ""))
+        if command["command"] == "write_note" and document_id:
+            now = utc_now()
+            self.db.execute(
+                """
+                UPDATE documents SET status = ?, error = ?, processed_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    "synced" if ok else "error",
+                    "" if ok else result[:2000],
+                    now if ok else None,
+                    now,
+                    document_id,
+                ),
+            )
+            self.db.add_event(
+                "document.synced" if ok else "document.error",
+                (
+                    f"Desktop vault wrote {payload.get('destination_path', '')}"
+                    if ok
+                    else f"Desktop vault write failed: {result[:500]}"
+                ),
+                level="info" if ok else "error",
+                agent_id=agent_id,
+                document_id=document_id,
+            )
 
     def overview(self) -> dict[str, Any]:
         stats = self.db.dashboard_stats()
         stats["online_agents"] = sum(1 for row in self.list_agents() if row["status"] == "online")
+        stats["computers"] = stats["agents"] + 1
+        stats["online_computers"] = stats["online_agents"] + 1
         events = self.db.query_all("SELECT * FROM events ORDER BY created_at DESC LIMIT 20")
         for event in events:
             event["details"] = json.loads(event.pop("details_json") or "{}")
         return {
             "stats": stats,
             "recent_events": events,
-            "vault": {
-                "path": str(self.settings.vault_path),
-                "exists": self.settings.vault_path.exists(),
-                "writable": os.access(self.settings.vault_path, os.W_OK),
-            },
+            "vault": self.vault_status(),
+            "server": self.server_info(),
         }
 
     def settings_for_ui(self) -> dict[str, Any]:
         values = self.db.get_settings()
         result: dict[str, Any] = {
             "vault_path": str(self.settings.vault_path),
+            "vault_host_path": self.settings.vault_host_path,
+            "public_url": self.settings.public_url,
+            "runtime": "docker"
+            if Path("/.dockerenv").exists() or Path("/run/.containerenv").exists()
+            else "native",
             "max_upload_mb": self.settings.max_upload_mb,
         }
         for key, row in values.items():
@@ -892,6 +1090,8 @@ class ObsyncService:
 
     def update_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
         allowed: dict[str, bool] = {
+            "vault_mode": False,
+            "vault_agent_id": False,
             "llm_enabled": False,
             "llm_provider": False,
             "llm_base_url": False,
@@ -901,6 +1101,16 @@ class ObsyncService:
             "review_threshold": False,
         }
         values: dict[str, tuple[str, bool]] = {}
+        requested_mode = str(payload.get("vault_mode", "")).strip()
+        if requested_mode and requested_mode not in {"local", "agent"}:
+            raise ValueError("Vault mode must be local or agent")
+        if requested_mode == "agent":
+            requested_agent = str(payload.get("vault_agent_id", "")).strip()
+            agent = self.db.query_one(
+                "SELECT * FROM agents WHERE id = ? AND enabled = 1", (requested_agent,)
+            )
+            if not agent or not agent["vault_ready"] or not agent["vault_path"]:
+                raise ValueError("Select a connected computer with an available Obsidian vault")
         for key, secret in allowed.items():
             if key not in payload:
                 continue
@@ -926,4 +1136,7 @@ class ObsyncService:
             key = overrides.get("llm_api_key")
             if key and key != "configured":
                 config.api_key = str(key)
+            if "llm_timeout_seconds" in overrides:
+                with suppress(TypeError, ValueError):
+                    config.timeout_seconds = max(5, min(int(overrides["llm_timeout_seconds"]), 600))
         return await LLMAnalyzer(config).test_connection()

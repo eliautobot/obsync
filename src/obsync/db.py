@@ -65,6 +65,9 @@ CREATE TABLE IF NOT EXISTS agents (
     os_name TEXT NOT NULL,
     os_version TEXT NOT NULL DEFAULT '',
     agent_version TEXT NOT NULL DEFAULT '',
+    vault_path TEXT NOT NULL DEFAULT '',
+    vault_ready INTEGER NOT NULL DEFAULT 0,
+    vault_error TEXT NOT NULL DEFAULT '',
     token_hash TEXT NOT NULL UNIQUE,
     status TEXT NOT NULL DEFAULT 'online',
     enabled INTEGER NOT NULL DEFAULT 1,
@@ -79,6 +82,7 @@ CREATE TABLE IF NOT EXISTS enrollments (
     label TEXT NOT NULL DEFAULT '',
     expires_at TEXT NOT NULL,
     used_at TEXT,
+    agent_id TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -178,11 +182,27 @@ class Database:
     def initialize(self) -> None:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            agent_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(agents)").fetchall()
+            }
+            for name, declaration in {
+                "vault_path": "TEXT NOT NULL DEFAULT ''",
+                "vault_ready": "INTEGER NOT NULL DEFAULT 0",
+                "vault_error": "TEXT NOT NULL DEFAULT ''",
+            }.items():
+                if name not in agent_columns:
+                    connection.execute(f"ALTER TABLE agents ADD COLUMN {name} {declaration}")
+            enrollment_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(enrollments)").fetchall()
+            }
+            if "agent_id" not in enrollment_columns:
+                connection.execute("ALTER TABLE enrollments ADD COLUMN agent_id TEXT")
             row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
-                connection.execute("INSERT INTO schema_meta(version) VALUES (2)")
-            elif int(row["version"]) < 2:
-                connection.execute("UPDATE schema_meta SET version = 2")
+                connection.execute("INSERT INTO schema_meta(version) VALUES (3)")
+            elif int(row["version"]) < 3:
+                connection.execute("UPDATE schema_meta SET version = 3")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
