@@ -120,6 +120,7 @@ If a destination collision is not already an Obsync-managed note, processing sto
 
 ## Documentation
 
+- [Project record](docs/PROJECT_RECORD.md)
 - [Features and behavior](docs/FEATURES.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Getting started](docs/GETTING_STARTED.md)
