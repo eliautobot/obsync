@@ -2,12 +2,18 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
 const state = {
-  token: localStorage.getItem("obsync_token") || sessionStorage.getItem("obsync_token") || "",
+  authMode: "login",
   view: "overview",
   overview: null,
   agents: [],
   roots: [],
 };
+
+function cookie(name) {
+  const prefix = `${encodeURIComponent(name)}=`;
+  const item = document.cookie.split("; ").find((value) => value.startsWith(prefix));
+  return item ? decodeURIComponent(item.slice(prefix.length)) : "";
+}
 
 const viewMeta = {
   overview: ["Overview", "Your knowledge pipeline at a glance."],
@@ -35,15 +41,20 @@ function relativeTime(value) {
 }
 
 async function api(path, options = {}) {
-  const headers = { ...(options.headers || {}), Authorization: `Bearer ${state.token}` };
+  const headers = { ...(options.headers || {}) };
+  const method = (options.method || "GET").toUpperCase();
+  if (!["GET", "HEAD", "OPTIONS"].includes(method)) {
+    const csrfToken = cookie("obsync_csrf");
+    if (csrfToken) headers["X-CSRF-Token"] = csrfToken;
+  }
   if (options.body && typeof options.body !== "string" && !(options.body instanceof FormData)) {
     headers["Content-Type"] = "application/json";
     options.body = JSON.stringify(options.body);
   }
-  const response = await fetch(path, { ...options, headers });
-  if (response.status === 401) {
-    lock();
-    throw new Error("Your admin token was rejected.");
+  const response = await fetch(path, { ...options, headers, credentials: "same-origin" });
+  if (response.status === 401 && !options.authRequest) {
+    showLogin();
+    throw new Error("Your session expired. Sign in again.");
   }
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
@@ -59,23 +70,66 @@ function toast(message, error = false) {
   toast.timer = setTimeout(() => { element.hidden = true; }, 4000);
 }
 
-function lock() {
-  state.token = "";
+function clearLegacyToken() {
   localStorage.removeItem("obsync_token");
   sessionStorage.removeItem("obsync_token");
-  $("#app").hidden = true;
-  $("#login-screen").hidden = false;
-  $("#token-input").value = "";
 }
 
-async function unlock(token, remember) {
-  state.token = token;
-  await api("/api/v1/admin/session");
-  (remember ? localStorage : sessionStorage).setItem("obsync_token", token);
-  if (remember) sessionStorage.removeItem("obsync_token");
+function showLogin(message = "") {
+  state.authMode = "login";
+  $("#app").hidden = true;
+  $("#login-screen").hidden = false;
+  $("#auth-title").textContent = "Sign in to Obsync";
+  $("#auth-description").textContent = "Use the administrator login for this Obsync server.";
+  $("#legacy-token-field").hidden = true;
+  $("#confirm-password-field").hidden = true;
+  $("#password-input").autocomplete = "current-password";
+  $("#remember-login").checked = false;
+  $("#auth-submit").textContent = "Sign in";
+  $("#login-error").textContent = message;
+}
+
+function showSetup(legacyMigrationRequired) {
+  state.authMode = "setup";
+  $("#app").hidden = true;
+  $("#login-screen").hidden = false;
+  $("#auth-title").textContent = legacyMigrationRequired ? "Upgrade your login" : "Create your admin account";
+  $("#auth-description").textContent = legacyMigrationRequired
+    ? "Choose an easier username and password. Your current token is needed only this once."
+    : "Choose the login you will use to manage this Obsync server.";
+  $("#legacy-token-field").hidden = !legacyMigrationRequired;
+  $("#confirm-password-field").hidden = false;
+  $("#password-input").autocomplete = "new-password";
+  $("#remember-login").checked = true;
+  $("#auth-submit").textContent = "Create account";
+  $("#login-error").textContent = "";
+  $("#username-input").value ||= "admin";
+  if (legacyMigrationRequired) {
+    $("#legacy-token-input").value = localStorage.getItem("obsync_token")
+      || sessionStorage.getItem("obsync_token") || "";
+  }
+}
+
+async function openApp() {
+  clearLegacyToken();
   $("#login-screen").hidden = true;
   $("#app").hidden = false;
   await navigate("overview");
+}
+
+async function bootstrapAuth() {
+  try {
+    const status = await api("/api/v1/auth/status", { authRequest: true });
+    if (status.setup_required) {
+      showSetup(status.legacy_migration_required);
+      return;
+    }
+    clearLegacyToken();
+    const session = await api("/api/v1/admin/session", { authRequest: true });
+    if (session.authenticated) await openApp();
+  } catch (error) {
+    showLogin(error.message === "Sign in required" ? "" : error.message);
+  }
 }
 
 function setTheme(theme) {
@@ -275,10 +329,48 @@ function settingsPayload() {
 $("#login-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   $("#login-error").textContent = "";
-  try { await unlock($("#token-input").value.trim(), $("#remember-token").checked); }
-  catch (error) { $("#login-error").textContent = error.message; }
+  const username = $("#username-input").value.trim();
+  const password = $("#password-input").value;
+  const remember = $("#remember-login").checked;
+  const button = $("#auth-submit");
+  button.disabled = true;
+  try {
+    if (state.authMode === "setup") {
+      if (password !== $("#confirm-password-input").value) {
+        throw new Error("Passwords do not match.");
+      }
+      await api("/api/v1/auth/setup", {
+        method: "POST",
+        authRequest: true,
+        body: {
+          username,
+          password,
+          remember,
+          legacy_token: $("#legacy-token-input").value.trim(),
+        },
+      });
+    } else {
+      await api("/api/v1/auth/login", {
+        method: "POST",
+        authRequest: true,
+        body: { username, password, remember },
+      });
+    }
+    $("#password-input").value = "";
+    $("#confirm-password-input").value = "";
+    $("#legacy-token-input").value = "";
+    await openApp();
+  } catch (error) {
+    $("#login-error").textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
 });
-$("#logout-button").addEventListener("click", lock);
+$("#logout-button").addEventListener("click", async () => {
+  try { await api("/api/v1/auth/logout", { method: "POST" }); }
+  catch (_error) { /* A missing/expired session still means the user is signed out. */ }
+  showLogin();
+});
 $("#theme-button").addEventListener("click", () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark"));
 $("#refresh-button").addEventListener("click", () => navigate(state.view));
 $("#menu-button").addEventListener("click", () => {
@@ -290,4 +382,4 @@ $$(".nav-item").forEach((button) => button.addEventListener("click", () => navig
 
 const storedTheme = localStorage.getItem("obsync_theme");
 setTheme(storedTheme || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"));
-if (state.token) unlock(state.token, !!localStorage.getItem("obsync_token")).catch(lock);
+bootstrapAuth();

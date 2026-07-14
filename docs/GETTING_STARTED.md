@@ -8,10 +8,9 @@ Requirements:
 - A writable Obsidian vault path on the server host
 - A private network, VPN, or HTTPS reverse proxy if agents connect across machines
 
-Clone the repository, create `.env`, and set at least:
+Clone the repository, create `.env`, and set the vault path:
 
 ```dotenv
-OBSYNC_ADMIN_TOKEN=a-long-random-secret
 OBSYNC_VAULT_HOST_PATH=/absolute/path/to/MyVault
 ```
 
@@ -23,7 +22,19 @@ docker compose ps
 curl http://127.0.0.1:7769/api/v1/health
 ```
 
-Open the UI, enter the admin token, and verify that **System → Obsidian vault** says **Ready**.
+Open the UI immediately on a trusted private network, create the administrator username/password, and verify that **System → Obsidian vault** says **Ready**. A password must contain at least 10 characters; a memorable passphrase is recommended.
+
+For unattended first boot, set both `OBSYNC_ADMIN_USERNAME` and `OBSYNC_ADMIN_PASSWORD`, start the server once, and then remove those plaintext values from `.env`. If the UI is available only over HTTPS, also set `OBSYNC_SECURE_COOKIES=true`.
+
+To recover a forgotten login:
+
+```bash
+docker compose exec -it obsync obsync admin reset-password --username admin
+```
+
+### Upgrade from v0.1.0
+
+On the first visit after upgrading, choose a username/password and enter the old admin token once. If the old token was remembered in that browser, Obsync fills it automatically. Once setup succeeds, the old token can no longer access the admin API.
 
 ### Windows Docker host
 
@@ -122,4 +133,3 @@ Start with a test folder and vault backup. Confirm:
 - LLM confidence is calibrated appropriately
 - Editing below **My notes** survives a source update
 - Removing a source marks the note missing without deleting it
-

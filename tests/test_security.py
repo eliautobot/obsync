@@ -5,12 +5,16 @@ from pathlib import Path
 import pytest
 
 from obsync.security import (
+    hash_password,
     hash_token,
     new_enrollment_code,
     new_token,
     safe_relative_path,
     safe_vault_path,
     slugify,
+    validate_password,
+    validate_username,
+    verify_password,
     verify_token,
 )
 
@@ -22,6 +26,28 @@ def test_tokens_are_random_and_verifiable() -> None:
     assert first != second
     assert verify_token(first, hash_token(first))
     assert not verify_token(second, hash_token(first))
+
+
+def test_passwords_are_salted_and_verifiable() -> None:
+    first = hash_password("a memorable password")
+    second = hash_password("a memorable password")
+    assert first.startswith("scrypt$")
+    assert first != second
+    assert verify_password("a memorable password", first)
+    assert not verify_password("wrong password", first)
+    assert not verify_password("a memorable password", "not-a-valid-hash")
+
+
+@pytest.mark.parametrize("password", ["short", "123456789"])
+def test_weak_passwords_are_rejected(password: str) -> None:
+    with pytest.raises(ValueError, match="at least 10"):
+        validate_password(password)
+
+
+@pytest.mark.parametrize("username", ["ab", "admin user", "admin/owner"])
+def test_invalid_usernames_are_rejected(username: str) -> None:
+    with pytest.raises(ValueError):
+        validate_username(username)
 
 
 def test_enrollment_code_is_human_readable() -> None:

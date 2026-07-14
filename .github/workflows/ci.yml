@@ -46,7 +46,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/obsync-vault" "$RUNNER_TEMP/obsync-data"
           docker run -d --name obsync-ci \
             --user "$(id -u):$(id -g)" \
-            -e OBSYNC_ADMIN_TOKEN=ci-admin-token \
+            -e OBSYNC_ADMIN_USERNAME=ci-admin \
+            -e OBSYNC_ADMIN_PASSWORD=ci-test-password \
             -v "$RUNNER_TEMP/obsync-vault:/vault" \
             -v "$RUNNER_TEMP/obsync-data:/data" \
             -p 127.0.0.1:7769:7769 obsync:ci
@@ -58,6 +59,16 @@ jobs:
           done
           docker logs obsync-ci
           exit 1
+      - name: Smoke test username/password login
+        run: |
+          curl --fail --silent --show-error \
+            --cookie-jar "$RUNNER_TEMP/obsync-cookies" \
+            --header 'Content-Type: application/json' \
+            --data '{"username":"ci-admin","password":"ci-test-password","remember":false}' \
+            http://127.0.0.1:7769/api/v1/auth/login
+          curl --fail --silent --show-error \
+            --cookie "$RUNNER_TEMP/obsync-cookies" \
+            http://127.0.0.1:7769/api/v1/admin/session
       - name: Container logs
         if: always()
         run: docker logs obsync-ci || true

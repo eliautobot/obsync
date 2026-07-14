@@ -49,6 +49,8 @@ Generated notes are grouped by destination prefix, source device, watched folder
 
 - Responsive minimal interface
 - Automatic system/light/dark theme with manual toggle
+- First-run administrator username/password setup with safe v0.1.0 token migration
+- Expiring browser sessions, sign-out, CSRF protection, and login throttling
 - Dashboard counts and event stream
 - Device and watched-root status
 - One-time device enrollment codes
@@ -68,6 +70,7 @@ Generated notes are grouped by destination prefix, source device, watched folder
 - Manual note content below the generated boundary is preserved
 - Source deletion is represented as status, never propagated as note deletion
 - API secrets are never returned to the UI after storage
+- Administrator passwords and browser session credentials are never stored in plaintext
 
 ## Deliberate non-goals for the first release
 
@@ -76,4 +79,3 @@ Generated notes are grouped by destination prefix, source device, watched folder
 - Cloud-hosted accounts or billing
 - Embedding/vector search as a hard dependency
 - Replacing Obsidian Sync for vault-to-vault replication
-

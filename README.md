@@ -48,7 +48,7 @@ Read [Architecture](docs/ARCHITECTURE.md) and [Multi-PC setup](docs/MULTI_PC.md)
 ## Quick start: central server
 
 1. Clone the repository and enter it.
-2. Copy `.env.example` to `.env` and set a long random `OBSYNC_ADMIN_TOKEN`.
+2. Copy `.env.example` to `.env`.
 3. Point `OBSYNC_VAULT_HOST_PATH` at the Obsidian vault in `.env` or the Compose command.
 4. Start the server.
 
@@ -59,19 +59,26 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-Open `http://SERVER_IP:7769` and enter the admin token. The default Compose file exposes port `7769`; use a private LAN/VPN or an HTTPS reverse proxy for remote access.
+Open `http://SERVER_IP:7769` and create the administrator username and password. The first browser to reach a fresh server can create the account, so complete setup immediately on a trusted private network. The default Compose file exposes port `7769`; use a private LAN/VPN or an HTTPS reverse proxy for remote access.
 
 Example `.env` additions:
 
 ```dotenv
-OBSYNC_ADMIN_TOKEN=generate-a-long-random-value
 OBSYNC_VAULT_HOST_PATH=/absolute/path/to/your/ObsidianVault
 OBSYNC_BIND_IP=0.0.0.0
 PUID=1000
 PGID=1000
 ```
 
-If no admin token is supplied, Obsync generates one in `/data/admin-token.txt` and prints it in the container logs. Retrieve it with `docker compose exec obsync cat /data/admin-token.txt`.
+Passwords are hashed with scrypt in `/data/obsync.db`. Browser sessions use expiring HttpOnly cookies, CSRF protection, and login rate limiting. If you forget the login, reset it from the server:
+
+```bash
+docker compose exec -it obsync obsync admin reset-password --username admin
+```
+
+For unattended deployments, `OBSYNC_ADMIN_USERNAME` and `OBSYNC_ADMIN_PASSWORD` can create the first account. Remove both values from `.env` after the first successful start. Set `OBSYNC_SECURE_COOKIES=true` when the UI is served exclusively over HTTPS.
+
+Upgrading from v0.1.0 is automatic. Obsync asks for the old admin token once, then disables token access after the username/password account is created.
 
 ## Add a watched computer
 

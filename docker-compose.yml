@@ -9,7 +9,11 @@ services:
     ports:
       - "${OBSYNC_BIND_IP:-0.0.0.0}:${OBSYNC_PORT:-7769}:7769"
     environment:
+      OBSYNC_ADMIN_USERNAME: "${OBSYNC_ADMIN_USERNAME:-}"
+      OBSYNC_ADMIN_PASSWORD: "${OBSYNC_ADMIN_PASSWORD:-}"
+      # Pre-0.2 migration only. Ignored after a username/password account exists.
       OBSYNC_ADMIN_TOKEN: "${OBSYNC_ADMIN_TOKEN:-}"
+      OBSYNC_SECURE_COOKIES: "${OBSYNC_SECURE_COOKIES:-false}"
       OBSYNC_DATA_DIR: /data
       OBSYNC_VAULT_PATH: /vault
       OBSYNC_MAX_UPLOAD_MB: "${OBSYNC_MAX_UPLOAD_MB:-100}"

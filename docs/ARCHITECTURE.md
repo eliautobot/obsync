@@ -8,6 +8,7 @@ The server is the control plane and sole vault writer. It provides:
 
 - FastAPI HTTP API and embedded web UI
 - SQLite processing ledger in WAL mode
+- Scrypt-hashed administrator credentials and expiring browser sessions
 - One-time enrollment and hashed device tokens
 - Upload staging with size limits and SHA-256 verification
 - Format-specific extraction
@@ -17,7 +18,7 @@ The server is the control plane and sole vault writer. It provides:
 
 The Docker container receives two persistent mounts:
 
-- `/data`: database, generated admin token, and temporary uploads
+- `/data`: database, administrator sessions, and temporary uploads
 - `/vault`: an Obsidian vault or a dedicated folder inside one
 
 ### Watch agent
@@ -95,5 +96,4 @@ SQLite and single-server vault writing are intentional. Obsidian vaults are file
 [Mounted Obsidian vault]
 ```
 
-Admin and agent tokens have separate privileges. Enrollment codes are single-use and expire. Tokens are stored as SHA-256 digests in the server database. Production deployments should terminate TLS at a private reverse proxy or run entirely over a private VPN/LAN.
-
+Administrator passwords are scrypt-hashed. Random browser session and CSRF values are stored only as SHA-256 digests; the session credential is held in an HttpOnly, SameSite cookie. Login attempts are rate limited. Agent tokens have separate privileges, and enrollment codes are single-use and expire. Production deployments should terminate TLS at a private reverse proxy or run entirely over a private VPN/LAN.

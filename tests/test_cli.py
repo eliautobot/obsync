@@ -7,29 +7,36 @@ import pytest
 
 from obsync.agent import AgentConfig
 from obsync.cli import (
+    _admin_reset,
     _agent_add,
     _agent_list,
-    _ensure_admin_token,
+    _load_legacy_admin_token,
     build_parser,
 )
 from obsync.config import Settings
 
 
-def test_admin_token_is_generated_then_reused(tmp_path: Path) -> None:
+def test_legacy_admin_token_is_loaded_but_not_generated(tmp_path: Path) -> None:
     settings = Settings(tmp_path / "data", tmp_path / "vault", "")
     settings.prepare()
-    token, created = _ensure_admin_token(settings)
-    assert created is True
-    assert token.startswith("admin_")
-    second_settings = Settings(settings.data_dir, settings.vault_path, "")
-    second, second_created = _ensure_admin_token(second_settings)
-    assert second == token
-    assert second_created is False
+    assert _load_legacy_admin_token(settings) == ""
+    token_file = settings.data_dir / "admin-token.txt"
+    token_file.write_text("old-token\n", encoding="utf-8")
+    assert _load_legacy_admin_token(settings) == "old-token"
 
 
 def test_existing_environment_admin_token_is_kept(tmp_path: Path) -> None:
     settings = Settings(tmp_path / "data", tmp_path / "vault", "provided")
-    assert _ensure_admin_token(settings) == ("provided", False)
+    assert _load_legacy_admin_token(settings) == "provided"
+
+
+def test_settings_loads_pre_upgrade_token_file(tmp_path: Path, monkeypatch) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "admin-token.txt").write_text("old-generated-token\n", encoding="utf-8")
+    monkeypatch.setenv("OBSYNC_DATA_DIR", str(data_dir))
+    monkeypatch.delenv("OBSYNC_ADMIN_TOKEN", raising=False)
+    assert Settings.from_env().admin_token == "old-generated-token"
 
 
 def test_cli_parser_has_server_and_agent_commands() -> None:
@@ -41,6 +48,17 @@ def test_cli_parser_has_server_and_agent_commands() -> None:
     )
     assert pair.server == "http://localhost"
     assert pair.agent_command == "pair"
+    reset = parser.parse_args(["admin", "reset-password", "--username", "owner"])
+    assert reset.username == "owner"
+
+
+def test_admin_reset_command_creates_account(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("OBSYNC_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("OBSYNC_VAULT_PATH", str(tmp_path / "vault"))
+    answers = iter(["new secure password", "new secure password"])
+    monkeypatch.setattr("obsync.cli.getpass.getpass", lambda _prompt: next(answers))
+    assert _admin_reset(argparse.Namespace(username="owner")) == 0
+    assert "credentials updated for owner" in capsys.readouterr().out
 
 
 def test_agent_add_and_list_commands(tmp_path: Path, capsys) -> None:

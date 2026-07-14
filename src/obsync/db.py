@@ -25,6 +25,39 @@ CREATE TABLE IF NOT EXISTS settings (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS admin_users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS admin_sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES admin_users(id) ON DELETE CASCADE,
+    csrf_hash TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    user_agent TEXT NOT NULL DEFAULT '',
+    client_ip TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_admin_sessions_expiry
+ON admin_sessions(expires_at);
+
+CREATE TABLE IF NOT EXISTS auth_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username_key TEXT NOT NULL,
+    client_key TEXT NOT NULL,
+    succeeded INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_attempts_lookup
+ON auth_attempts(username_key, client_key, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS agents (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -147,7 +180,9 @@ class Database:
             connection.executescript(SCHEMA)
             row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
-                connection.execute("INSERT INTO schema_meta(version) VALUES (1)")
+                connection.execute("INSERT INTO schema_meta(version) VALUES (2)")
+            elif int(row["version"]) < 2:
+                connection.execute("UPDATE schema_meta SET version = 2")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

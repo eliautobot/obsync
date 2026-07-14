@@ -9,6 +9,7 @@ Obsync is a self-hosted ingestion layer that keeps an Obsidian vault aligned wit
 - Source: <https://github.com/eliautobot/obsync>
 - License: MIT
 - Initial release: `v0.1.0`
+- Current release: `v0.2.0`
 
 ## Product decisions
 
@@ -20,6 +21,11 @@ Obsync is a self-hosted ingestion layer that keeps an Obsidian vault aligned wit
 - Non-Obsync destination collisions stop processing instead of overwriting a note.
 - Local AI is optional. Ollama, LM Studio, and OpenAI-compatible endpoints are supported, with deterministic rules as the offline fallback.
 - One server coordinates any number of paired devices and watched folders.
+- Human administrators use username/password login; agents keep separate non-interactive device tokens.
+
+## Authentication update
+
+Version 0.2.0 replaces the long administrator token login with first-run username/password setup. It uses scrypt password hashing, expiring HttpOnly sessions, CSRF protection, login throttling, a recovery command, and a one-time migration that disables the old token after account creation.
 
 ## Initial validation
 

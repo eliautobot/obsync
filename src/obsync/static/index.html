@@ -27,7 +27,7 @@
         </nav>
         <div class="sidebar-foot">
           <div class="server-dot"><i></i><span>Server connected</span></div>
-          <span id="version-label">v0.1.0</span>
+          <span id="version-label">v0.2.0</span>
         </div>
       </aside>
 
@@ -41,7 +41,7 @@
           <div class="topbar-actions">
             <button class="icon-button" id="refresh-button" aria-label="Refresh">↻</button>
             <button class="icon-button" id="theme-button" aria-label="Toggle theme">◐</button>
-            <button class="avatar" id="logout-button" aria-label="Lock Obsync">O</button>
+            <button class="avatar" id="logout-button" aria-label="Sign out">O</button>
           </div>
         </header>
         <section class="content" id="content" aria-live="polite"></section>
@@ -54,12 +54,28 @@
           <path d="M16 11a15 15 0 0 1 21 4l3-3v11H29l3.3-3.3A9 9 0 0 0 19 17"/>
           <path d="M32 37a15 15 0 0 1-21-4l-3 3V25h11l-3.3 3.3A9 9 0 0 0 29 31"/>
         </svg>
-        <h1>Welcome to Obsync</h1>
-        <p>Enter the admin token from your Docker logs or <code>/data/admin-token.txt</code>.</p>
-        <label for="token-input">Admin token</label>
-        <input id="token-input" type="password" autocomplete="current-password" required placeholder="admin_…">
-        <label class="check-row"><input id="remember-token" type="checkbox"> Remember on this browser</label>
-        <button class="primary full" type="submit">Open Obsync</button>
+        <h1 id="auth-title">Sign in to Obsync</h1>
+        <p id="auth-description">Use the administrator login for this Obsync server.</p>
+        <div class="field" id="legacy-token-field" hidden>
+          <label for="legacy-token-input">Current admin token</label>
+          <input id="legacy-token-input" type="password" autocomplete="off" placeholder="Required once to upgrade">
+          <small>This is needed once to securely replace the old token login.</small>
+        </div>
+        <div class="field">
+          <label for="username-input">Username</label>
+          <input id="username-input" type="text" autocomplete="username" required maxlength="64" placeholder="admin">
+        </div>
+        <div class="field">
+          <label for="password-input">Password</label>
+          <input id="password-input" type="password" autocomplete="current-password" required placeholder="Your password">
+        </div>
+        <div class="field" id="confirm-password-field" hidden>
+          <label for="confirm-password-input">Confirm password</label>
+          <input id="confirm-password-input" type="password" autocomplete="new-password" placeholder="Repeat your password">
+          <small>Use at least 10 characters. A memorable passphrase works well.</small>
+        </div>
+        <label class="check-row"><input id="remember-login" type="checkbox"> Keep me signed in</label>
+        <button class="primary full" id="auth-submit" type="submit">Sign in</button>
         <p class="form-error" id="login-error" role="alert"></p>
       </form>
     </div>

@@ -31,8 +31,20 @@ def client(app) -> TestClient:
 
 
 @pytest.fixture
-def admin_headers() -> dict[str, str]:
-    return {"Authorization": "Bearer test-admin-token"}
+def admin_headers(client: TestClient) -> dict[str, str]:
+    response = client.post(
+        "/api/v1/auth/setup",
+        json={
+            "username": "admin",
+            "password": "correct horse battery staple",
+            "legacy_token": "test-admin-token",
+            "remember": False,
+        },
+    )
+    assert response.status_code == 200, response.text
+    csrf_token = client.cookies.get("obsync_csrf")
+    assert csrf_token
+    return {"X-CSRF-Token": csrf_token}
 
 
 @pytest.fixture

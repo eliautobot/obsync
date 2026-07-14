@@ -20,12 +20,16 @@ from .markdown import (
     set_source_status,
 )
 from .security import (
+    hash_password,
     hash_token,
     new_enrollment_code,
     new_token,
     safe_relative_path,
     safe_vault_path,
     slugify,
+    validate_password,
+    validate_username,
+    verify_password,
     verify_token,
 )
 
@@ -40,6 +44,10 @@ DEFAULT_SETTINGS: dict[str, tuple[str, bool]] = {
 }
 
 
+class LoginRateLimitedError(ValueError):
+    pass
+
+
 class ObsyncService:
     def __init__(self, settings: Settings, db: Database | None = None):
         self.settings = settings
@@ -47,6 +55,8 @@ class ObsyncService:
         self.db = db or Database(settings.database_path)
         self.db.initialize()
         self._ensure_defaults()
+        self._dummy_password_hash = hash_password("obsync-invalid-password")
+        self._bootstrap_admin_from_env()
 
     def _ensure_defaults(self) -> None:
         existing = self.db.get_settings()
@@ -54,10 +64,243 @@ class ObsyncService:
         if missing:
             self.db.set_settings(missing)
 
+    def _bootstrap_admin_from_env(self) -> None:
+        if self.has_admin_account():
+            return
+        username = self.settings.admin_username
+        password = self.settings.admin_password
+        if not username and not password:
+            return
+        if not username or not password:
+            raise ValueError("OBSYNC_ADMIN_USERNAME and OBSYNC_ADMIN_PASSWORD must be set together")
+        self.create_admin_account(username, password, bootstrap=True)
+
+    def has_admin_account(self) -> bool:
+        return self.db.query_one("SELECT id FROM admin_users LIMIT 1") is not None
+
+    def setup_status(self) -> dict[str, bool]:
+        setup_required = not self.has_admin_account()
+        return {
+            "setup_required": setup_required,
+            "legacy_migration_required": setup_required and bool(self.settings.admin_token),
+        }
+
     def verify_admin(self, token: str) -> bool:
+        """Verify the pre-0.2 admin token only until an admin account is created."""
+        if self.has_admin_account():
+            return False
         return bool(self.settings.admin_token and token) and verify_token(
             token, hash_token(self.settings.admin_token)
         )
+
+    def create_admin_account(
+        self,
+        username: str,
+        password: str,
+        *,
+        legacy_token: str = "",
+        bootstrap: bool = False,
+    ) -> dict[str, Any]:
+        username = validate_username(username)
+        validate_password(password)
+        if self.has_admin_account():
+            raise ValueError("Admin account setup is already complete")
+        if self.settings.admin_token and not bootstrap and not self.verify_admin(legacy_token):
+            raise ValueError("The current admin token is incorrect")
+        now = utc_now()
+        with self.db.transaction() as connection:
+            existing = connection.execute("SELECT id FROM admin_users LIMIT 1").fetchone()
+            if existing:
+                raise ValueError("Admin account setup is already complete")
+            cursor = connection.execute(
+                """
+                INSERT INTO admin_users(username, password_hash, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (username, hash_password(password), now, now),
+            )
+            user_id = int(cursor.lastrowid)
+        self.db.add_event("auth.admin_created", f"Admin account {username} was created")
+        return {"id": user_id, "username": username}
+
+    def _record_login_attempt(self, username_key: str, client_key: str, *, succeeded: bool) -> None:
+        now = utc_now()
+        self.db.execute(
+            """
+            INSERT INTO auth_attempts(username_key, client_key, succeeded, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (username_key, client_key, int(succeeded), now),
+        )
+        cutoff = (datetime.now(UTC) - timedelta(days=1)).isoformat(timespec="seconds")
+        self.db.execute("DELETE FROM auth_attempts WHERE created_at < ?", (cutoff,))
+
+    def _login_is_rate_limited(self, username_key: str, client_key: str) -> bool:
+        cutoff = (datetime.now(UTC) - timedelta(minutes=15)).isoformat(timespec="seconds")
+        row = self.db.query_one(
+            """
+            SELECT count(*) AS failures
+            FROM auth_attempts
+            WHERE username_key = ? AND client_key = ? AND succeeded = 0 AND created_at >= ?
+            """,
+            (username_key, client_key, cutoff),
+        )
+        client_row = self.db.query_one(
+            """
+            SELECT count(*) AS failures
+            FROM auth_attempts
+            WHERE client_key = ? AND succeeded = 0 AND created_at >= ?
+            """,
+            (client_key, cutoff),
+        )
+        return bool(
+            (row and int(row["failures"]) >= 5)
+            or (client_row and int(client_row["failures"]) >= 20)
+        )
+
+    def login_admin(
+        self,
+        username: str,
+        password: str,
+        *,
+        remember: bool,
+        client_ip: str = "",
+        user_agent: str = "",
+    ) -> dict[str, Any]:
+        username_key = username.strip().casefold()[:64]
+        client_key = (client_ip or "unknown")[:128]
+        if self._login_is_rate_limited(username_key, client_key):
+            raise LoginRateLimitedError("Too many failed attempts. Try again in 15 minutes")
+        user = self.db.query_one(
+            "SELECT * FROM admin_users WHERE username = ? COLLATE NOCASE", (username.strip(),)
+        )
+        encoded = str(user["password_hash"]) if user else self._dummy_password_hash
+        if not verify_password(password, encoded) or not user:
+            self._record_login_attempt(username_key, client_key, succeeded=False)
+            raise ValueError("Username or password is incorrect")
+        self._record_login_attempt(username_key, client_key, succeeded=True)
+        self.db.execute(
+            "DELETE FROM auth_attempts WHERE username_key = ? AND client_key = ?",
+            (username_key, client_key),
+        )
+        return self.create_admin_session(
+            user,
+            remember=remember,
+            client_ip=client_ip,
+            user_agent=user_agent,
+        )
+
+    def create_admin_session(
+        self,
+        user: dict[str, Any],
+        *,
+        remember: bool,
+        client_ip: str = "",
+        user_agent: str = "",
+    ) -> dict[str, Any]:
+        token = new_token("session")
+        csrf_token = new_token("csrf")
+        now = datetime.now(UTC)
+        lifetime = (
+            timedelta(days=self.settings.remembered_session_days)
+            if remember
+            else timedelta(hours=self.settings.session_hours)
+        )
+        expires = now + lifetime
+        self.db.execute("DELETE FROM admin_sessions WHERE expires_at <= ?", (now.isoformat(),))
+        self.db.execute(
+            """
+            INSERT INTO admin_sessions(token_hash, user_id, csrf_hash, expires_at, created_at,
+                                       last_seen_at, user_agent, client_ip)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                hash_token(token),
+                user["id"],
+                hash_token(csrf_token),
+                expires.isoformat(timespec="seconds"),
+                now.isoformat(timespec="seconds"),
+                now.isoformat(timespec="seconds"),
+                user_agent[:500],
+                client_ip[:128],
+            ),
+        )
+        return {
+            "token": token,
+            "csrf_token": csrf_token,
+            "expires_at": expires.isoformat(timespec="seconds"),
+            "max_age": int(lifetime.total_seconds()),
+            "username": user["username"],
+            "user_id": user["id"],
+        }
+
+    def authenticate_admin_session(self, token: str) -> dict[str, Any] | None:
+        if not token:
+            return None
+        session = self.db.query_one(
+            """
+            SELECT s.*, u.username
+            FROM admin_sessions s
+            JOIN admin_users u ON u.id = s.user_id
+            WHERE s.token_hash = ?
+            """,
+            (hash_token(token),),
+        )
+        if not session:
+            return None
+        now = datetime.now(UTC)
+        if datetime.fromisoformat(session["expires_at"]) <= now:
+            self.db.execute(
+                "DELETE FROM admin_sessions WHERE token_hash = ?", (session["token_hash"],)
+            )
+            return None
+        try:
+            last_seen = datetime.fromisoformat(session["last_seen_at"])
+        except (TypeError, ValueError):
+            last_seen = now - timedelta(hours=1)
+        if now - last_seen >= timedelta(minutes=5):
+            self.db.execute(
+                "UPDATE admin_sessions SET last_seen_at = ? WHERE token_hash = ?",
+                (now.isoformat(timespec="seconds"), session["token_hash"]),
+            )
+        return session
+
+    def verify_admin_csrf(self, session: dict[str, Any], csrf_token: str) -> bool:
+        return bool(csrf_token) and verify_token(csrf_token, str(session["csrf_hash"]))
+
+    def logout_admin(self, token: str) -> None:
+        if token:
+            self.db.execute("DELETE FROM admin_sessions WHERE token_hash = ?", (hash_token(token),))
+
+    def reset_admin_account(self, username: str, password: str) -> dict[str, Any]:
+        username = validate_username(username)
+        validate_password(password)
+        now = utc_now()
+        password_hash = hash_password(password)
+        with self.db.transaction() as connection:
+            user = connection.execute("SELECT id FROM admin_users LIMIT 1").fetchone()
+            if user:
+                user_id = int(user["id"])
+                connection.execute(
+                    """
+                    UPDATE admin_users
+                    SET username = ?, password_hash = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (username, password_hash, now, user_id),
+                )
+                connection.execute("DELETE FROM admin_sessions")
+            else:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO admin_users(username, password_hash, created_at, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (username, password_hash, now, now),
+                )
+                user_id = int(cursor.lastrowid)
+        self.db.add_event("auth.admin_reset", f"Admin credentials reset for {username}")
+        return {"id": user_id, "username": username}
 
     def create_enrollment(self, label: str = "", minutes: int = 20) -> dict[str, Any]:
         code = new_enrollment_code()

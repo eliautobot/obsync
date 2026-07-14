@@ -2,34 +2,30 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import os
-import secrets
 import sys
 from contextlib import suppress
 from pathlib import Path
 
 import uvicorn
 
+from . import __version__
 from .agent import AgentConfig, AgentRuntime, default_config_path, pair_agent
 from .config import Settings
+from .service import ObsyncService
 
 
-def _ensure_admin_token(settings: Settings) -> tuple[str, bool]:
+def _load_legacy_admin_token(settings: Settings) -> str:
     if settings.admin_token:
-        return settings.admin_token, False
+        return settings.admin_token
     token_file = settings.data_dir / "admin-token.txt"
     if token_file.exists():
         token = token_file.read_text(encoding="utf-8").strip()
         if token:
             settings.admin_token = token
-            return token, False
-    token = f"admin_{secrets.token_urlsafe(32)}"
-    token_file.parent.mkdir(parents=True, exist_ok=True)
-    token_file.write_text(token + "\n", encoding="utf-8")
-    if os.name != "nt":
-        token_file.chmod(0o600)
-    settings.admin_token = token
-    return token, True
+            return token
+    return ""
 
 
 def _server(args: argparse.Namespace) -> int:
@@ -39,12 +35,9 @@ def _server(args: argparse.Namespace) -> int:
     if args.port:
         settings.port = args.port
     settings.prepare()
-    token, created = _ensure_admin_token(settings)
-    if created:
-        print("\nObsync created an admin token. Save it in your password manager:\n")
-        print(token)
-        print(f"\nA private copy is stored at {settings.data_dir / 'admin-token.txt'}\n")
-    os.environ["OBSYNC_ADMIN_TOKEN"] = token
+    legacy_token = _load_legacy_admin_token(settings)
+    if legacy_token:
+        os.environ["OBSYNC_ADMIN_TOKEN"] = legacy_token
     os.environ["OBSYNC_DATA_DIR"] = str(settings.data_dir)
     os.environ["OBSYNC_VAULT_PATH"] = str(settings.vault_path)
     uvicorn.run(
@@ -55,6 +48,19 @@ def _server(args: argparse.Namespace) -> int:
         proxy_headers=True,
         forwarded_allow_ips=os.getenv("OBSYNC_FORWARDED_ALLOW_IPS", "127.0.0.1"),
     )
+    return 0
+
+
+def _admin_reset(args: argparse.Namespace) -> int:
+    settings = Settings.from_env()
+    settings.prepare()
+    _load_legacy_admin_token(settings)
+    password = getpass.getpass("New password: ")
+    confirmation = getpass.getpass("Confirm password: ")
+    if password != confirmation:
+        raise ValueError("Passwords do not match")
+    account = ObsyncService(settings).reset_admin_account(args.username, password)
+    print(f"Admin credentials updated for {account['username']}. All sessions were signed out.")
     return 0
 
 
@@ -130,13 +136,21 @@ def build_parser() -> argparse.ArgumentParser:
         prog="obsync",
         description="Turn folders from any computer into organized Obsidian Markdown.",
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.1.0")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
 
     server = commands.add_parser("server", help="Run the central Obsync server")
     server.add_argument("--host", default="", help="Bind host (default: OBSYNC_HOST or 0.0.0.0)")
     server.add_argument("--port", type=int, default=0, help="Bind port (default: 7769)")
     server.set_defaults(handler=_server)
+
+    admin = commands.add_parser("admin", help="Manage the Obsync administrator account")
+    admin_commands = admin.add_subparsers(dest="admin_command", required=True)
+    reset_password = admin_commands.add_parser(
+        "reset-password", help="Create or reset the administrator login"
+    )
+    reset_password.add_argument("--username", default="admin", help="Administrator username")
+    reset_password.set_defaults(handler=_admin_reset)
 
     agent = commands.add_parser("agent", help="Manage the folder-watching agent")
     agent_commands = agent.add_subparsers(dest="agent_command", required=True)

@@ -35,9 +35,10 @@ def test_health_ui_and_admin_auth(client: TestClient, admin_headers: dict[str, s
     health = client.get("/api/v1/health")
     assert health.status_code == 200
     assert health.json()["vault_ready"] is True
-    assert "Welcome to Obsync" in client.get("/").text
+    assert "Sign in to Obsync" in client.get("/").text
+    assert client.get("/api/v1/admin/overview").status_code == 200
+    client.cookies.clear()
     assert client.get("/api/v1/admin/overview").status_code == 401
-    assert client.get("/api/v1/admin/overview", headers=admin_headers).status_code == 200
 
 
 def test_enrollment_is_single_use(client: TestClient, admin_headers: dict[str, str]) -> None:
@@ -216,7 +217,7 @@ def test_admin_listing_review_and_event_routes(
 
 
 def test_invalid_agent_and_root_are_rejected(
-    client: TestClient, agent_headers: dict[str, str]
+    client: TestClient, admin_headers: dict[str, str], agent_headers: dict[str, str]
 ) -> None:
     assert client.get("/api/v1/agent/commands").status_code == 401
     bad_root = client.post(
@@ -232,6 +233,6 @@ def test_invalid_agent_and_root_are_rejected(
     assert bad_root.status_code == 400
     unknown_scan = client.post(
         "/api/v1/admin/agents/unknown/scan",
-        headers={"Authorization": "Bearer test-admin-token"},
+        headers=admin_headers,
     )
     assert unknown_scan.status_code == 400

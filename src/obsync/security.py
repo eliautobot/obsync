@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import re
@@ -18,6 +19,71 @@ def verify_token(token: str, expected_hash: str) -> bool:
 
 def new_token(prefix: str = "obs") -> str:
     return f"{prefix}_{secrets.token_urlsafe(32)}"
+
+
+_SCRYPT_N = 2**14
+_SCRYPT_R = 8
+_SCRYPT_P = 1
+_PASSWORD_MAX_BYTES = 1024
+
+
+def validate_username(username: str) -> str:
+    value = username.strip()
+    if not 3 <= len(value) <= 64:
+        raise ValueError("Username must be between 3 and 64 characters")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value):
+        raise ValueError("Username may contain letters, numbers, periods, underscores, and hyphens")
+    return value
+
+
+def validate_password(password: str) -> str:
+    if len(password) < 10:
+        raise ValueError("Password must be at least 10 characters")
+    if len(password.encode("utf-8")) > _PASSWORD_MAX_BYTES:
+        raise ValueError("Password is too long")
+    return password
+
+
+def hash_password(password: str, *, salt: bytes | None = None) -> str:
+    validate_password(password)
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.scrypt(
+        password.encode("utf-8"),
+        salt=salt,
+        n=_SCRYPT_N,
+        r=_SCRYPT_R,
+        p=_SCRYPT_P,
+        dklen=32,
+    )
+    encoded_salt = base64.urlsafe_b64encode(salt).decode("ascii").rstrip("=")
+    encoded_digest = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    return f"scrypt${_SCRYPT_N}${_SCRYPT_R}${_SCRYPT_P}${encoded_salt}${encoded_digest}"
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    try:
+        if len(password.encode("utf-8")) > _PASSWORD_MAX_BYTES:
+            return False
+        algorithm, n, r, p, encoded_salt, encoded_digest = encoded.split("$", 5)
+        if algorithm != "scrypt" or (int(n), int(r), int(p)) != (
+            _SCRYPT_N,
+            _SCRYPT_R,
+            _SCRYPT_P,
+        ):
+            return False
+        salt = base64.urlsafe_b64decode(encoded_salt + "=" * (-len(encoded_salt) % 4))
+        expected = base64.urlsafe_b64decode(encoded_digest + "=" * (-len(encoded_digest) % 4))
+        candidate = hashlib.scrypt(
+            password.encode("utf-8"),
+            salt=salt,
+            n=int(n),
+            r=int(r),
+            p=int(p),
+            dklen=len(expected),
+        )
+        return hmac.compare_digest(candidate, expected)
+    except (ValueError, TypeError, OverflowError):
+        return False
 
 
 def new_enrollment_code() -> str:

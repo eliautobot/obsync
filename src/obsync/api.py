@@ -14,6 +14,7 @@ from fastapi import (
     HTTPException,
     Query,
     Request,
+    Response,
     UploadFile,
 )
 from fastapi.responses import FileResponse, JSONResponse
@@ -22,7 +23,10 @@ from pydantic import BaseModel, Field
 
 from . import __version__
 from .config import Settings
-from .service import ObsyncService
+from .service import LoginRateLimitedError, ObsyncService
+
+SESSION_COOKIE = "obsync_session"
+CSRF_COOKIE = "obsync_csrf"
 
 
 class RegistrationRequest(BaseModel):
@@ -54,6 +58,19 @@ class CommandCompleteRequest(BaseModel):
     result: str = ""
 
 
+class SetupRequest(BaseModel):
+    username: str
+    password: str
+    legacy_token: str = ""
+    remember: bool = True
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+    remember: bool = False
+
+
 def _bearer(value: str | None) -> str:
     if not value:
         return ""
@@ -69,13 +86,24 @@ ServiceDependency = Annotated[ObsyncService, Depends(get_service)]
 
 
 def require_admin(
+    request: Request,
     service: ServiceDependency,
     authorization: Annotated[str | None, Header()] = None,
-) -> str:
+    x_csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, Any]:
+    session_token = request.cookies.get(SESSION_COOKIE, "")
+    session = service.authenticate_admin_session(session_token)
+    if session:
+        if request.method not in {"GET", "HEAD", "OPTIONS"} and not service.verify_admin_csrf(
+            session, x_csrf_token or ""
+        ):
+            raise HTTPException(status_code=403, detail="Invalid CSRF token")
+        session["_raw_token"] = session_token
+        return session
     token = _bearer(authorization)
     if not service.verify_admin(token):
-        raise HTTPException(status_code=401, detail="Invalid admin token")
-    return token
+        raise HTTPException(status_code=401, detail="Sign in required")
+    return {"legacy": True}
 
 
 def require_agent(
@@ -88,8 +116,46 @@ def require_agent(
     return agent
 
 
-AdminDependency = Annotated[str, Depends(require_admin)]
+AdminDependency = Annotated[dict[str, Any], Depends(require_admin)]
 AgentDependency = Annotated[dict[str, Any], Depends(require_agent)]
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else ""
+
+
+def _set_session_cookies(
+    response: Response,
+    session: dict[str, Any],
+    *,
+    secure: bool,
+) -> None:
+    max_age = int(session["max_age"])
+    response.set_cookie(
+        SESSION_COOKIE,
+        session["token"],
+        max_age=max_age,
+        httponly=True,
+        secure=secure,
+        samesite="strict",
+        path="/",
+    )
+    response.set_cookie(
+        CSRF_COOKIE,
+        session["csrf_token"],
+        max_age=max_age,
+        httponly=False,
+        secure=secure,
+        samesite="strict",
+        path="/",
+    )
+
+
+def _clear_session_cookies(response: Response, *, secure: bool) -> None:
+    response.delete_cookie(
+        SESSION_COOKIE, httponly=True, secure=secure, samesite="strict", path="/"
+    )
+    response.delete_cookie(CSRF_COOKIE, httponly=False, secure=secure, samesite="strict", path="/")
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -133,11 +199,83 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/v1/meta")
     async def meta() -> dict[str, Any]:
-        return {"name": "Obsync", "version": __version__, "authentication": "bearer"}
+        return {"name": "Obsync", "version": __version__, "authentication": "session"}
+
+    @app.get("/api/v1/auth/status")
+    async def auth_status() -> dict[str, bool]:
+        return service.setup_status()
+
+    @app.post("/api/v1/auth/setup")
+    def auth_setup(payload: SetupRequest, request: Request, response: Response) -> dict[str, Any]:
+        try:
+            user = service.create_admin_account(
+                payload.username,
+                payload.password,
+                legacy_token=payload.legacy_token,
+            )
+        except ValueError as exc:
+            status = 401 if "token is incorrect" in str(exc) else 400
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+        session = service.create_admin_session(
+            user,
+            remember=payload.remember,
+            client_ip=_client_ip(request),
+            user_agent=request.headers.get("user-agent", ""),
+        )
+        _set_session_cookies(
+            response,
+            session,
+            secure=settings.secure_cookies or request.url.scheme == "https",
+        )
+        return {"authenticated": True, "username": user["username"]}
+
+    @app.post("/api/v1/auth/login")
+    def auth_login(payload: LoginRequest, request: Request, response: Response) -> dict[str, Any]:
+        if not service.has_admin_account():
+            raise HTTPException(status_code=409, detail="Complete admin account setup first")
+        try:
+            session = service.login_admin(
+                payload.username,
+                payload.password,
+                remember=payload.remember,
+                client_ip=_client_ip(request),
+                user_agent=request.headers.get("user-agent", ""),
+            )
+        except LoginRateLimitedError as exc:
+            raise HTTPException(
+                status_code=429,
+                detail=str(exc),
+                headers={"Retry-After": "900"},
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        _set_session_cookies(
+            response,
+            session,
+            secure=settings.secure_cookies or request.url.scheme == "https",
+        )
+        return {"authenticated": True, "username": session["username"]}
+
+    @app.post("/api/v1/auth/logout")
+    async def auth_logout(
+        request: Request,
+        response: Response,
+        session: AdminDependency,
+    ) -> dict[str, bool]:
+        service.logout_admin(str(session.get("_raw_token", "")))
+        _clear_session_cookies(
+            response,
+            secure=settings.secure_cookies or request.url.scheme == "https",
+        )
+        return {"ok": True}
 
     @app.get("/api/v1/admin/session")
-    async def admin_session(_token: AdminDependency) -> dict[str, bool]:
-        return {"authenticated": True}
+    async def admin_session(session: AdminDependency) -> dict[str, Any]:
+        return {
+            "authenticated": True,
+            "username": session.get("username", "admin"),
+            "legacy": bool(session.get("legacy")),
+        }
 
     @app.get("/api/v1/admin/overview")
     async def overview(_token: AdminDependency) -> dict[str, Any]:
