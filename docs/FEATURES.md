@@ -70,6 +70,9 @@ Generated notes are grouped by destination prefix, source device, watched folder
 - Automatic server computer plus optional paired desktops
 - Native desktop folder picker for watched roots and the vault
 - Account menu with administrator username/password management and explicit sign-out
+- Guided Windows Companion with per-user installation, silent background operation, and automatic sign-in startup
+- Contextual `?` explanations across controls and a complete in-app Help center
+- Top-layer notifications that remain sharp and readable above open dialogs
 
 ## Safety guarantees
 

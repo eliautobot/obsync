@@ -33,10 +33,22 @@ jobs:
         run: >-
           uv run pyinstaller --noconfirm --clean --onefile
           --collect-all obsync --name "${{ matrix.artifact }}" scripts/obsync_entry.py
+      - name: Build Windows Companion
+        if: runner.os == 'Windows'
+        shell: bash
+        run: >-
+          uv run pyinstaller --noconfirm --clean --onefile --windowed
+          --collect-all obsync --hidden-import tkinter
+          --name "obsync-companion-windows-x64" scripts/obsync_companion.py
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: dist/${{ matrix.artifact }}${{ matrix.extension }}
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: obsync-companion-windows-x64
+          path: dist/obsync-companion-windows-x64.exe
 
   container:
     runs-on: ubuntu-latest
@@ -69,12 +81,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          pattern: obsync-agent-*
+          pattern: obsync-*
           path: release-artifacts
           merge-multiple: true
       - name: Create GitHub release
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: >-
-          gh release create "${GITHUB_REF_NAME}" release-artifacts/*
-          --generate-notes --title "Obsync ${GITHUB_REF_NAME}"
+        run: |
+          notes="docs/releases/${GITHUB_REF_NAME}.md"
+          if [[ -f "$notes" ]]; then
+            gh release create "${GITHUB_REF_NAME}" release-artifacts/* \
+              --notes-file "$notes" --title "Obsync ${GITHUB_REF_NAME}"
+          else
+            gh release create "${GITHUB_REF_NAME}" release-artifacts/* \
+              --generate-notes --title "Obsync ${GITHUB_REF_NAME}"
+          fi

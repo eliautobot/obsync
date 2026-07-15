@@ -14,6 +14,7 @@
 - Each device receives a distinct long random token.
 - The database stores SHA-256 token digests, not raw device tokens.
 - Device tokens can access only agent endpoints; root ownership is checked server-side.
+- The Windows Companion installs per-user in Local AppData and creates a limited current-user `ONLOGON` scheduled task. It does not require elevation or install a system service.
 
 ## Network exposure
 

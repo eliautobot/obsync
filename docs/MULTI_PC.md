@@ -28,10 +28,10 @@ Do not expose plain HTTP or an unauthenticated local-LLM endpoint to the public 
 For each PC:
 
 1. Create an expiring enrollment code in the central UI.
-2. Pair the agent once.
+2. On Windows, download the Companion, enter the server/code/name, and click **Connect and install**. On other systems, pair the agent once from the CLI.
 3. Choose **Add folder** on that computer's card and select a local directory.
 4. Review the inventory comparison, then choose **Sync changes**.
-5. Configure the agent to start at login/boot.
+5. The Windows Companion starts automatically at sign-in; configure the CLI agent to start at login/boot on other systems.
 
 The central UI shows the device, its roots, last heartbeat, file counts, and comparison states. **Scan** compares without writing; **Sync changes** processes the pending red/orange items. Commands are received by the desktop agent within approximately 30 seconds.
 
@@ -54,7 +54,7 @@ The agent does not mark a successful local state until the central server accept
 Obsync supports two explicit modes:
 
 1. **Server-mounted vault:** Docker receives a host folder as `/vault`. This is simplest when the vault is on the server or a reliably mounted share. Docker mounts are established at container startup, so a web page cannot browse arbitrary Windows host folders later.
-2. **Vault on a desktop:** pair the desktop, run `obsync agent set-vault --browse`, and select it in **Settings**. The native agent writes only validated Obsync-managed notes into that local vault. This is the recommended mode when the vault is in Windows Documents and the server runs elsewhere.
+2. **Vault on a desktop:** pair the desktop, select the vault in the Windows Companion (or run `obsync agent set-vault --browse` for a CLI agent), and select that computer in **Settings**. The native agent writes only validated Obsync-managed notes into that local vault. This is the recommended mode when the vault is in Windows Documents and the server runs elsewhere.
 
 Only one vault writer is active. The server remains the authoritative ledger and queues idempotent write/status commands when a desktop is selected. If that desktop is offline, documents remain pending and complete after the agent reconnects.
 

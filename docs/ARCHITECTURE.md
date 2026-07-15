@@ -38,6 +38,10 @@ The agent runs beside source folders. It can optionally be selected as the singl
 
 Every network connection starts from the agent. No inbound port is required on a watched device.
 
+### Windows Companion
+
+The Windows Companion packages the same watch-agent runtime in a windowed setup application. It pairs with a one-time code, stores the device configuration in the user's Obsync config directory, copies the versioned executable into Local AppData, creates a limited current-user `ONLOGON` Task Scheduler entry, and starts the background runtime with no console window. It does not install a Windows service, request elevation, or open an inbound port. The command-line agent remains available for advanced and non-Windows deployments.
+
 ### LLM providers
 
 The server—not each agent—connects to the configured model endpoint. Supported protocols:

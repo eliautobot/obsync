@@ -63,7 +63,21 @@ In **Settings**, choose the provider, base URL, and model. Press **Check connect
 
 ## 3. Pair a source computer
 
-The server is listed automatically and counts as one connected computer, but its card represents the control plane—not an arbitrary desktop filesystem. If Docker is inside a VM or Docker Desktop, pair the physical desktop to browse its local folders or vault. Open **Sources → Add another computer**. The Windows wizard provides one complete PowerShell command. To pair manually:
+The server is listed automatically and counts as one connected computer, but its card represents the control plane—not an arbitrary desktop filesystem. If Docker is inside a VM or Docker Desktop, pair the physical desktop to browse its local folders or vault.
+
+On Windows:
+
+1. Open **Sources → Add another computer** and create a pairing code.
+2. Download and open `obsync-companion-windows-x64.exe`.
+3. Enter the displayed server address, one-time code, and computer name.
+4. Optionally choose the Obsidian vault on that computer.
+5. Click **Connect and install**.
+
+The Companion installs under the current user's Local AppData directory, creates a limited per-user automatic-start task, launches silently, and starts whenever that user signs in. It requires no Administrator access and leaves no PowerShell window open.
+
+Early community builds are not code-signed, so Windows SmartScreen may identify the Companion as an unrecognized app. Verify that the file came from the official Obsync GitHub release before choosing **More info → Run anyway**.
+
+To pair manually on Linux, macOS, or an advanced Windows installation:
 
 ```bash
 obsync agent pair --server https://your-server --code XXXX-XXXX-XXXX --name "Laptop"
@@ -110,13 +124,7 @@ Only one paired computer is selected as the vault writer at a time. Obsync valid
 
 ### Windows
 
-Use the standalone `obsync-agent-windows-x64.exe` release. Start with a normal foreground scan first. For automatic startup, create a Task Scheduler task that runs:
-
-```text
-obsync-agent-windows-x64.exe agent run
-```
-
-Run it as the Windows user who can read every watched folder and network share. A Windows service running as Local System often cannot see user-mapped network drives; use UNC paths or a service account instead.
+Use the guided `obsync-companion-windows-x64.exe` release. **Connect and install** creates the automatic-start task and launches the agent without a visible terminal. Reopen the Companion if the startup task needs to be repaired. It runs as the current Windows user so it can access that user's Documents folder and vault. User-mapped network drives may not be ready at sign-in; UNC paths are more reliable for shares.
 
 ### Linux systemd user service
 
@@ -158,3 +166,7 @@ Start with a test folder and vault backup. Confirm:
 - Removing a source marks the note missing without deleting it
 
 For future server and desktop-agent releases, follow [Updating Obsync](UPDATING.md). It includes pre-update backups, Docker and source-based upgrade commands, verification, and rollback.
+
+## 7. Use the in-app Help center
+
+Open **Help** from the sidebar or the top-right `?` button. It contains the quick-start flow, page explanations, status-color meanings, Companion details, local-model guidance, safety behavior, and troubleshooting. Small `?` controls beside settings and terms show a brief explanation on hover, focus, or tap.

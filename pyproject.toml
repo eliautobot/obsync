@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "obsync-app"
-version = "0.5.0"
+version = "0.6.0"
 description = "Continuously turn folders from any computer into organized Obsidian Markdown."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -67,7 +67,7 @@ asyncio_mode = "auto"
 [tool.coverage.run]
 source = ["obsync"]
 branch = true
-omit = ["src/obsync/cli.py"]
+omit = ["src/obsync/cli.py", "src/obsync/companion.py"]
 
 [tool.coverage.report]
 show_missing = true

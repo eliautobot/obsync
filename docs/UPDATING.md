@@ -65,22 +65,22 @@ To install a specific release instead of the newest `main` branch:
 
 ```bash
 git fetch --tags
-git checkout v0.5.0
+git checkout v0.6.0
 docker compose build --pull
 docker compose up -d
 ```
 
-Replace `v0.5.0` with the desired release tag. A tag checkout is intentionally fixed to that release; check out `main` again before using `git pull` for later updates.
+Replace `v0.6.0` with the desired release tag. A tag checkout is intentionally fixed to that release; check out `main` again before using `git pull` for later updates.
 
 ## Update a server using the published Docker image
 
 Pull the desired tag, then recreate the container using the same environment, ports, data volume, and vault mount as the existing deployment:
 
 ```bash
-docker pull ghcr.io/eliautobot/obsync:0.5.0
+docker pull ghcr.io/eliautobot/obsync:0.6.0
 ```
 
-Replace `0.5.0` with the desired version. Prefer a numbered tag for predictable deployments. If your Compose file references the published image, the complete update is:
+Replace `0.6.0` with the desired version. Prefer a numbered tag for predictable deployments. If your Compose file references the published image, the complete update is:
 
 ```bash
 docker compose pull
@@ -95,7 +95,16 @@ Do not remove the `/data` volume or change the vault mount during recreation.
 
 The server and desktop agents should normally use the same release. Update the server first, then each paired computer. Pairing details, watched folders, and the selected desktop vault are stored outside the executable and remain in place.
 
-### Windows standalone agent
+### Windows Companion
+
+1. Download `obsync-companion-windows-x64.exe` from the matching [GitHub release](https://github.com/eliautobot/obsync/releases).
+2. Open it as the same Windows user that owns the existing pairing and watched folders.
+3. Leave the pairing code blank when the existing server address is unchanged, then click **Connect and install**.
+4. The Companion installs the new version, refreshes its automatic-start task, and starts in the background.
+
+The versioned executable lives under Local AppData, while pairing, vault, and watched-folder configuration live separately and are preserved. If an older Companion is still running, sign out of Windows and sign back in so only the new automatic-start entry remains active.
+
+### Windows standalone command-line agent
 
 1. Stop the running agent or its Task Scheduler task.
 2. Download `obsync-agent-windows-x64.exe` from the matching [GitHub release](https://github.com/eliautobot/obsync/releases).
@@ -116,7 +125,7 @@ Install the matching release tag:
 
 ```bash
 python -m pip install --upgrade \
-  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.5.0"
+  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.6.0"
 obsync --version
 obsync agent scan
 ```

@@ -2,6 +2,21 @@
 
 All notable changes to Obsync will be documented here.
 
+## 0.6.0 - 2026-07-14
+
+### Added
+
+- Added a standalone Windows Companion setup app with a simple pairing window, per-user installation, silent background operation, and automatic startup at Windows sign-in
+- Added an in-app Help center with a five-step setup guide, page explanations, status definitions, local-AI guidance, safety details, and troubleshooting
+- Added visible `?` explanations throughout authentication, overview, sources, documents, review, settings, account, folder, and computer-pairing controls
+- Added a dedicated Windows Companion release artifact alongside the existing Windows and Linux command-line agents
+
+### Changed
+
+- Replaced the Windows PowerShell onboarding flow with a download-and-open Companion workflow; no terminal remains open and Administrator access is not required
+- Moved toast notifications into the browser top layer and removed backdrop blur so notices remain sharp above open dialogs
+- Added first-party versioned release notes to the GitHub release workflow
+
 ## 0.5.0 - 2026-07-14
 
 ### Added

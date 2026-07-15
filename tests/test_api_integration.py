@@ -72,6 +72,20 @@ def test_health_ui_and_admin_auth(client: TestClient, admin_headers: dict[str, s
     assert client.get("/api/v1/admin/overview").status_code == 401
 
 
+def test_ui_includes_guided_help_and_windows_companion(client: TestClient) -> None:
+    index = client.get("/").text
+    app_js = client.get("/assets/app.js").text
+    styles = client.get("/assets/styles.css").text
+    assert 'data-view="help"' in index
+    assert 'popover="manual"' in index
+    assert "renderHelp" in app_js
+    assert "Download Windows Companion" in app_js
+    assert "obsync-companion-windows-x64.exe" in app_js
+    assert "Keep that PowerShell window open" not in app_js
+    assert ".help-tip" in styles
+    assert "backdrop-filter: blur(3px)" not in styles
+
+
 def test_enrollment_is_single_use(client: TestClient, admin_headers: dict[str, str]) -> None:
     enrollment = client.post(
         "/api/v1/admin/enrollments", headers=admin_headers, json={"label": "Laptop"}

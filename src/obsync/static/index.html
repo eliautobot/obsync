@@ -24,10 +24,11 @@
           <button class="nav-item" data-view="documents"><span>▤</span>Documents</button>
           <button class="nav-item" data-view="review"><span>◇</span>Review <b id="review-badge" hidden>0</b></button>
           <button class="nav-item" data-view="settings"><span>⚙</span>Settings</button>
+          <button class="nav-item" data-view="help"><span>?</span>Help</button>
         </nav>
         <div class="sidebar-foot">
           <div class="server-dot"><i></i><span>Server connected</span></div>
-          <span id="version-label">v0.5.0</span>
+          <span id="version-label">v0.6.0</span>
         </div>
       </aside>
 
@@ -41,6 +42,7 @@
           <div class="topbar-actions">
             <button class="icon-button" id="refresh-button" aria-label="Refresh">↻</button>
             <button class="icon-button" id="theme-button" aria-label="Toggle theme">◐</button>
+            <button class="icon-button" id="help-button" aria-label="Open Help">?</button>
             <div class="account-control">
               <button class="avatar" id="account-button" aria-label="Open account menu" aria-haspopup="menu" aria-expanded="false">O</button>
               <div class="account-menu" id="account-menu" role="menu" hidden>
@@ -73,20 +75,20 @@
         <p id="auth-description">Use the administrator login for this Obsync server.</p>
         <div class="auth-fields" id="auth-fields">
           <div class="field" id="legacy-token-field" hidden>
-            <label for="legacy-token-input">Current admin token</label>
+            <div class="field-label-row"><label for="legacy-token-input">Current admin token</label><button class="help-tip" type="button" data-help="Used once when upgrading a very early Obsync installation. It is disabled after you create a username and password." aria-label="About the legacy admin token">?</button></div>
             <input id="legacy-token-input" type="password" autocomplete="off" placeholder="Required once to upgrade">
             <small>This is needed once to securely replace the old token login.</small>
           </div>
           <div class="field" id="username-field">
-            <label for="username-input">Username</label>
+            <div class="field-label-row"><label for="username-input">Username</label><button class="help-tip" type="button" data-help="The local administrator name for this Obsync server." aria-label="About the username">?</button></div>
             <input id="username-input" type="text" autocomplete="username" required maxlength="64" placeholder="admin">
           </div>
           <div class="field" id="password-field">
-            <label for="password-input">Password</label>
+            <div class="field-label-row"><label for="password-input">Password</label><button class="help-tip" type="button" data-help="Protects access to computers, watched folders, model settings, and your Obsidian vault." aria-label="About the password">?</button></div>
             <input id="password-input" type="password" autocomplete="current-password" required placeholder="Your password">
           </div>
           <div class="field" id="confirm-password-field" hidden>
-            <label for="confirm-password-input">Confirm password</label>
+            <div class="field-label-row"><label for="confirm-password-input">Confirm password</label><button class="help-tip" type="button" data-help="Enter the new password a second time to catch typing mistakes." aria-label="About confirming the password">?</button></div>
             <input id="confirm-password-input" type="password" autocomplete="new-password" placeholder="Repeat your password">
             <small>Use at least 10 characters. A memorable passphrase works well.</small>
           </div>
@@ -105,7 +107,7 @@
       <div class="modal-head"><h2 id="modal-title"></h2><button class="icon-button" id="modal-close" aria-label="Close">×</button></div>
       <div id="modal-body"></div>
     </dialog>
-    <div class="toast" id="toast" role="status" hidden></div>
-    <script src="/assets/app.js?v=0.5.0" defer></script>
+    <div class="toast" id="toast" role="status" popover="manual" hidden></div>
+    <script src="/assets/app.js?v=0.6.0" defer></script>
   </body>
 </html>
