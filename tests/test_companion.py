@@ -8,11 +8,13 @@ import pytest
 from obsync.agent import AgentConfig
 from obsync.companion import (
     TASK_NAME,
+    background_companion_is_running,
     install_companion,
     install_startup_task,
     parse_pairing_details,
     scheduled_task_command,
     start_background_companion,
+    stop_background_companion,
 )
 
 
@@ -38,14 +40,32 @@ def test_startup_task_is_per_user_and_non_elevated(monkeypatch, tmp_path: Path) 
     config = tmp_path / "agent.yml"
     install_startup_task(executable, config, run=fake_run)
     assert calls[0][0][:2] == ["schtasks.exe", "/End"]
-    args, kwargs = calls[1]
+    assert calls[1][0][:2] == ["schtasks.exe", "/End"]
+    args, kwargs = calls[2]
     assert args[:2] == ["schtasks.exe", "/Create"]
     assert args[args.index("/TN") + 1] == TASK_NAME
     assert args[args.index("/SC") + 1] == "ONLOGON"
     assert args[args.index("/RL") + 1] == "LIMITED"
     assert "--background" in args[args.index("/TR") + 1]
     assert kwargs["check"] is False
-    assert calls[2][0][:2] == ["schtasks.exe", "/Query"]
+    assert calls[3][0][:2] == ["schtasks.exe", "/Query"]
+    assert calls[4][0][:2] == ["schtasks.exe", "/Delete"]
+
+
+def test_background_desktop_status_and_stop(monkeypatch) -> None:
+    monkeypatch.setattr("obsync.companion.is_windows", lambda: True)
+    calls: list[list[str]] = []
+
+    def fake_run(args, **_kwargs):
+        calls.append(args)
+        if "/Query" in args:
+            return subprocess.CompletedProcess(args, 0, '"Obsync Desktop","N/A","Running"', "")
+        return subprocess.CompletedProcess(args, 0, "SUCCESS", "")
+
+    assert background_companion_is_running(run=fake_run) is True
+    stop_background_companion(run=fake_run)
+    assert calls[0][:2] == ["schtasks.exe", "/Query"]
+    assert calls[1][:2] == ["schtasks.exe", "/End"]
 
 
 def test_startup_task_reports_windows_error(monkeypatch, tmp_path: Path) -> None:

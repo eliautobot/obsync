@@ -107,6 +107,12 @@ class AgentConfig:
         self.roots.append(root)
         return root
 
+    def remove_root(self, root_key: str) -> RootConfig | None:
+        for index, root in enumerate(self.roots):
+            if root.root_key == root_key:
+                return self.roots.pop(index)
+        return None
+
     def set_vault(self, path: Path) -> Path:
         resolved = path.expanduser().resolve()
         if not resolved.is_dir():
@@ -213,6 +219,15 @@ class AgentState:
             )
             connection.commit()
 
+    def remove_root(self, root_key: str) -> None:
+        with self.connect() as connection:
+            connection.execute("DELETE FROM files WHERE root_key = ?", (root_key,))
+            connection.commit()
+
+
+class SyncPausedError(RuntimeError):
+    pass
+
 
 class AgentRuntime:
     def __init__(
@@ -233,6 +248,7 @@ class AgentRuntime:
         self._stop = asyncio.Event()
         self._watch_tasks: dict[str, asyncio.Task[None]] = {}
         self._running = False
+        self._server_sync_enabled = True
 
     def _client(self) -> httpx.AsyncClient:
         return self._external_client or httpx.AsyncClient(
@@ -253,11 +269,30 @@ class AgentRuntime:
                 await client.aclose()
 
     async def register_roots(self) -> None:
-        for root in self.config.roots:
+        for root in list(self.config.roots):
             if not root.enabled:
                 continue
             response = await self._request("POST", "/api/v1/agent/roots", json=asdict(root))
-            self._root_ids[root.root_key] = response.json()["id"]
+            payload = response.json()
+            if payload.get("removal_requested"):
+                self._remove_local_root(root.root_key)
+                continue
+            self._root_ids[root.root_key] = payload["id"]
+
+    def _remove_local_root(self, root_key: str) -> RootConfig | None:
+        task = self._watch_tasks.pop(root_key, None)
+        if task:
+            task.cancel()
+        self._root_ids.pop(root_key, None)
+        removed = self.config.remove_root(root_key)
+        self.state.remove_root(root_key)
+        if removed:
+            self.config.save(self.config_path)
+        return removed
+
+    def _require_sync_enabled(self) -> None:
+        if not self._server_sync_enabled:
+            raise SyncPausedError("Syncing was stopped by the user")
 
     @staticmethod
     def _hash(path: Path) -> str:
@@ -296,6 +331,7 @@ class AgentRuntime:
     async def sync_file(
         self, root: RootConfig, path: Path, *, force: bool = False
     ) -> dict[str, Any] | None:
+        self._require_sync_enabled()
         root_path = Path(root.path).resolve()
         try:
             resolved = path.resolve()
@@ -305,6 +341,7 @@ class AgentRuntime:
         if not resolved.is_file() or resolved.is_symlink() or not self._matches(root, relative):
             return None
         stat = await self._stable_stat(resolved)
+        self._require_sync_enabled()
         if stat is None:
             return None
         previous = self.state.get(root.root_key, relative)
@@ -344,6 +381,7 @@ class AgentRuntime:
         return response.json()
 
     async def mark_missing(self, root: RootConfig, relative: str) -> dict[str, Any]:
+        self._require_sync_enabled()
         response = await self._request(
             "POST",
             "/api/v1/agent/documents/missing",
@@ -353,12 +391,14 @@ class AgentRuntime:
         return response.json()
 
     async def scan_root(self, root: RootConfig) -> dict[str, int]:
+        self._require_sync_enabled()
         root_path = Path(root.path).expanduser().resolve()
         if not root_path.is_dir():
             raise ValueError(f"Watched folder is unavailable: {root_path}")
         current: set[str] = set()
         synced = unchanged = errors = 0
         for path in root_path.rglob("*"):
+            self._require_sync_enabled()
             if not path.is_file() or path.is_symlink():
                 continue
             relative = path.relative_to(root_path).as_posix()
@@ -382,6 +422,7 @@ class AgentRuntime:
         return {"synced": synced, "unchanged": unchanged, "errors": errors, "files": len(current)}
 
     async def inventory_root(self, root: RootConfig) -> dict[str, Any]:
+        self._require_sync_enabled()
         root_path = Path(root.path).expanduser().resolve()
         if not root_path.is_dir():
             raise ValueError(f"Watched folder is unavailable: {root_path}")
@@ -408,6 +449,7 @@ class AgentRuntime:
             return response.json()
 
         for path in root_path.rglob("*"):
+            self._require_sync_enabled()
             if not path.is_file() or path.is_symlink():
                 continue
             relative = path.relative_to(root_path).as_posix()
@@ -446,6 +488,7 @@ class AgentRuntime:
         return results
 
     async def sync_pending_root(self, root: RootConfig) -> dict[str, int]:
+        self._require_sync_enabled()
         if root.root_key not in self._root_ids:
             await self.register_roots()
         root_id = self._root_ids[root.root_key]
@@ -453,6 +496,7 @@ class AgentRuntime:
         items = response.json()["items"]
         synced = missing = errors = 0
         for item in items:
+            self._require_sync_enabled()
             if item["comparison_status"] == "source-missing":
                 missing += 1
                 continue
@@ -482,10 +526,10 @@ class AgentRuntime:
                 results[root.name] = await self.scan_root(root)
         return results
 
-    async def heartbeat_once(self) -> None:
+    async def heartbeat_once(self) -> dict[str, Any]:
         vault = Path(self.config.vault_path).expanduser() if self.config.vault_path else None
         vault_ready = bool(vault and vault.is_dir() and os.access(vault, os.W_OK))
-        await self._request(
+        response = await self._request(
             "POST",
             "/api/v1/agent/heartbeat",
             json={
@@ -495,6 +539,9 @@ class AgentRuntime:
                 "vault_error": "" if vault_ready or not vault else "Vault folder is unavailable",
             },
         )
+        payload = response.json()
+        self._server_sync_enabled = bool(payload.get("sync_enabled", True))
+        return payload
 
     @staticmethod
     def _atomic_write(path: Path, content: str) -> None:
@@ -620,6 +667,18 @@ class AgentRuntime:
             ok = True
             result = ""
             try:
+                if command["command"] in {
+                    "scan",
+                    "sync",
+                    "scan_root",
+                    "sync_root",
+                    "resync",
+                    "write_note",
+                    "set_source_status",
+                    "audit_vault",
+                    "select_source",
+                }:
+                    self._require_sync_enabled()
                 if command["command"] == "scan":
                     result = json.dumps(await self.inventory_all())
                 elif command["command"] == "sync":
@@ -664,6 +723,15 @@ class AgentRuntime:
                     inventory = await self.inventory_root(root)
                     self._ensure_watch_task(root)
                     result = json.dumps({"root": asdict(root), "inventory": inventory})
+                elif command["command"] == "remove_root":
+                    payload = command.get("payload", {})
+                    removed = self._remove_local_root(str(payload.get("root_key", "")))
+                    result = json.dumps(
+                        {
+                            "removed": bool(removed),
+                            "root_key": str(payload.get("root_key", "")),
+                        }
+                    )
                 else:
                     raise ValueError(f"Unknown command: {command['command']}")
             except Exception as exc:
@@ -681,6 +749,8 @@ class AgentRuntime:
             try:
                 async for changes in awatch(root_path, stop_event=self._stop):
                     for change, changed_path in changes:
+                        if not self._server_sync_enabled:
+                            continue
                         path = Path(changed_path)
                         if change == Change.deleted:
                             try:
@@ -691,13 +761,25 @@ class AgentRuntime:
                                 await self.mark_missing(root, relative)
                         else:
                             await self.sync_file(root, path)
-            except (FileNotFoundError, OSError, httpx.HTTPError):
+            except (FileNotFoundError, OSError, httpx.HTTPError, SyncPausedError):
                 await asyncio.sleep(10)
 
     async def _heartbeat_loop(self) -> None:
         while not self._stop.is_set():
             try:
                 await self.heartbeat_once()
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 401:
+                    self._stop.set()
+                    return
+            except httpx.HTTPError:
+                pass
+            with suppress(TimeoutError):
+                await asyncio.wait_for(self._stop.wait(), timeout=5)
+
+    async def _command_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
                 await self.process_commands_once()
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 401:
@@ -706,16 +788,17 @@ class AgentRuntime:
             except httpx.HTTPError:
                 pass
             with suppress(TimeoutError):
-                await asyncio.wait_for(self._stop.wait(), timeout=30)
+                await asyncio.wait_for(self._stop.wait(), timeout=3)
 
     async def _reconcile_loop(self) -> None:
         first_pass = True
         while not self._stop.is_set():
-            with suppress(httpx.HTTPError, OSError, ValueError):
-                await self.inventory_all()
-                if not first_pass:
-                    await self.sync_pending_all()
-            first_pass = False
+            if self._server_sync_enabled:
+                with suppress(httpx.HTTPError, OSError, ValueError, SyncPausedError):
+                    await self.inventory_all()
+                    if not first_pass:
+                        await self.sync_pending_all()
+                    first_pass = False
             with suppress(TimeoutError):
                 await asyncio.wait_for(
                     self._stop.wait(), timeout=max(30, self.config.scan_interval_seconds)
@@ -723,9 +806,11 @@ class AgentRuntime:
 
     async def run_forever(self) -> None:
         self._running = True
+        await self.heartbeat_once()
         await self.register_roots()
         tasks = [
             asyncio.create_task(self._heartbeat_loop()),
+            asyncio.create_task(self._command_loop()),
             asyncio.create_task(self._reconcile_loop()),
         ]
         for root in self.config.roots:

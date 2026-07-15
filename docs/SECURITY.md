@@ -14,7 +14,9 @@
 - Each device receives a distinct long random token.
 - The database stores SHA-256 token digests, not raw device tokens.
 - Device tokens can access only agent endpoints; root ownership is checked server-side. Disconnecting a computer revokes its token immediately.
-- The Windows Companion installs per-user in Local AppData and creates a limited current-user `ONLOGON` scheduled task. It does not require elevation or install a system service.
+- Obsync Desktop installs per-user in Local AppData and creates a limited current-user `ONLOGON` scheduled task. It does not require elevation or install a system service.
+- Global Stop cancels queued and active processing before further vault writes; connected desktops remain authenticated only for heartbeat and safe configuration/removal operations until Start.
+- Folder removal deletes only Obsync's server/desktop tracking records for that root. It never deletes the underlying source directory, source files, or existing notes.
 
 ## Network exposure
 

@@ -72,21 +72,114 @@ def test_health_ui_and_admin_auth(client: TestClient, admin_headers: dict[str, s
     assert client.get("/api/v1/admin/overview").status_code == 401
 
 
-def test_ui_includes_guided_help_and_windows_companion(client: TestClient) -> None:
+def test_ui_includes_guided_help_and_obsync_desktop(client: TestClient) -> None:
     index = client.get("/").text
     app_js = client.get("/assets/app.js").text
     styles = client.get("/assets/styles.css").text
     assert 'data-view="help"' in index
     assert 'popover="manual"' in index
     assert "renderHelp" in app_js
-    assert "Download Windows Companion" in app_js
-    assert "/api/v1/downloads/windows-companion" in app_js
-    download = client.get("/api/v1/downloads/windows-companion", follow_redirects=False)
+    assert "Download Obsync Desktop" in app_js
+    assert "/api/v1/downloads/windows-desktop" in app_js
+    download = client.get("/api/v1/downloads/windows-desktop", follow_redirects=False)
     assert download.status_code == 307
-    assert "obsync-companion-windows-x64.exe" in download.headers["location"]
+    assert "obsync-desktop-windows-x64.exe" in download.headers["location"]
+    legacy = client.get("/api/v1/downloads/windows-companion", follow_redirects=False)
+    assert legacy.headers["location"] == "/api/v1/downloads/windows-desktop"
+    assert 'id="pipeline-toggle"' in index
+    assert "Stop syncing" in index
+    assert "Remove folder" in app_js
     assert "Keep that PowerShell window open" not in app_js
     assert ".help-tip" in styles
     assert "backdrop-filter: blur(3px)" not in styles
+
+
+def test_pipeline_can_stop_cancel_pending_work_and_resume(
+    client: TestClient,
+    admin_headers: dict[str, str],
+    agent_headers: dict[str, str],
+    enrolled_agent: dict[str, str],
+    registered_root: dict,
+) -> None:
+    queued = client.post(
+        f"/api/v1/admin/agents/{enrolled_agent['agent_id']}/scan", headers=admin_headers
+    ).json()
+    stopped = client.post("/api/v1/admin/pipeline/stop", headers=admin_headers)
+    assert stopped.status_code == 200
+    assert stopped.json()["enabled"] is False
+    assert stopped.json()["cancelled_commands"] == 1
+    status = client.get("/api/v1/admin/pipeline", headers=admin_headers)
+    assert status.json()["state"] == "stopped"
+    command = client.get(f"/api/v1/admin/commands/{queued['id']}", headers=admin_headers).json()
+    assert command["status"] == "cancelled"
+    assert command["result"] == "Stopped by user"
+    client.post(
+        f"/api/v1/agent/commands/{queued['id']}/complete",
+        headers=agent_headers,
+        json={"ok": True, "result": "late result"},
+    )
+    command = client.get(f"/api/v1/admin/commands/{queued['id']}", headers=admin_headers).json()
+    assert command["status"] == "cancelled"
+
+    heartbeat = client.post("/api/v1/agent/heartbeat", headers=agent_headers, json={})
+    assert heartbeat.json()["sync_enabled"] is False
+    blocked = sync_text(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "blocked.txt",
+        b"This must not be processed while stopped.",
+    )
+    assert blocked.status_code == 409
+    assert "Syncing is stopped" in blocked.json()["detail"]
+
+    started = client.post("/api/v1/admin/pipeline/start", headers=admin_headers)
+    assert started.status_code == 200
+    assert started.json()["enabled"] is True
+    synced = sync_text(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "resumed.txt",
+        b"Processing resumes safely.",
+    )
+    assert synced.status_code == 200
+    assert synced.json()["result"] == "synced"
+
+
+def test_removing_folder_keeps_source_and_obsidian_note(
+    client: TestClient,
+    admin_headers: dict[str, str],
+    agent_headers: dict[str, str],
+    registered_root: dict,
+    app_settings,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "Computer Folder" / "record.txt"
+    source.parent.mkdir()
+    source.write_text("Original computer file", encoding="utf-8")
+    synced = sync_text(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "record.txt",
+        source.read_bytes(),
+    ).json()
+    note = app_settings.vault_path / synced["destination_path"]
+    assert source.is_file() and note.is_file()
+
+    removed = client.delete(f"/api/v1/admin/roots/{registered_root['id']}", headers=admin_headers)
+    assert removed.status_code == 200
+    assert removed.json()["removed_documents"] == 1
+    assert source.read_text(encoding="utf-8") == "Original computer file"
+    assert note.is_file()
+    assert client.get("/api/v1/admin/roots", headers=admin_headers).json()["items"] == []
+    assert client.get("/api/v1/admin/documents", headers=admin_headers).json()["total"] == 0
+    commands = client.get("/api/v1/agent/commands", headers=agent_headers).json()["items"]
+    assert commands[-1]["command"] == "remove_root"
+    assert commands[-1]["payload"]["root_key"] == registered_root["root_key"]
+    missing = client.delete(f"/api/v1/admin/roots/{registered_root['id']}", headers=admin_headers)
+    assert missing.status_code == 404
 
 
 def test_enrollment_is_single_use(client: TestClient, admin_headers: dict[str, str]) -> None:

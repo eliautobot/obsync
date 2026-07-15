@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ import socket
 import subprocess
 import sys
 import threading
+import webbrowser
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -23,8 +25,10 @@ from . import __version__
 from .agent import AgentConfig, AgentRuntime, default_config_path, pair_agent
 from .desktop import choose_directory
 
-TASK_NAME = "Obsync Companion"
-COMPANION_FILENAME = "Obsync-Companion.exe"
+TASK_NAME = "Obsync Desktop"
+LEGACY_TASK_NAME = "Obsync Companion"
+DESKTOP_FILENAME = "Obsync-Desktop.exe"
+COMPANION_FILENAME = DESKTOP_FILENAME
 
 
 @dataclass(slots=True)
@@ -41,7 +45,7 @@ def is_windows() -> bool:
 
 
 def companion_data_dir() -> Path:
-    return user_data_path("Obsync") / "companion"
+    return user_data_path("Obsync") / "desktop"
 
 
 def installed_companion_path() -> Path:
@@ -112,15 +116,16 @@ def install_startup_task(
     run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> None:
     if not is_windows():
-        raise ValueError("Automatic companion startup is currently available on Windows")
+        raise ValueError("Automatic Obsync Desktop startup is currently available on Windows")
     command = scheduled_task_command(executable, config_path)
-    run(
-        ["schtasks.exe", "/End", "/TN", TASK_NAME],
-        check=False,
-        capture_output=True,
-        text=True,
-        creationflags=_windows_creation_flags(),
-    )
+    for task_name in (LEGACY_TASK_NAME, TASK_NAME):
+        run(
+            ["schtasks.exe", "/End", "/TN", task_name],
+            check=False,
+            capture_output=True,
+            text=True,
+            creationflags=_windows_creation_flags(),
+        )
     result = run(
         [
             "schtasks.exe",
@@ -155,6 +160,13 @@ def install_startup_task(
             verification.stderr or verification.stdout or "Windows could not find the startup task"
         ).strip()
         raise ValueError(f"Could not verify automatic startup: {detail}")
+    run(
+        ["schtasks.exe", "/Delete", "/F", "/TN", LEGACY_TASK_NAME],
+        check=False,
+        capture_output=True,
+        text=True,
+        creationflags=_windows_creation_flags(),
+    )
 
 
 def start_background_companion(
@@ -192,6 +204,46 @@ def start_background_companion(
     )
 
 
+def stop_background_companion(
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> None:
+    if not is_windows():
+        raise ValueError("Desktop background controls are currently available on Windows")
+    result = run(
+        ["schtasks.exe", "/End", "/TN", TASK_NAME],
+        check=False,
+        capture_output=True,
+        text=True,
+        creationflags=_windows_creation_flags(),
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "Windows could not stop Obsync").strip()
+        raise ValueError(f"Could not stop syncing on this computer: {detail}")
+
+
+def background_companion_is_running(
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> bool:
+    if not is_windows():
+        return False
+    result = run(
+        ["schtasks.exe", "/Query", "/TN", TASK_NAME, "/FO", "CSV", "/NH"],
+        check=False,
+        capture_output=True,
+        text=True,
+        creationflags=_windows_creation_flags(),
+    )
+    if result.returncode != 0:
+        return False
+    try:
+        fields = next(csv.reader([result.stdout.strip()]))
+    except (csv.Error, StopIteration):
+        return False
+    return any(field.strip().casefold() == "running" for field in fields)
+
+
 async def existing_pairing_is_valid(config: AgentConfig) -> bool:
     if not config.server_url or not config.agent_token:
         return False
@@ -214,7 +266,7 @@ async def existing_pairing_is_valid(config: AgentConfig) -> bool:
 def _current_standalone_executable() -> Path:
     if not getattr(sys, "frozen", False):
         raise ValueError(
-            "Automatic installation requires the standalone Windows Companion from GitHub Releases"
+            "Automatic installation requires Obsync Desktop for Windows from GitHub Releases"
         )
     return Path(sys.executable).resolve()
 
@@ -229,7 +281,7 @@ async def install_companion(
     source_executable: Path | None = None,
 ) -> CompanionInstall:
     if not is_windows():
-        raise ValueError("The guided companion installer is available on Windows")
+        raise ValueError("The guided Obsync Desktop installer is available on Windows")
     server = server_url.strip().rstrip("/")
     code = enrollment_code.strip()
     name = computer_name.strip() or socket.gethostname()
@@ -288,7 +340,7 @@ async def install_companion(
 
 
 def _background_log_path() -> Path:
-    path = companion_data_dir() / "companion.log"
+    path = companion_data_dir() / "desktop.log"
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -301,10 +353,10 @@ def run_background(config_path: Path) -> int:
     )
     try:
         config = AgentConfig.load(config_path)
-        logging.info("Starting Obsync Companion %s for %s", __version__, config.name)
+        logging.info("Starting Obsync Desktop %s for %s", __version__, config.name)
         asyncio.run(AgentRuntime(config, config_path=config_path).run_forever())
     except Exception:
-        logging.exception("Obsync Companion stopped unexpectedly")
+        logging.exception("Obsync Desktop stopped unexpectedly")
         return 1
     return 0
 
@@ -325,9 +377,9 @@ def run_setup_gui(
     target_config = config_path or default_config_path()
     existing = AgentConfig.load(target_config)
     root = tk.Tk()
-    root.title(f"Obsync Companion {__version__}")
-    root.geometry("560x620")
-    root.minsize(520, 580)
+    root.title(f"Obsync Desktop {__version__}")
+    root.geometry("590x760")
+    root.minsize(540, 680)
 
     frame = ttk.Frame(root, padding=24)
     frame.pack(fill="both", expand=True)
@@ -335,8 +387,8 @@ def run_setup_gui(
     ttk.Label(
         frame,
         text=(
-            "Pair once, then Obsync runs quietly in the background and starts automatically "
-            "when you sign in. No PowerShell window or Administrator access is required."
+            "This is the Windows side of Obsync. Pair once, then folder watching runs quietly "
+            "in the background and starts automatically when you sign in."
         ),
         wraplength=500,
     ).pack(anchor="w", pady=(6, 20))
@@ -424,15 +476,79 @@ def run_setup_gui(
     connect_button = ttk.Button(frame, text="Connect and install")
     connect_button.pack(fill="x", ipady=7)
 
+    desktop_controls = ttk.LabelFrame(frame, text="This computer", padding=12)
+    desktop_controls.pack(fill="x", pady=(16, 0))
+    sync_status_value = tk.StringVar(value="Checking background status…")
+    ttk.Label(desktop_controls, textvariable=sync_status_value).pack(anchor="w")
+    ttk.Label(
+        desktop_controls,
+        text=(
+            "Stopping here stops this PC's watcher. To cancel server-side AI work too, use "
+            "Stop syncing in the Obsync dashboard."
+        ),
+        wraplength=500,
+    ).pack(anchor="w", pady=(3, 10))
+    control_row = ttk.Frame(desktop_controls)
+    control_row.pack(fill="x")
+
+    def refresh_background_status() -> None:
+        if not AgentConfig.load(target_config).agent_token:
+            sync_status_value.set("Not connected yet")
+            start_button.configure(state="disabled")
+            stop_button.configure(state="disabled")
+            open_button.configure(state="disabled")
+            return
+        running = background_companion_is_running()
+        sync_status_value.set(
+            "Folder watching is running" if running else "Folder watching is stopped"
+        )
+        start_button.configure(state="disabled" if running else "normal")
+        stop_button.configure(state="normal" if running else "disabled")
+        open_button.configure(state="normal")
+
+    def start_syncing() -> None:
+        try:
+            executable = installed_companion_path()
+            if not executable.is_file():
+                raise ValueError("Connect and install Obsync Desktop before starting it")
+            install_startup_task(executable, target_config)
+            start_background_companion(executable, target_config)
+            sync_status_value.set("Folder watching is running")
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Could not start Obsync", str(exc), parent=root)
+        refresh_background_status()
+
+    def stop_syncing() -> None:
+        try:
+            stop_background_companion()
+            sync_status_value.set("Folder watching is stopped")
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Could not stop Obsync", str(exc), parent=root)
+        refresh_background_status()
+
+    def open_obsync() -> None:
+        server = AgentConfig.load(target_config).server_url
+        if server:
+            webbrowser.open(server)
+
+    start_button = ttk.Button(control_row, text="Start this PC", command=start_syncing)
+    start_button.pack(side="left")
+    stop_button = ttk.Button(control_row, text="Stop this PC", command=stop_syncing)
+    stop_button.pack(side="left", padx=(8, 0))
+    open_button = ttk.Button(control_row, text="Open Obsync", command=open_obsync)
+    open_button.pack(side="right")
+
     def finish_success(result: CompanionInstall) -> None:
         status_value.set(
-            f"Connected as {result.computer_name}. Obsync is running in the background and "
+            f"Connected as {result.computer_name}. Obsync Desktop is running in the background and "
             "will start automatically at Windows sign-in."
         )
         connect_button.configure(state="normal", text="Installed")
+        refresh_background_status()
         messagebox.showinfo(
-            "Obsync Companion is ready",
-            "This PC is connected. You may close this window and return to Obsync in your browser.",
+            "Obsync Desktop is ready",
+            "This PC is connected. You may close this window; folder watching stays in the "
+            "background.",
             parent=root,
         )
 
@@ -476,17 +592,18 @@ def run_setup_gui(
     ttk.Label(
         frame,
         text=(
-            "Installed per-user in Local AppData. Remove it later from Windows Task Scheduler "
-            "if needed."
+            "Installed for your Windows account in Local AppData. This window is only needed "
+            "when you want to change or repair the desktop connection."
         ),
         wraplength=500,
     ).pack(anchor="w", pady=(12, 0))
+    refresh_background_status()
     root.mainloop()
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Install or run the Obsync Windows Companion")
+    parser = argparse.ArgumentParser(description="Install or run Obsync Desktop for Windows")
     parser.add_argument("--background", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--config", default="", help=argparse.SUPPRESS)
     parser.add_argument("--server", default="", help="Prefill the Obsync server address")
@@ -506,8 +623,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 from tkinter import messagebox
 
                 messagebox.showinfo(
-                    "Obsync Companion is already open",
-                    "Use the setup window that is already open. "
+                    "Obsync Desktop is already open",
+                    "Use the Obsync Desktop window that is already open. "
                     "Only one window can pair at a time.",
                 )
             except Exception:
@@ -524,7 +641,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             try:
                 from tkinter import messagebox
 
-                messagebox.showerror("Obsync Companion", str(exc))
+                messagebox.showerror("Obsync Desktop", str(exc))
             except Exception:
                 pass
             code = 2

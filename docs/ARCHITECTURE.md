@@ -38,9 +38,13 @@ The agent runs beside source folders. It can optionally be selected as the singl
 
 Every network connection starts from the agent. No inbound port is required on a watched device.
 
-### Windows Companion
+### Obsync Desktop for Windows
 
-The Windows Companion packages the same watch-agent runtime in a windowed setup application. Published server images serve the matching executable directly. It accepts all setup details through one clipboard paste, pairs with a one-time code, stores the device configuration in the user's Obsync config directory, copies the versioned executable into Local AppData, creates and verifies a limited current-user `ONLOGON` Task Scheduler entry, and starts the background runtime through that tracked task with no console window. Only one setup window may run at a time; valid pairings are reused for repair. It does not install a Windows service, request elevation, or open an inbound port. The command-line agent remains available for advanced and non-Windows deployments.
+Obsync Desktop packages the watch-agent runtime, pairing, background startup, local watcher controls, and a dashboard shortcut in one windowed app. Published server images serve the matching executable directly. It accepts all setup details through one clipboard paste, pairs with a one-time code, stores device configuration separately from the executable, copies the versioned app into Local AppData, creates and verifies a limited current-user `ONLOGON` task, and starts the background runtime with no console window. Upgrading replaces the legacy `Obsync Companion` startup task without losing pairing, roots, or vault selection. Only one setup window may run at a time; valid pairings are reused for repair. It does not install a Windows service, request elevation, or open an inbound port.
+
+### Pipeline control
+
+The server stores a durable running/stopped flag and returns it with every desktop heartbeat. While stopped, agents remain connected but skip filesystem work, reconciliation, scans, syncs, and AI-related commands. The server rejects new processing requests, cancels queued work, and cancels active asynchronous extraction/classification tasks. Restarting re-enables work; periodic inventory reconciles changes that occurred while stopped. Configuration and safe folder-removal commands remain available.
 
 ### LLM providers
 
@@ -69,6 +73,8 @@ The server sends extracted text, metadata, and an allowlist of candidate related
 13. SQLite ledger, comparison state, and event stream are updated
 ```
 
+At any processing boundary, the global Stop control can cancel the operation before a vault write. Cancelled documents remain pending/paused and are eligible for reconciliation after Start.
+
 ## Identity and idempotency
 
 A source document is identified by `(agent_id, root_id, relative_path)`. Each gets an immutable UUID. Content SHA-256 makes repeated events idempotent. Device registration is transactional and accepts a client-generated credential so a lost response can be retried without creating another computer. Rename hints let the server update the existing row and note rather than creating a new identity. If the processing database is rebuilt, a vault audit matches managed notes by source computer, watched-root name, and relative path before creating anything new.
@@ -88,6 +94,8 @@ Obsync replaces the properties and generated region. Text following `## My notes
 - Filesystem event missed: periodic full reconciliation repairs state.
 - Source removed: note is retained and marked `source-missing`.
 - Upload interrupted: staged temporary file is removed; no ledger success is recorded.
+- Pipeline stopped: active extraction/classification is cancelled, queued work is cancelled, agents remain connected, and restart reconciles missed changes.
+- Watched folder removed: the desktop forgets the root and its local/server ledger; original files and existing notes remain untouched.
 - Computer disconnected: its credential is revoked and its server ledger is removed; original source files and existing Obsidian notes remain untouched.
 
 ## Scaling model

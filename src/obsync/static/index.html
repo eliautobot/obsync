@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="light dark">
     <meta name="theme-color" content="#6d5dfc">
     <title>Obsync</title>
-    <link rel="stylesheet" href="/assets/styles.css?v=0.7.0">
+    <link rel="stylesheet" href="/assets/styles.css?v=0.8.0">
   </head>
   <body>
     <div class="app-shell" id="app" hidden>
@@ -28,7 +28,7 @@
         </nav>
         <div class="sidebar-foot">
           <div class="server-dot"><i></i><span>Server connected</span></div>
-          <span id="version-label">v0.7.0</span>
+          <span id="version-label">v0.8.0</span>
         </div>
       </aside>
 
@@ -40,6 +40,7 @@
             <p id="page-subtitle">Your knowledge pipeline at a glance.</p>
           </div>
           <div class="topbar-actions">
+            <button class="pipeline-toggle running" id="pipeline-toggle" type="button" title="Stop syncing and cancel active AI work"><i></i><span>Stop syncing</span></button>
             <button class="icon-button" id="refresh-button" aria-label="Refresh">↻</button>
             <button class="icon-button" id="theme-button" aria-label="Toggle theme">◐</button>
             <button class="icon-button" id="help-button" aria-label="Open Help">?</button>
@@ -108,6 +109,6 @@
       <div id="modal-body"></div>
     </dialog>
     <div class="toast" id="toast" role="status" popover="manual" hidden></div>
-    <script src="/assets/app.js?v=0.7.0" defer></script>
+    <script src="/assets/app.js?v=0.8.0" defer></script>
   </body>
 </html>

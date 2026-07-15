@@ -18,9 +18,9 @@ uv run coverage run -m pytest
 uv run coverage report
 ```
 
-The test suite covers local-only temporary Admin, remote and cross-site setup rejection, password hashing, account changes, first-run and legacy auth migration, session cookies, CSRF, expiration, login throttling, device token/enrollment behavior, concurrent idempotent pairing, repeated pair/disconnect cleanup, native folder selection, source inventories, green/orange/red comparisons, existing-note adoption, local and remote vault audits/writers, Windows Companion installation/startup/repair, path security, extractors, quick LLM model discovery, LLM response normalization, generated-note preservation, complete source-to-vault synchronization, repeat updates, tombstones, rename identity, and UI/static delivery.
+The test suite covers local-only temporary Admin, remote and cross-site setup rejection, password hashing, account changes, first-run and legacy auth migration, sessions, CSRF, login throttling, device enrollment, concurrent idempotent pairing, pair/disconnect cleanup, native folder selection, source inventories, source-to-vault comparisons, existing-note adoption, local and remote vault writers, Obsync Desktop installation/startup/stop/repair, global pipeline cancellation, active AI cancellation, safe folder removal, path security, extractors, LLM normalization, generated-note preservation, updates, tombstones, rename identity, and UI delivery.
 
-The CLI and windowed Companion entry module are excluded from the aggregate coverage denominator because their process, Tk, and Windows-shell boundaries are validated through parser/unit tests, real Windows packaging, scheduled-task lifecycle checks, and launch smoke tests.
+The CLI and windowed Desktop entry module are excluded from the aggregate coverage denominator because their process, Tk, and Windows-shell boundaries are validated through parser/unit tests, real Windows packaging, scheduled-task lifecycle checks, and launch smoke tests.
 
 ## Docker validation
 
@@ -52,4 +52,4 @@ Use temporary directories for source, data, and vault:
 
 ## Release builds
 
-GitHub Actions runs lint and tests on Linux and Windows, builds the Docker image, and uses PyInstaller to produce standalone Windows and Linux command-line agents plus the windowed Windows Companion for tagged releases. Versioned release notes under `docs/releases/` are published verbatim when present. The central server remains Docker-first.
+GitHub Actions runs lint and tests on Linux and Windows, builds the Docker image, and uses PyInstaller to produce standalone Windows and Linux command-line agents plus Obsync Desktop for tagged releases. Versioned release notes under `docs/releases/` are published verbatim when present. The central server remains Docker-first.

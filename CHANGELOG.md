@@ -2,6 +2,21 @@
 
 All notable changes to Obsync will be documented here.
 
+## 0.8.0 - 2026-07-15
+
+### Added
+
+- Replaced the separate Companion product experience with **Obsync Desktop**, a single Windows app that bundles pairing, background folder watching, automatic startup, local start/stop controls, and a shortcut back to the Obsync dashboard
+- Added a global **Start syncing / Stop syncing** control that pauses connected watchers, cancels active synchronization and AI classification, cancels queued processing commands, and reconciles missed changes after restart
+- Added per-folder **Remove** controls that forget a watched folder on both the server and desktop without deleting original files or existing Obsidian notes
+- Added cancellation-safe processing states, desktop heartbeat propagation, late-command protection, and automated active-AI cancellation coverage
+
+### Changed
+
+- Renamed the Windows release artifact and in-app download to `obsync-desktop-windows-x64.exe`
+- Migrated automatic startup from the legacy `Obsync Companion` task to `Obsync Desktop` while preserving pairing, watched folders, and vault configuration
+- Moved extraction off the server event loop so Stop remains responsive during document processing
+
 ## 0.7.0 - 2026-07-14
 
 ### Added

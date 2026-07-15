@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from obsync.security import hash_token
+from obsync.service import PipelinePausedError
 
 
 def test_expired_enrollment_is_rejected(app) -> None:
@@ -93,3 +95,70 @@ def test_repeated_pair_disconnect_cycles_leave_no_stale_computers(app) -> None:
 async def test_incomplete_llm_settings_report_disabled(app) -> None:
     result = await app.state.service.test_llm()
     assert result["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_stopping_pipeline_cancels_active_ai_processing(app, tmp_path, monkeypatch) -> None:
+    service = app.state.service
+    enrollment = service.create_enrollment("AI PC")
+    registered = service.register_agent(
+        enrollment["code"],
+        {"name": "AI PC", "hostname": "ai-pc", "os_name": "Windows"},
+    )
+    agent = service.db.query_one("SELECT * FROM agents WHERE id = ?", (registered["agent_id"],))
+    root = service.upsert_root(
+        registered["agent_id"],
+        {
+            "root_key": "ai-root",
+            "name": "AI Files",
+            "path": str(tmp_path),
+            "destination": "Obsync",
+        },
+    )
+    staged = tmp_path / "active.txt"
+    staged.write_text("Wait for a deliberately slow AI review", encoding="utf-8")
+    started = asyncio.Event()
+
+    async def wait_forever(*_args, **_kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("obsync.service.LLMAnalyzer.analyze", wait_forever)
+    task = asyncio.create_task(
+        service.process_file(
+            agent=agent,
+            root_id=root["id"],
+            source_path="active.txt",
+            source_mtime_ns=1,
+            source_size=staged.stat().st_size,
+            staged_file=staged,
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=2)
+    stopped = service.pause_pipeline()
+    assert stopped["active_jobs"] == 1
+    with pytest.raises(PipelinePausedError, match="stopped"):
+        await task
+    document = service.db.query_one("SELECT * FROM documents WHERE source_path = 'active.txt'")
+    assert document["status"] == "paused"
+    assert document["error"] == "Stopped by user"
+    assert list(service.settings.vault_path.rglob("*.md")) == []
+
+
+def test_stopping_pipeline_cancels_pending_desktop_note_write(app) -> None:
+    service = app.state.service
+    enrollment = service.create_enrollment("Vault PC")
+    registered = service.register_agent(enrollment["code"], {"name": "Vault PC"})
+    queued = service.queue_command(
+        registered["agent_id"],
+        "write_note",
+        {"document_id": "document-waiting-for-desktop"},
+    )
+
+    stopped = service.pause_pipeline()
+
+    assert stopped["cancelled_commands"] == 1
+    command = service.db.query_one("SELECT * FROM commands WHERE id = ?", (queued["id"],))
+    assert command is not None
+    assert command["status"] == "cancelled"
+    assert command["result"] == "Stopped by user"

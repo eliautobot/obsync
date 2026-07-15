@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
 
 from . import __version__
 from .config import Settings
-from .service import LoginRateLimitedError, ObsyncService
+from .service import LoginRateLimitedError, ObsyncService, PipelinePausedError
 
 SESSION_COOKIE = "obsync_session"
 CSRF_COOKIE = "obsync_csrf"
@@ -277,6 +277,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def value_error_handler(_request: Request, exc: ValueError):
         return JSONResponse(status_code=400, content={"detail": str(exc)})
 
+    @app.exception_handler(PipelinePausedError)
+    async def pipeline_paused_handler(_request: Request, exc: PipelinePausedError):
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
     @app.get("/api/v1/health")
     async def health() -> dict[str, Any]:
         return {
@@ -289,9 +293,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def meta() -> dict[str, Any]:
         return {"name": "Obsync", "version": __version__, "authentication": "session"}
 
-    @app.get("/api/v1/downloads/windows-companion", include_in_schema=False)
-    async def download_windows_companion() -> Response:
-        filename = "obsync-companion-windows-x64.exe"
+    @app.get("/api/v1/downloads/windows-desktop", include_in_schema=False)
+    async def download_windows_desktop() -> Response:
+        filename = "obsync-desktop-windows-x64.exe"
         bundled = Path(__file__).with_name("downloads") / filename
         if bundled.is_file():
             return FileResponse(
@@ -303,6 +307,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             f"https://github.com/eliautobot/obsync/releases/download/v{__version__}/{filename}",
             status_code=307,
         )
+
+    @app.get("/api/v1/downloads/windows-companion", include_in_schema=False)
+    async def download_windows_companion() -> Response:
+        return RedirectResponse("/api/v1/downloads/windows-desktop", status_code=307)
 
     @app.get("/api/v1/auth/status")
     async def auth_status(request: Request) -> dict[str, bool]:
@@ -412,6 +420,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def overview(_token: AdminDependency) -> dict[str, Any]:
         return service.overview()
 
+    @app.get("/api/v1/admin/pipeline")
+    async def pipeline_status(_token: AdminDependency) -> dict[str, Any]:
+        return service.pipeline_status()
+
+    @app.post("/api/v1/admin/pipeline/stop")
+    async def stop_pipeline(_token: AdminDependency) -> dict[str, Any]:
+        return service.pause_pipeline()
+
+    @app.post("/api/v1/admin/pipeline/start")
+    async def start_pipeline(_token: AdminDependency) -> dict[str, Any]:
+        return service.resume_pipeline()
+
     @app.get("/api/v1/admin/server")
     async def server_info(_token: AdminDependency) -> dict[str, Any]:
         return service.server_info()
@@ -450,6 +470,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/v1/admin/roots")
     async def roots(_token: AdminDependency) -> dict[str, Any]:
         return {"items": service.list_roots()}
+
+    @app.delete("/api/v1/admin/roots/{root_id}")
+    async def remove_root(root_id: str, _token: AdminDependency) -> dict[str, Any]:
+        try:
+            return service.remove_root(root_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/v1/admin/enrollments")
     async def create_enrollment(
@@ -587,10 +614,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "agent_id": agent["id"],
             "name": agent["name"],
             "server_version": __version__,
+            "sync_enabled": service.pipeline_enabled(),
         }
 
     @app.post("/api/v1/agent/heartbeat")
-    async def heartbeat(payload: dict[str, Any], agent: AgentDependency) -> dict[str, bool]:
+    async def heartbeat(payload: dict[str, Any], agent: AgentDependency) -> dict[str, Any]:
         service.heartbeat(
             agent["id"],
             str(payload.get("agent_version", "")),
@@ -598,7 +626,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             vault_ready=bool(payload.get("vault_ready")) if "vault_ready" in payload else None,
             vault_error=str(payload.get("vault_error", "")) if "vault_error" in payload else None,
         )
-        return {"ok": True}
+        return {"ok": True, "sync_enabled": service.pipeline_enabled()}
 
     @app.post("/api/v1/agent/roots")
     async def upsert_root(payload: RootRequest, agent: AgentDependency) -> dict[str, Any]:

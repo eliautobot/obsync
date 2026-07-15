@@ -59,6 +59,8 @@ Generated notes are grouped by destination prefix, source device, watched folder
 - Dashboard counts and event stream
 - Device and watched-root status
 - Native **Add folder**, per-folder **Scan**, **View files**, and **Sync changes** controls
+- Global **Start syncing / Stop syncing** control with active sync and AI cancellation
+- Per-folder **Remove** action that preserves originals and existing notes
 - Green/orange/red comparison indicators and aggregate folder counts
 - One-time device enrollment codes
 - Remote scan command
@@ -70,10 +72,10 @@ Generated notes are grouped by destination prefix, source device, watched folder
 - Automatic server computer plus optional paired desktops
 - Native desktop folder picker for watched roots and the vault
 - Account menu with administrator username/password management and explicit sign-out
-- Guided Windows Companion with per-user installation, silent background operation, and automatic sign-in startup
-- Single-instance, retry-safe Windows pairing with one-click copy/paste setup and startup repair
+- Obsync Desktop for Windows with bundled watcher, local start/stop controls, dashboard shortcut, per-user installation, silent background operation, and automatic sign-in startup
+- Single-instance, retry-safe Windows pairing with one-click copy/paste setup, legacy-task migration, and startup repair
 - Safe computer disconnect that preserves source files and existing Obsidian notes
-- Matching Windows Companion served directly by published Obsync containers
+- Matching Obsync Desktop executable served directly by published Obsync containers
 - Contextual `?` explanations across controls and a complete in-app Help center
 - Top-layer notifications that remain sharp and readable above open dialogs
 
@@ -86,6 +88,8 @@ Generated notes are grouped by destination prefix, source device, watched folder
 - Writes use a temporary sibling file followed by an atomic replace
 - Manual note content below the generated boundary is preserved
 - Source deletion is represented as status, never propagated as note deletion
+- Stopping work never disconnects computers, deletes source files, or deletes existing notes
+- Removing a watched folder deletes only Obsync's connection and ledger for that root
 - API secrets are never returned to the UI after storage
 - Administrator passwords and browser session credentials are never stored in plaintext
 

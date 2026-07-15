@@ -6,7 +6,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from obsync.agent import AgentConfig, AgentRuntime, AgentState, RootConfig
+from obsync.agent import AgentConfig, AgentRuntime, AgentState, RootConfig, SyncPausedError
 
 
 @pytest.mark.asyncio
@@ -250,6 +250,153 @@ async def test_remote_folder_picker_registers_and_inventories_source(
         f"/api/v1/admin/commands/{queued.json()['id']}", headers=admin_headers
     ).json()
     assert command["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_remote_folder_removal_forgets_local_watch_but_keeps_files(
+    app,
+    client,
+    admin_headers,
+    enrolled_agent,
+    registered_root,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "kept-source"
+    source.mkdir()
+    source_file = source / "kept.txt"
+    source_file.write_text("Keep this original", encoding="utf-8")
+    config_path = tmp_path / "agent.yml"
+    config = AgentConfig(
+        server_url="http://testserver",
+        agent_id=enrolled_agent["agent_id"],
+        agent_token=enrolled_agent["agent_token"],
+        name="Test PC",
+        roots=[
+            RootConfig(
+                root_key=registered_root["root_key"],
+                name=registered_root["name"],
+                path=str(source),
+            )
+        ],
+    )
+    config.save(config_path)
+    state = AgentState(tmp_path / "agent-state.db")
+    state.mark_synced(registered_root["root_key"], "kept.txt", 1, 18, "a" * 64)
+
+    removed = client.delete(f"/api/v1/admin/roots/{registered_root['id']}", headers=admin_headers)
+    assert removed.status_code == 200
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+        headers={"Authorization": f"Bearer {enrolled_agent['agent_token']}"},
+    ) as async_client:
+        runtime = AgentRuntime(
+            config,
+            client=async_client,
+            config_path=config_path,
+            state=state,
+        )
+        await runtime.process_commands_once()
+
+    assert AgentConfig.load(config_path).roots == []
+    assert state.all_for_root(registered_root["root_key"]) == []
+    assert source_file.read_text(encoding="utf-8") == "Keep this original"
+    command = client.get(
+        f"/api/v1/admin/commands/{removed.json()['command_id']}", headers=admin_headers
+    ).json()
+    assert command["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_offline_folder_removal_is_reconciled_when_agent_reconnects(
+    app,
+    client,
+    admin_headers,
+    enrolled_agent,
+    registered_root,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "offline-source"
+    source.mkdir()
+    config_path = tmp_path / "agent.yml"
+    root = RootConfig(
+        root_key=registered_root["root_key"],
+        name=registered_root["name"],
+        path=str(source),
+    )
+    config = AgentConfig(
+        server_url="http://testserver",
+        agent_id=enrolled_agent["agent_id"],
+        agent_token=enrolled_agent["agent_token"],
+        name="Test PC",
+        roots=[root],
+    )
+    config.save(config_path)
+    state = AgentState(tmp_path / "agent-state.db")
+    state.mark_synced(root.root_key, "old.txt", 1, 3, "b" * 64)
+
+    removed = client.delete(f"/api/v1/admin/roots/{registered_root['id']}", headers=admin_headers)
+    assert removed.status_code == 200
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+        headers={"Authorization": f"Bearer {enrolled_agent['agent_token']}"},
+    ) as async_client:
+        runtime = AgentRuntime(
+            config,
+            client=async_client,
+            config_path=config_path,
+            state=state,
+        )
+        await runtime.register_roots()
+        assert runtime.config.roots == []
+        assert runtime._root_ids == {}
+        await runtime.process_commands_once()
+
+    assert AgentConfig.load(config_path).roots == []
+    assert state.all_for_root(root.root_key) == []
+    command = client.get(
+        f"/api/v1/admin/commands/{removed.json()['command_id']}", headers=admin_headers
+    ).json()
+    assert command["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_agent_heartbeat_obeys_global_pipeline_state(
+    app,
+    client,
+    admin_headers,
+    enrolled_agent,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "paused-source"
+    source.mkdir()
+    root = RootConfig(root_key="paused-root", name="Paused", path=str(source))
+    config = AgentConfig(
+        server_url="http://testserver",
+        agent_id=enrolled_agent["agent_id"],
+        agent_token=enrolled_agent["agent_token"],
+        name="Test PC",
+        roots=[root],
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+        headers={"Authorization": f"Bearer {enrolled_agent['agent_token']}"},
+    ) as async_client:
+        runtime = AgentRuntime(config, client=async_client)
+        client.post("/api/v1/admin/pipeline/stop", headers=admin_headers)
+        assert (await runtime.heartbeat_once())["sync_enabled"] is False
+        with pytest.raises(SyncPausedError, match="stopped"):
+            await runtime.inventory_root(root)
+
+        client.post("/api/v1/admin/pipeline/start", headers=admin_headers)
+        assert (await runtime.heartbeat_once())["sync_enabled"] is True
 
 
 @pytest.mark.asyncio

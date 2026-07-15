@@ -9,6 +9,7 @@ const state = {
   agents: [],
   roots: [],
   server: null,
+  pipeline: { enabled: true, state: "running", active_jobs: 0 },
 };
 
 function cookie(name) {
@@ -279,8 +280,48 @@ async function openApp(session, promptToSecure = false) {
   $("#login-screen").hidden = true;
   $("#app").hidden = false;
   updateSecurityState(session);
-  await navigate("overview");
+  await Promise.all([refreshPipelineStatus(), navigate("overview")]);
   if (session?.temporary && promptToSecure) await openSecuritySetup();
+}
+
+function updatePipelineControl(status) {
+  state.pipeline = status;
+  const button = $("#pipeline-toggle");
+  if (!button) return;
+  button.classList.toggle("running", status.enabled);
+  button.classList.toggle("stopped", !status.enabled);
+  $("span", button).textContent = status.enabled ? "Stop syncing" : "Start syncing";
+  button.title = status.enabled
+    ? "Stop syncing and cancel active AI work"
+    : "Start syncing and reconcile missed changes";
+  $$('[data-pipeline-work="true"]').forEach((control) => { control.disabled = !status.enabled; });
+}
+
+async function refreshPipelineStatus() {
+  const status = await api("/api/v1/admin/pipeline");
+  updatePipelineControl(status);
+  return status;
+}
+
+async function togglePipeline() {
+  const button = $("#pipeline-toggle");
+  button.disabled = true;
+  const stopping = state.pipeline.enabled;
+  try {
+    const status = await api(
+      stopping ? "/api/v1/admin/pipeline/stop" : "/api/v1/admin/pipeline/start",
+      { method: "POST" },
+    );
+    updatePipelineControl(status);
+    toast(stopping
+      ? "Syncing stopped. Active sync and AI work was cancelled."
+      : "Syncing started. Missed changes will be reconciled.");
+    await navigate(state.view);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function bootstrapAuth() {
@@ -372,6 +413,7 @@ async function pollCommand(commandId, message = "Working on the desktop…") {
     const command = await api(`/api/v1/admin/commands/${commandId}`);
     if (command.status === "completed") return command;
     if (command.status === "failed") throw new Error(command.result || "Desktop command failed.");
+    if (command.status === "cancelled") throw new Error(command.result || "Stopped by user.");
   }
   throw new Error("The desktop did not finish the request. Make sure its Obsync agent is running.");
 }
@@ -460,6 +502,36 @@ function openDisconnectComputer(agent) {
   });
 }
 
+function openRemoveFolder(root) {
+  const modal = $("#modal");
+  $("#modal-title").textContent = "Remove synced folder";
+  $("#modal-body").innerHTML = `
+    <div class="warning-box"><strong>Stop syncing ${escapeHtml(root.name)}?</strong><p>The folder will be removed from this computer's Obsync folder list.</p></div>
+    <ul class="plain-list">
+      <li>The real folder and every original file on the PC are kept.</li>
+      <li>Existing Markdown notes in Obsidian are kept.</li>
+      <li>Obsync removes its file records for this folder. Adding it again starts a fresh comparison.</li>
+    </ul>
+    <div class="modal-actions"><button class="secondary" type="button" id="remove-folder-cancel">Cancel</button><button class="danger" type="button" id="remove-folder-confirm">Remove folder</button></div>`;
+  modal.showModal();
+  $("#remove-folder-cancel").addEventListener("click", () => modal.close());
+  $("#remove-folder-confirm").addEventListener("click", async () => {
+    const button = $("#remove-folder-confirm");
+    button.disabled = true;
+    button.textContent = "Removing…";
+    try {
+      const result = await api(`/api/v1/admin/roots/${root.id}`, { method: "DELETE" });
+      modal.close();
+      toast(`${result.name} removed. Original files and Obsidian notes were kept.`);
+      await navigate("sources");
+    } catch (error) {
+      button.disabled = false;
+      button.textContent = "Remove folder";
+      toast(error.message, true);
+    }
+  });
+}
+
 async function openRootFiles(root) {
   const modal = $("#modal");
   $("#modal-title").textContent = root.name;
@@ -481,6 +553,7 @@ async function openRootFiles(root) {
 async function renderOverview() {
   const data = await api("/api/v1/admin/overview");
   state.overview = data;
+  updatePipelineControl(data.pipeline);
   const stats = data.stats;
   $("#review-badge").hidden = !stats.review;
   $("#review-badge").textContent = stats.review;
@@ -488,6 +561,7 @@ async function renderOverview() {
     <li class="event ${escapeHtml(event.level)}"><i class="event-dot"></i><p>${escapeHtml(event.message)}</p><small>${relativeTime(event.created_at)}</small></li>
   `).join("") || '<li class="empty">No activity yet.</li>';
   $("#content").innerHTML = `
+    ${data.pipeline.enabled ? "" : '<div class="pipeline-banner"><div><strong>Syncing is stopped</strong><p>Folder watching, scans, syncs, and AI classification are paused. Source files and existing notes are unchanged.</p></div></div>'}
     <div class="stats">
       ${statCard("Synced documents", stats.synced, "↗", "good", "Files whose current source content is represented by an Obsync-managed note in the vault.")}
       ${statCard("Connected computers", `${stats.online_computers}/${stats.computers}`, "◎", "", "Online computers divided by all known computers. The central Obsync server counts as one computer.")}
@@ -508,9 +582,10 @@ async function renderOverview() {
 }
 
 async function renderSources() {
-  const [server, agentData, rootData] = await Promise.all([
-    api("/api/v1/admin/server"), api("/api/v1/admin/agents"), api("/api/v1/admin/roots"),
+  const [server, agentData, rootData, pipeline] = await Promise.all([
+    api("/api/v1/admin/server"), api("/api/v1/admin/agents"), api("/api/v1/admin/roots"), api("/api/v1/admin/pipeline"),
   ]);
+  updatePipelineControl(pipeline);
   state.server = server;
   state.agents = agentData.items;
   state.roots = rootData.items;
@@ -526,23 +601,23 @@ async function renderSources() {
         ${comparisonBadge("vault-missing", root.missing_count || 0)}
         ${root.checking_count ? comparisonBadge("checking", root.checking_count) : ""}
       </div>
-      <div class="root-actions"><button class="quiet view-root" data-root="${root.id}" title="Inspect every file and its current comparison status">View files</button><button class="quiet scan-root" data-root="${root.id}" title="Compare the folder with Obsidian without writing notes">Scan</button><button class="secondary sync-root" data-root="${root.id}" title="Process only new, modified, or missing items">Sync changes</button></div>
+      <div class="root-actions"><button class="danger remove-root" data-root="${root.id}" title="Stop watching this folder without deleting originals or notes">Remove</button><button class="quiet view-root" data-root="${root.id}" title="Inspect every file and its current comparison status">View files</button><button class="quiet scan-root" data-pipeline-work="true" data-root="${root.id}" title="Compare the folder with Obsidian without writing notes" ${pipeline.enabled ? "" : "disabled"}>Scan</button><button class="secondary sync-root" data-pipeline-work="true" data-root="${root.id}" title="Process only new, modified, or missing items" ${pipeline.enabled ? "" : "disabled"}>Sync changes</button></div>
     </div>`).join("");
     return `<article class="source-card">
-      <div class="source-top"><span class="device-icon">${agent.os_name === "Windows" ? "▣" : "◫"}</span><div><h3>${escapeHtml(agent.name)} ${helpIcon("A paired desktop companion that gives Obsync safe access to folders on this computer.", `About ${agent.name}`)}</h3><p>${escapeHtml(agent.os_name)} · seen ${relativeTime(agent.last_seen_at)}</p>${agent.vault_ready ? '<span class="device-role">VAULT WRITER READY</span>' : ""}</div><span class="status-pill ${agent.status}" title="Whether the companion is currently communicating with the server">${agent.status}</span></div>
+      <div class="source-top"><span class="device-icon">${agent.os_name === "Windows" ? "▣" : "◫"}</span><div><h3>${escapeHtml(agent.name)} ${helpIcon("A paired Obsync Desktop app that gives Obsync safe access to folders on this computer.", `About ${agent.name}`)}</h3><p>${escapeHtml(agent.os_name)} · seen ${relativeTime(agent.last_seen_at)}</p>${agent.vault_ready ? '<span class="device-role">VAULT WRITER READY</span>' : ""}</div><span class="status-pill ${agent.status}" title="Whether Obsync Desktop is currently communicating with the server">${agent.status}</span></div>
       ${rootRows || '<div class="root-row">No watched folders registered yet.</div>'}
       ${agent.vault_path ? `<div class="root-row"><strong>Obsidian vault</strong><code>${escapeHtml(agent.vault_path)}</code></div>` : ""}
-      <div class="source-stats"><span>${agent.document_count || 0} files indexed</span><div class="source-actions"><button class="danger disconnect-computer" data-agent="${agent.id}" title="Revoke this computer and remove it from Obsync">Disconnect</button><button class="primary add-folder" data-agent="${agent.id}" title="Open this computer's folder browser and add a directory to watch">+ Add folder</button></div></div>
+      <div class="source-stats"><span>${agent.document_count || 0} files indexed</span><div class="source-actions"><button class="danger disconnect-computer" data-agent="${agent.id}" title="Revoke this computer and remove it from Obsync">Disconnect</button><button class="primary add-folder" data-pipeline-work="true" data-agent="${agent.id}" title="Open this computer's folder browser and add a directory to watch" ${pipeline.enabled ? "" : "disabled"}>+ Add folder</button></div></div>
     </article>`;
   }).join("");
   const serverPath = server.vault_host_path || server.vault_path;
   const serverCard = `<article class="source-card server-card">
-    <div class="source-top"><span class="device-icon">◆</span><div><h3>${escapeHtml(server.name)} ${helpIcon("The central Obsync server processes files, stores the sync ledger, and coordinates every desktop companion.", "About the Obsync server")}</h3><p>${server.container ? "Docker container" : escapeHtml(server.os_name)} · ${escapeHtml(server.hostname)}</p><span class="device-role">ALWAYS CONNECTED</span></div><span class="status-pill" title="The central server is running">online</span></div>
+    <div class="source-top"><span class="device-icon">◆</span><div><h3>${escapeHtml(server.name)} ${helpIcon("The central Obsync server processes files, stores the sync ledger, and coordinates every Obsync Desktop app.", "About the Obsync server")}</h3><p>${server.container ? "Docker container" : escapeHtml(server.os_name)} · ${escapeHtml(server.hostname)}</p><span class="device-role">ALWAYS CONNECTED</span></div><span class="status-pill" title="The central server is running">online</span></div>
     <div class="root-row"><strong>Server vault mount</strong><code>${escapeHtml(serverPath)}</code></div>
     <div class="source-stats"><span>Processes files and coordinates every desktop</span></div>
   </article>`;
   const emptyHelp = state.agents.length ? "" : '<div class="panel source-help"><strong>1 connected computer means this Obsync server.</strong><p>Pair the Windows, Linux, or macOS computer that contains your source folders. It will then appear here and in the vault computer selector.</p></div>';
-  $("#content").innerHTML = `<div class="section-head"><div><h2>${headingWithHelp("Computers and folders", "Pair a desktop companion, choose one or more source folders, compare them with the vault, then sync only what changed.")}</h2><p>Add folders, scan them against Obsidian, inspect differences, then sync only what changed.</p></div><button class="primary" id="add-device" title="Pair a Windows, Linux, or macOS computer">+ Add another computer</button></div>${emptyHelp}<div class="source-grid">${serverCard}${cards}</div>`;
+  $("#content").innerHTML = `<div class="section-head"><div><h2>${headingWithHelp("Computers and folders", "Connect Obsync Desktop, choose one or more source folders, compare them with the vault, then sync only what changed.")}</h2><p>Add folders, scan them against Obsidian, inspect differences, then sync only what changed.</p></div><button class="primary" id="add-device" title="Connect a Windows, Linux, or macOS computer">+ Add another computer</button></div>${emptyHelp}<div class="source-grid">${serverCard}${cards}</div>`;
   $("#add-device").addEventListener("click", openEnrollment);
   $$(".add-folder").forEach((button) => button.addEventListener("click", () => {
     const agent = state.agents.find((item) => item.id === button.dataset.agent);
@@ -552,6 +627,10 @@ async function renderSources() {
   $$(".disconnect-computer").forEach((button) => button.addEventListener("click", () => {
     const agent = state.agents.find((item) => item.id === button.dataset.agent);
     if (agent) openDisconnectComputer(agent);
+  }));
+  $$(".remove-root").forEach((button) => button.addEventListener("click", () => {
+    const root = state.roots.find((item) => item.id === button.dataset.root);
+    if (root) openRemoveFolder(root);
   }));
   $$(".view-root").forEach((button) => button.addEventListener("click", () => {
     openRootFiles(state.roots.find((root) => root.id === button.dataset.root));
@@ -614,7 +693,7 @@ async function openEnrollment() {
     <p class="modal-note">The Obsync server is already connected. Add the Windows PC, Mac, or Linux computer whose folders are outside the server.</p>
     <div class="field">${labelWithHelp("device-label", "Computer name", "A friendly name such as Office PC. It helps you identify the computer in folder and vault selectors.")}<input id="device-label" placeholder="Office PC"></div>
     <div class="field">${labelWithHelp("pair-server-url", "Server address", "The address this computer uses to reach Obsync. Use a LAN, VPN, or HTTPS address—not localhost for a different computer.")}<input id="pair-server-url" value="${escapeHtml(suggestedServer)}"><small>Do not use localhost for a different computer.</small></div>
-    <label class="check-row"><input id="device-has-vault" type="checkbox"> This computer contains the Obsidian vault ${helpIcon("Select this when the real vault is stored on this computer, such as in Windows Documents. The Companion will ask you to choose it.", "About the vault computer option")}</label>
+    <label class="check-row"><input id="device-has-vault" type="checkbox"> This computer contains the Obsidian vault ${helpIcon("Select this when the real vault is stored on this computer, such as in Windows Documents. Obsync Desktop will ask you to choose it.", "About the vault computer option")}</label>
     <button class="primary full" id="create-code">Create pairing code</button>`;
   modal.showModal();
   $("#create-code").addEventListener("click", async () => {
@@ -628,19 +707,19 @@ async function openEnrollment() {
       const hasVault = $("#device-has-vault").checked;
       const enrollment = await api("/api/v1/admin/enrollments", { method: "POST", body: { label } });
       const setupDetails = JSON.stringify({ server, code: enrollment.code, name: label });
-      const download = "/api/v1/downloads/windows-companion";
+      const download = "/api/v1/downloads/windows-desktop";
       $("#modal-body").innerHTML = `
-        <p class="modal-note">This one-time code expires in 20 minutes. The Windows Companion installs for your account, runs silently, and starts automatically when you sign in.</p><div class="pair-code">${escapeHtml(enrollment.code)}</div>
+        <p class="modal-note">This one-time code expires in 20 minutes. Obsync Desktop installs for your account, contains the folder watcher, runs silently, and starts automatically when you sign in.</p><div class="pair-code">${escapeHtml(enrollment.code)}</div>
         <div class="pair-steps">
-          <div class="pair-step"><p><strong>1.</strong> On the Windows PC, download and open the Companion once.</p><a class="primary download-button" href="${download}">Download Windows Companion</a></div>
-          <div class="pair-step"><p><strong>2.</strong> Copy all setup details, then click <strong>Paste setup details</strong> in the Companion.</p><button class="secondary full copy-pair-setup" type="button" data-copy="${escapeHtml(setupDetails)}">Copy all setup details</button>
+          <div class="pair-step"><p><strong>1.</strong> On the Windows PC, download and open Obsync Desktop once.</p><a class="primary download-button" href="${download}">Download Obsync Desktop</a></div>
+          <div class="pair-step"><p><strong>2.</strong> Copy all setup details, then click <strong>Paste setup details</strong> in Obsync Desktop.</p><button class="secondary full copy-pair-setup" type="button" data-copy="${escapeHtml(setupDetails)}">Copy all setup details</button>
             <details class="manual-pair-details"><summary>Or enter the details manually</summary>
             <div class="pair-detail"><span>Server</span><code>${escapeHtml(server)}</code><button class="quiet copy-pair-value" type="button" data-copy="${escapeHtml(server)}">Copy</button></div>
             <div class="pair-detail"><span>Code</span><code>${escapeHtml(enrollment.code)}</code><button class="quiet copy-pair-value" type="button" data-copy="${escapeHtml(enrollment.code)}">Copy</button></div>
             <div class="pair-detail"><span>Name</span><code>${escapeHtml(label)}</code><button class="quiet copy-pair-value" type="button" data-copy="${escapeHtml(label)}">Copy</button></div>
             </details>
           </div>
-          <div class="pair-step"><p><strong>3.</strong> Click <strong>Connect and install</strong>${hasVault ? " and select the Obsidian vault when asked" : ""}. You may close the setup window after it confirms the connection.</p></div>
+          <div class="pair-step"><p><strong>3.</strong> Click <strong>Connect and install</strong>${hasVault ? " and select the Obsidian vault when asked" : ""}. The desktop app includes Start this PC, Stop this PC, and Open Obsync controls.</p></div>
         </div>
         <p class="inline-status" id="pairing-status"><span class="connection-wait"><i></i>Waiting for ${escapeHtml(label)} to connect…</span></p>
         <p class="modal-note">No PowerShell window stays open and no Administrator access is required. Linux and macOS users can follow the manual steps in the in-app Help page.</p>`;
@@ -702,14 +781,14 @@ async function renderSettings() {
     <section class="settings-card"><h3>${headingWithHelp("Obsidian vault", "The one vault where Obsync creates and updates managed Markdown notes.")}</h3><p>Choose where Obsync writes generated Markdown. The server mount is the default; a paired desktop can write directly to a vault on Windows or another computer.</p>
       <div class="vault-mode-grid">
         <label class="vault-choice"><input type="radio" name="vault-mode" value="local" ${vaultMode === "local" ? "checked" : ""}><span><strong>Server-mounted vault</strong><small>Best when the vault is mounted into Docker or Obsync runs natively beside it.</small></span>${helpIcon("The Docker or native server writes directly to a folder it can access.", "About a server-mounted vault")}</label>
-        <label class="vault-choice"><input type="radio" name="vault-mode" value="agent" ${vaultMode === "agent" ? "checked" : ""}><span><strong>Vault on a desktop</strong><small>Best when the vault is in Documents on Windows while the server runs elsewhere.</small></span>${helpIcon("A paired Companion performs safe vault reads and writes on the selected desktop.", "About a desktop vault")}</label>
+        <label class="vault-choice"><input type="radio" name="vault-mode" value="agent" ${vaultMode === "agent" ? "checked" : ""}><span><strong>Vault on a desktop</strong><small>Best when the vault is in Documents on Windows while the server runs elsewhere.</small></span>${helpIcon("Obsync Desktop performs safe vault reads and writes on the selected computer.", "About a desktop vault")}</label>
       </div>
       <div id="local-vault-settings">
         <div class="field">${labelWithHelp("", settings.runtime === "docker" ? "Host vault folder" : "Vault folder", "The host folder currently mapped to the Obsync vault. Docker mounts are changed in Compose, not from a web browser.")}<input value="${escapeHtml(hostVault)}" disabled><small>${settings.runtime === "docker" ? `Inside Docker this is mounted as ${escapeHtml(settings.vault_path)}. Docker mounts can only be changed when the container is created.` : "This native Obsync process writes directly to this folder."}</small></div>
       </div>
       <div id="agent-vault-settings" hidden>
-        <div class="field">${labelWithHelp("vault-agent", "Computer containing the vault", "Choose the online Companion that can access the real Obsidian vault folder.")}<select id="vault-agent"><option value="">${state.agents.length ? "Choose a paired computer…" : "No desktop computers paired"}</option>${vaultOptions}</select><small>The Overview computer count includes the Obsync server. A Windows PC appears here only after its desktop agent is paired and connected.</small></div>
-        <div class="settings-actions"><button class="secondary" type="button" id="browse-vault" title="Open a native folder browser on the selected computer">Browse for vault on that computer</button><button class="quiet" type="button" id="add-vault-computer" title="Pair another desktop Companion">+ Add computer</button></div>
+        <div class="field">${labelWithHelp("vault-agent", "Computer containing the vault", "Choose the online Obsync Desktop app that can access the real Obsidian vault folder.")}<select id="vault-agent"><option value="">${state.agents.length ? "Choose a paired computer…" : "No desktop computers paired"}</option>${vaultOptions}</select><small>The Overview computer count includes the Obsync server. A Windows PC appears here only after Obsync Desktop is connected.</small></div>
+        <div class="settings-actions"><button class="secondary" type="button" id="browse-vault" title="Open a native folder browser on the selected computer">Browse for vault on that computer</button><button class="quiet" type="button" id="add-vault-computer" title="Connect another computer">+ Add computer</button></div>
         <p class="inline-status" id="vault-agent-status">${state.agents.length ? "Choose a paired computer." : "The Obsync server is connected, but no desktop computer is paired yet."}</p>
       </div>
     </section>
@@ -777,12 +856,12 @@ async function renderHelp() {
   $("#content").innerHTML = `
     <div class="help-layout">
       <section class="help-hero panel">
-        <div><span class="eyebrow">START HERE</span><h2>From a folder to organized Obsidian notes</h2><p>Obsync uses one central server, a quiet Companion on each desktop, one Obsidian vault, and any number of watched folders.</p></div>
+        <div><span class="eyebrow">START HERE</span><h2>From a folder to organized Obsidian notes</h2><p>Obsync uses one central server, the Obsync Desktop app on each computer, one Obsidian vault, and any number of watched folders.</p></div>
         <button class="primary" id="help-add-computer">Add a computer</button>
       </section>
       <section class="help-steps" aria-label="Quick start">
         <article class="help-step"><span>1</span><div><h3>Secure the server</h3><p>Create the local administrator username and password. The server stores settings and coordinates every computer.</p></div></article>
-        <article class="help-step"><span>2</span><div><h3>Connect the vault computer</h3><p>Open <strong>Sources → Add another computer</strong>, download the Windows Companion once, copy all setup details, and paste them into its setup window. It runs silently and starts at sign-in.</p></div></article>
+        <article class="help-step"><span>2</span><div><h3>Connect the vault computer</h3><p>Open <strong>Sources → Add another computer</strong>, download Obsync Desktop once, copy all setup details, and paste them into the app. Its built-in watcher runs silently and starts at sign-in.</p></div></article>
         <article class="help-step"><span>3</span><div><h3>Select the vault</h3><p>In <strong>Settings → Obsidian vault</strong>, choose either a server-mounted vault or the connected desktop that contains your real vault.</p></div></article>
         <article class="help-step"><span>4</span><div><h3>Add folders</h3><p>On the Sources page, click <strong>Add folder</strong> on a connected computer. Choose any external folder you want Obsync to monitor.</p></div></article>
         <article class="help-step"><span>5</span><div><h3>Scan, inspect, then sync</h3><p>Scan compares every file without writing. View files shows the results. Sync changes extracts, organizes, and writes only what needs attention.</p></div></article>
@@ -804,17 +883,17 @@ async function renderHelp() {
           <div class="help-status">${comparisonBadge("vault-missing")}<p>The source is known, but its expected managed note is missing.</p></div>
           <div class="help-status">${comparisonBadge("source-missing")}<p>The original file disappeared. Obsync keeps the note and marks it missing.</p></div>
         </article>
-        <article class="settings-card"><h3>Why Windows needs the Companion</h3><p>Docker and web browsers are intentionally isolated from arbitrary Windows files. The Companion is the one-time, safe bridge that opens native folder pickers and watches folders as your Windows user. Obsync serves the matching download directly, needs no Administrator rights, creates an automatic sign-in task, and leaves no PowerShell window open.</p><p>If a computer shows offline, open the Companion again. It reuses the saved pairing and repairs automatic startup without creating another computer.</p></article>
-        <article class="settings-card"><h3>Removing computers</h3><p>Use <strong>Sources → Disconnect</strong> to revoke an old computer and remove its watched-folder ledger. Original files and existing Obsidian notes are always kept. The active vault writer must be changed in Settings first.</p></article>
+        <article class="settings-card"><h3>Why Windows needs Obsync Desktop</h3><p>Docker and web browsers are intentionally isolated from arbitrary Windows files. Obsync Desktop includes the safe local bridge, native folder picker, background watcher, and start/stop controls in one app. It needs no Administrator rights and leaves no PowerShell window open.</p><p>If a computer shows offline, open Obsync Desktop and choose Start this PC. Reconnecting reuses the saved pairing.</p></article>
+        <article class="settings-card"><h3>Stopping and removing</h3><p>Use the top <strong>Stop syncing</strong> button to cancel active sync and AI work without disconnecting anything. Use <strong>Remove</strong> on one folder to forget only that source, or <strong>Disconnect</strong> to revoke a whole computer. Original files and existing Obsidian notes are always kept.</p></article>
         <article class="settings-card"><h3>Server vs. desktop</h3><p>The central server always appears as one connected computer. Docker can access only folders mounted into its container. Pair the physical desktop whenever the vault or source folders live in Windows Documents, another user folder, a Mac, or a different PC.</p></article>
         <article class="settings-card"><h3>Local AI</h3><p>AI is optional. Choose Ollama, LM Studio, or an OpenAI-compatible endpoint, enter the exact model name, then use <strong>Check connection</strong>. The check lists models quickly without starting inference. If AI is offline, deterministic organization keeps syncing.</p></article>
         <article class="settings-card"><h3>Safety</h3><p>Obsync never edits, moves, or deletes source files. It owns only marked generated sections in Markdown and preserves text under <strong>My notes</strong>. Missing files are recorded rather than propagated as deletions.</p></article>
       </section>
       <section class="settings-card help-troubleshooting"><h3>Troubleshooting</h3>
-        <details><summary>A Windows PC does not appear in a selector</summary><p>Confirm the Companion setup window reported success and the Sources card says online. The Overview count includes the central server, which is not a desktop selector option.</p></details>
-        <details><summary>The Companion says the pairing code was already used</summary><p>Close duplicate Companion windows and reopen one copy. Obsync reuses a valid saved connection and repairs startup. If the computer was disconnected, create a new code.</p></details>
-        <details><summary>Windows warns that the Companion is unrecognized</summary><p>Early community builds are not code-signed. Confirm the file came from the official Obsync GitHub release before choosing <strong>More info → Run anyway</strong> in Windows SmartScreen.</p></details>
-        <details><summary>The folder browser does not open</summary><p>The selected desktop must be online. Open the Companion again to repair automatic startup, then retry Add folder or Browse for vault.</p></details>
+        <details><summary>A Windows PC does not appear in a selector</summary><p>Confirm Obsync Desktop reported success and the Sources card says online. The Overview count includes the central server, which is not a desktop selector option.</p></details>
+        <details><summary>Obsync Desktop says the pairing code was already used</summary><p>Close duplicate Desktop windows and reopen one copy. Obsync reuses a valid saved connection and repairs startup. If the computer was disconnected, create a new code.</p></details>
+        <details><summary>Windows warns that Obsync Desktop is unrecognized</summary><p>Early community builds are not code-signed. Confirm the file came from the official Obsync GitHub release before choosing <strong>More info → Run anyway</strong> in Windows SmartScreen.</p></details>
+        <details><summary>The folder browser does not open</summary><p>The selected desktop must be online. Open Obsync Desktop and choose Start this PC, then retry Add folder or Browse for vault.</p></details>
         <details><summary>The model check fails</summary><p>Confirm the provider, exact model name, and base URL. From Docker Desktop, <code>host.docker.internal</code> usually reaches Ollama or LM Studio on the host.</p></details>
         <details><summary>A file remains red or orange</summary><p>Open View files for the exact reason, confirm the vault computer is online, then choose Sync changes. Errors also appear under Documents.</p></details>
       </section>
@@ -901,6 +980,7 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") closeAccountMenu();
 });
 $("#secure-admin-button").addEventListener("click", openSecuritySetup);
+$("#pipeline-toggle").addEventListener("click", togglePipeline);
 $("#theme-button").addEventListener("click", () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark"));
 $("#help-button").addEventListener("click", () => navigate("help"));
 $("#refresh-button").addEventListener("click", () => navigate(state.view));

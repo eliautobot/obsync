@@ -28,14 +28,16 @@ Do not expose plain HTTP or an unauthenticated local-LLM endpoint to the public 
 For each PC:
 
 1. Create an expiring enrollment code in the central UI.
-2. On Windows, download the Companion from Obsync, copy all setup details, paste them into the Companion, and click **Connect and install**. On other systems, pair the agent once from the CLI.
+2. On Windows, download Obsync Desktop, copy all setup details, paste them into the app, and click **Connect and install**. On other systems, pair the agent once from the CLI.
 3. Choose **Add folder** on that computer's card and select a local directory.
 4. Review the inventory comparison, then choose **Sync changes**.
-5. The Windows Companion starts automatically at sign-in; configure the CLI agent to start at login/boot on other systems.
+5. Obsync Desktop starts its built-in watcher automatically at sign-in; configure the CLI agent to start at login/boot on other systems.
 
 The central UI shows the device, its roots, last heartbeat, file counts, and comparison states. **Scan** compares without writing; **Sync changes** processes the pending red/orange items. Commands are received by the desktop agent within approximately 30 seconds.
 
 Use **Disconnect** to retire a stale computer. Its credential, server-side watched-folder ledger, and pending commands are removed. Original files and existing Obsidian notes remain untouched. If it is the active desktop vault writer, choose another vault first.
+
+Use **Remove** on one watched folder to forget only that root on the server and desktop. Its local folder, original files, and existing notes remain untouched. Use the global **Stop syncing** control to pause all computers and cancel active AI processing without removing any connection; **Start syncing** reconciles missed changes.
 
 ## Network folders
 
@@ -56,7 +58,7 @@ The agent does not mark a successful local state until the central server accept
 Obsync supports two explicit modes:
 
 1. **Server-mounted vault:** Docker receives a host folder as `/vault`. This is simplest when the vault is on the server or a reliably mounted share. Docker mounts are established at container startup, so a web page cannot browse arbitrary Windows host folders later.
-2. **Vault on a desktop:** pair the desktop, select the vault in the Windows Companion (or run `obsync agent set-vault --browse` for a CLI agent), and select that computer in **Settings**. The native agent writes only validated Obsync-managed notes into that local vault. This is the recommended mode when the vault is in Windows Documents and the server runs elsewhere.
+2. **Vault on a desktop:** connect Obsync Desktop, select the vault there (or run `obsync agent set-vault --browse` for a CLI agent), and select that computer in **Settings**. The native app writes only validated Obsync-managed notes into that local vault. This is the recommended mode when the vault is in Windows Documents and the server runs elsewhere.
 
 Only one vault writer is active. The server remains the authoritative ledger and queues idempotent write/status commands when a desktop is selected. If that desktop is offline, documents remain pending and complete after the agent reconnects.
 

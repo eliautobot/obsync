@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -38,6 +39,7 @@ from .security import (
 )
 
 DEFAULT_SETTINGS: dict[str, tuple[str, bool]] = {
+    "sync_enabled": ("true", False),
     "vault_mode": ("local", False),
     "vault_agent_id": ("", False),
     "llm_enabled": ("false", False),
@@ -49,8 +51,26 @@ DEFAULT_SETTINGS: dict[str, tuple[str, bool]] = {
     "review_threshold": ("0.65", False),
 }
 
+PIPELINE_COMMANDS = frozenset(
+    {
+        "scan",
+        "sync",
+        "scan_root",
+        "sync_root",
+        "resync",
+        "write_note",
+        "set_source_status",
+        "audit_vault",
+        "select_source",
+    }
+)
+
 
 class LoginRateLimitedError(ValueError):
+    pass
+
+
+class PipelinePausedError(RuntimeError):
     pass
 
 
@@ -62,6 +82,7 @@ class ObsyncService:
         self.db.initialize()
         self._ensure_defaults()
         self._inventory_vault_indexes: dict[str, dict[tuple[str, str, str], dict[str, str]]] = {}
+        self._active_processing: dict[str, tuple[str, asyncio.Task[Any]]] = {}
         self._dummy_password_hash = hash_password("obsync-invalid-password")
         self._bootstrap_admin_from_env()
 
@@ -81,6 +102,86 @@ class ObsyncService:
         if not username or not password:
             raise ValueError("OBSYNC_ADMIN_USERNAME and OBSYNC_ADMIN_PASSWORD must be set together")
         self.create_admin_account(username, password, bootstrap=True)
+
+    def pipeline_enabled(self) -> bool:
+        return self.db.get_setting("sync_enabled", "true").lower() == "true"
+
+    def require_pipeline_enabled(self) -> None:
+        if not self.pipeline_enabled():
+            raise PipelinePausedError(
+                "Syncing is stopped. Choose Start syncing before scanning or processing files."
+            )
+
+    def pipeline_status(self) -> dict[str, Any]:
+        enabled = self.pipeline_enabled()
+        return {
+            "enabled": enabled,
+            "state": "running" if enabled else "stopped",
+            "active_jobs": len(self._active_processing),
+        }
+
+    @staticmethod
+    def _cancel_task(task: asyncio.Task[Any]) -> None:
+        if task.done():
+            return
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is task.get_loop():
+            task.cancel()
+        else:
+            task.get_loop().call_soon_threadsafe(task.cancel)
+
+    def _cancel_processing(self, *, root_id: str = "") -> int:
+        tasks = [
+            task
+            for active_root_id, task in self._active_processing.values()
+            if not root_id or active_root_id == root_id
+        ]
+        for task in tasks:
+            self._cancel_task(task)
+        return len(tasks)
+
+    def pause_pipeline(self) -> dict[str, Any]:
+        self.db.set_settings({"sync_enabled": ("false", False)})
+        now = utc_now()
+        pending = self.db.query_all(
+            "SELECT id, command, payload_json FROM commands WHERE status = 'pending'"
+        )
+        cancelled = [row for row in pending if row["command"] in PIPELINE_COMMANDS]
+        with self.db.transaction() as connection:
+            for row in cancelled:
+                connection.execute(
+                    "UPDATE commands SET status = 'cancelled', result = ?, completed_at = ? "
+                    "WHERE id = ? AND status = 'pending'",
+                    ("Stopped by user", now, row["id"]),
+                )
+                if row["command"] == "write_note":
+                    payload = json.loads(row.get("payload_json") or "{}")
+                    document_id = str(payload.get("document_id", ""))
+                    if document_id:
+                        connection.execute(
+                            "UPDATE documents SET status = 'paused', error = ?, updated_at = ? "
+                            "WHERE id = ?",
+                            ("Stopped by user", now, document_id),
+                        )
+        active = self._cancel_processing()
+        self.db.add_event(
+            "pipeline.stopped",
+            "Syncing was stopped; active sync and AI work was cancelled",
+            level="warning",
+            details={"active_jobs": active, "cancelled_commands": len(cancelled)},
+        )
+        return {**self.pipeline_status(), "cancelled_commands": len(cancelled)}
+
+    def resume_pipeline(self) -> dict[str, Any]:
+        self.db.set_settings({"sync_enabled": ("true", False)})
+        self.db.add_event(
+            "pipeline.started",
+            "Syncing was started; connected computers will reconcile missed changes",
+        )
+        return self.pipeline_status()
 
     def has_admin_account(self) -> bool:
         return self.db.query_one("SELECT id FROM admin_users LIMIT 1") is not None
@@ -560,6 +661,16 @@ class ObsyncService:
 
     def upsert_root(self, agent_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         root_key = str(payload["root_key"])[:200]
+        pending_removals = self.db.query_all(
+            "SELECT payload_json FROM commands "
+            "WHERE agent_id = ? AND command = 'remove_root' AND status = 'pending'",
+            (agent_id,),
+        )
+        if any(
+            str(json.loads(row.get("payload_json") or "{}").get("root_key", "")) == root_key
+            for row in pending_removals
+        ):
+            return {"id": "", "root_key": root_key, "removal_requested": True}
         now = utc_now()
         existing = self.db.query_one(
             "SELECT * FROM roots WHERE agent_id = ? AND root_key = ?", (agent_id, root_key)
@@ -601,6 +712,48 @@ class ObsyncService:
         root = self.db.query_one("SELECT * FROM roots WHERE id = ?", (root_id,))
         assert root is not None
         return self._decode_root(root)
+
+    def remove_root(self, root_id: str) -> dict[str, Any]:
+        root = self.db.query_one(
+            "SELECT r.*, a.name AS agent_name FROM roots r "
+            "JOIN agents a ON a.id = r.agent_id WHERE r.id = ?",
+            (root_id,),
+        )
+        if not root:
+            raise ValueError("Watched folder not found")
+        document_count = int(
+            (
+                self.db.query_one(
+                    "SELECT count(*) AS count FROM documents WHERE root_id = ?", (root_id,)
+                )
+                or {}
+            ).get("count", 0)
+        )
+        self._cancel_processing(root_id=root_id)
+        command = self.queue_command(
+            root["agent_id"],
+            "remove_root",
+            {"root_key": root["root_key"], "name": root["name"]},
+        )
+        with self.db.transaction() as connection:
+            connection.execute("DELETE FROM events WHERE root_id = ?", (root_id,))
+            connection.execute("DELETE FROM roots WHERE id = ?", (root_id,))
+        self.db.add_event(
+            "root.removed",
+            (
+                f"Stopped watching {root['name']} on {root['agent_name']}; "
+                "source files and Obsidian notes were kept"
+            ),
+            agent_id=root["agent_id"],
+        )
+        return {
+            "ok": True,
+            "root_id": root_id,
+            "name": root["name"],
+            "agent_id": root["agent_id"],
+            "removed_documents": document_count,
+            "command_id": command["id"],
+        }
 
     def list_roots(self, agent_id: str | None = None) -> list[dict[str, Any]]:
         sql = """
@@ -697,6 +850,7 @@ class ObsyncService:
         items: list[dict[str, Any]],
         complete: bool = False,
     ) -> dict[str, Any]:
+        self.require_pipeline_enabled()
         root = self.db.query_one(
             "SELECT * FROM roots WHERE id = ? AND agent_id = ?", (root_id, agent["id"])
         )
@@ -1019,6 +1173,7 @@ class ObsyncService:
         claimed_hash: str = "",
         previous_path: str = "",
     ) -> dict[str, Any]:
+        self.require_pipeline_enabled()
         source_rel = safe_relative_path(source_path).as_posix()
         root = self.db.query_one(
             "SELECT * FROM roots WHERE id = ? AND agent_id = ?", (root_id, agent["id"])
@@ -1124,8 +1279,13 @@ class ObsyncService:
                 ),
             )
 
+        task = asyncio.current_task()
+        if task is not None:
+            self._active_processing[document_id] = (root_id, task)
         try:
-            extracted = extract_document(staged_file, self.settings.max_extract_chars)
+            extracted = await asyncio.to_thread(
+                extract_document, staged_file, self.settings.max_extract_chars
+            )
             analyzer = LLMAnalyzer(self._llm_config())
             analysis = await analyzer.analyze(
                 source_path=source_rel,
@@ -1133,6 +1293,8 @@ class ObsyncService:
                 mime_type=extracted.mime_type,
                 candidates=self._candidate_titles(source_rel),
             )
+            self.require_pipeline_enabled()
+            await asyncio.sleep(0)
             try:
                 threshold = float(self.db.get_setting("review_threshold", "0.65"))
             except ValueError:
@@ -1237,6 +1399,26 @@ class ObsyncService:
                 **self._decode_document(row),
                 "result": "queued" if remote_vault else "synced",
             }
+        except asyncio.CancelledError as exc:
+            self.db.execute(
+                "UPDATE documents SET status = 'paused', error = ?, updated_at = ? WHERE id = ?",
+                ("Stopped by user", utc_now(), document_id),
+            )
+            self.db.add_event(
+                "document.stopped",
+                f"Stopped processing {source_rel}",
+                level="warning",
+                agent_id=agent["id"],
+                root_id=root_id,
+                document_id=document_id,
+            )
+            raise PipelinePausedError("Syncing was stopped by the user") from exc
+        except PipelinePausedError:
+            self.db.execute(
+                "UPDATE documents SET status = 'paused', error = ?, updated_at = ? WHERE id = ?",
+                ("Stopped by user", utc_now(), document_id),
+            )
+            raise
         except Exception as exc:
             self.db.execute(
                 "UPDATE documents SET status = 'error', error = ?, updated_at = ? WHERE id = ?",
@@ -1251,8 +1433,13 @@ class ObsyncService:
                 document_id=document_id,
             )
             raise
+        finally:
+            active = self._active_processing.get(document_id)
+            if active and active[1] is task:
+                self._active_processing.pop(document_id, None)
 
     def mark_missing(self, agent_id: str, root_id: str, source_path: str) -> dict[str, Any]:
+        self.require_pipeline_enabled()
         source_rel = safe_relative_path(source_path).as_posix()
         document = self.db.query_one(
             "SELECT * FROM documents WHERE agent_id = ? AND root_id = ? AND source_path = ?",
@@ -1345,6 +1532,7 @@ class ObsyncService:
         return {"items": [self._decode_document(row) for row in rows], "total": count["count"]}
 
     def pending_root_documents(self, agent_id: str, root_id: str) -> list[dict[str, Any]]:
+        self.require_pipeline_enabled()
         root = self.db.query_one(
             "SELECT id FROM roots WHERE id = ? AND agent_id = ? AND enabled = 1",
             (root_id, agent_id),
@@ -1376,6 +1564,8 @@ class ObsyncService:
     def queue_command(
         self, agent_id: str, command: str, payload: dict[str, Any] | None = None
     ) -> dict[str, Any]:
+        if command in PIPELINE_COMMANDS:
+            self.require_pipeline_enabled()
         if not self.db.query_one("SELECT id FROM agents WHERE id = ? AND enabled = 1", (agent_id,)):
             raise ValueError("Unknown or disabled agent")
         command_id = str(uuid.uuid4())
@@ -1411,6 +1601,8 @@ class ObsyncService:
         )
         if not command:
             raise ValueError("Unknown command")
+        if command["status"] == "cancelled":
+            return
         self.db.execute(
             """
             UPDATE commands SET status = ?, result = ?, completed_at = ?
@@ -1501,6 +1693,7 @@ class ObsyncService:
             "recent_events": events,
             "vault": self.vault_status(),
             "server": self.server_info(),
+            "pipeline": self.pipeline_status(),
         }
 
     def settings_for_ui(self) -> dict[str, Any]:
@@ -1513,6 +1706,7 @@ class ObsyncService:
             if Path("/.dockerenv").exists() or Path("/run/.containerenv").exists()
             else "native",
             "max_upload_mb": self.settings.max_upload_mb,
+            "sync_enabled": "true" if self.pipeline_enabled() else "false",
         }
         for key, row in values.items():
             if row["is_secret"]:

@@ -68,16 +68,16 @@ The server is listed automatically and counts as one connected computer, but its
 On Windows:
 
 1. Open **Sources → Add another computer** and create a pairing code.
-2. Download and open the Windows Companion served by Obsync.
-3. Click **Copy all setup details** in Obsync, then **Paste setup details** in the Companion.
+2. Download and open Obsync Desktop served by Obsync.
+3. Click **Copy all setup details** in Obsync, then **Paste setup details** in Obsync Desktop.
 4. Optionally choose the Obsidian vault on that computer.
 5. Click **Connect and install**.
 
-The Companion installs under the current user's Local AppData directory, creates and verifies a limited per-user automatic-start task, launches silently, and starts whenever that user signs in. It requires no Administrator access and leaves no PowerShell window open. Reopening it reuses a valid saved connection and repairs startup rather than creating another computer.
+Obsync Desktop installs under the current user's Local AppData directory, bundles the folder watcher, creates and verifies a limited per-user automatic-start task, launches silently, and starts whenever that user signs in. It requires no Administrator access and leaves no PowerShell window open. Reopening it exposes **Start this PC**, **Stop this PC**, and **Open Obsync**, reuses a valid saved connection, and repairs startup rather than creating another computer.
 
-The one-time Companion is required when the server runs in Docker because containers and web browsers cannot safely browse or continuously watch arbitrary Windows user folders. After installation, all normal folder, scan, sync, and disconnect controls live in the Obsync web app.
+The one-time Desktop installation is required when the server runs in Docker because containers and web browsers cannot safely browse or continuously watch arbitrary Windows user folders. It is the Windows half of Obsync, not a separate product or separately managed agent download.
 
-Early community builds are not code-signed, so Windows SmartScreen may identify the Companion as an unrecognized app. Verify that the file came from the official Obsync GitHub release before choosing **More info → Run anyway**.
+Early community builds are not code-signed, so Windows SmartScreen may identify Obsync Desktop as an unrecognized app. Verify that the file came from the official Obsync GitHub release before choosing **More info → Run anyway**.
 
 To pair manually on Linux, macOS, or an advanced Windows installation:
 
@@ -96,6 +96,10 @@ From **Sources**, open the connected computer and choose **Add folder**. A nativ
 - Red: new or missing
 
 Inspect the list with **View files**, use **Scan** to compare again, and use **Sync changes** when ready.
+
+Use the top **Stop syncing** button whenever you need all synchronization and AI classification to end. Connected computers stay connected and continue reporting their status, but work is rejected or cancelled. Choose **Start syncing** to resume; periodic reconciliation detects anything that changed while stopped.
+
+Use **Remove** on one folder to remove it from that computer's Obsync list. Obsync deletes only its local/server tracking records. The real folder, original files, and existing Obsidian notes remain untouched. Adding the folder later starts a fresh comparison.
 
 To retire a computer, choose **Disconnect** on its Sources card. Obsync revokes it and removes its device/folder ledger, but never changes source files or deletes existing notes. Change the active vault writer in Settings before disconnecting that computer.
 
@@ -128,7 +132,7 @@ Only one paired computer is selected as the vault writer at a time. Obsync valid
 
 ### Windows
 
-Use the guided Windows Companion downloaded from **Sources → Add another computer**. **Connect and install** creates, verifies, and starts the automatic-start task without a visible terminal. Reopen the Companion if startup needs to be repaired; a valid saved pairing is reused automatically. It runs as the current Windows user so it can access that user's Documents folder and vault. User-mapped network drives may not be ready at sign-in; UNC paths are more reliable for shares.
+Use Obsync Desktop downloaded from **Sources → Add another computer**. **Connect and install** creates, verifies, and starts the automatic-start task without a visible terminal. Reopen Obsync Desktop to start or stop this PC or repair startup; a valid saved pairing is reused automatically. It runs as the current Windows user so it can access that user's Documents folder and vault. User-mapped network drives may not be ready at sign-in; UNC paths are more reliable for shares.
 
 ### Linux systemd user service
 
@@ -173,4 +177,4 @@ For future server and desktop-agent releases, follow [Updating Obsync](UPDATING.
 
 ## 7. Use the in-app Help center
 
-Open **Help** from the sidebar or the top-right `?` button. It contains the quick-start flow, page explanations, status-color meanings, Companion details, local-model guidance, safety behavior, and troubleshooting. Small `?` controls beside settings and terms show a brief explanation on hover, focus, or tap.
+Open **Help** from the sidebar or the top-right `?` button. It contains the quick-start flow, page explanations, status-color meanings, Obsync Desktop details, start/stop and removal behavior, local-model guidance, safety behavior, and troubleshooting.
