@@ -28,7 +28,7 @@ from .markdown import (
     merge_preserving_manual,
     set_source_status,
 )
-from .security import safe_vault_path
+from .security import new_token, safe_vault_path
 
 
 def default_config_path() -> Path:
@@ -699,6 +699,10 @@ class AgentRuntime:
             try:
                 await self.heartbeat_once()
                 await self.process_commands_once()
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 401:
+                    self._stop.set()
+                    return
             except httpx.HTTPError:
                 pass
             with suppress(TimeoutError):
@@ -743,6 +747,7 @@ async def pair_agent(
     name: str = "",
     verify_tls: bool = True,
 ) -> AgentConfig:
+    proposed_token = new_token("agent")
     payload = {
         "code": code.upper(),
         "name": name or socket.gethostname(),
@@ -750,12 +755,31 @@ async def pair_agent(
         "os_name": platform.system(),
         "os_version": platform.platform(),
         "agent_version": __version__,
+        # Client-generated credentials make a registration retry idempotent. The
+        # server stores only the hash and returns this secret only to this client.
+        "agent_token": proposed_token,
     }
     async with httpx.AsyncClient(
         base_url=server_url.rstrip("/"), verify=verify_tls, timeout=30
     ) as client:
-        response = await client.post("/api/v1/agents/register", json=payload)
-        response.raise_for_status()
+        response = None
+        for attempt in range(2):
+            try:
+                response = await client.post("/api/v1/agents/register", json=payload)
+                break
+            except httpx.TransportError:
+                if attempt:
+                    raise
+                await asyncio.sleep(0.35)
+        assert response is not None
+        if not response.is_success:
+            try:
+                detail = str(response.json().get("detail", ""))
+            except (ValueError, AttributeError):
+                detail = ""
+            raise ValueError(
+                detail or f"The Obsync server rejected pairing ({response.status_code})"
+            )
         result = response.json()
     return AgentConfig(
         server_url=server_url.rstrip("/"),

@@ -18,7 +18,7 @@ uv run coverage run -m pytest
 uv run coverage report
 ```
 
-The test suite covers local-only temporary Admin, remote and cross-site setup rejection, password hashing, account changes, first-run and legacy auth migration, session cookies, CSRF, expiration, login throttling, device token/enrollment behavior, native folder selection, source inventories, green/orange/red comparisons, existing-note adoption, local and remote vault audits/writers, Windows Companion installation and automatic startup, path security, extractors, quick LLM model discovery, LLM response normalization, generated-note preservation, complete source-to-vault synchronization, repeat updates, tombstones, rename identity, and UI/static delivery.
+The test suite covers local-only temporary Admin, remote and cross-site setup rejection, password hashing, account changes, first-run and legacy auth migration, session cookies, CSRF, expiration, login throttling, device token/enrollment behavior, concurrent idempotent pairing, repeated pair/disconnect cleanup, native folder selection, source inventories, green/orange/red comparisons, existing-note adoption, local and remote vault audits/writers, Windows Companion installation/startup/repair, path security, extractors, quick LLM model discovery, LLM response normalization, generated-note preservation, complete source-to-vault synchronization, repeat updates, tombstones, rename identity, and UI/static delivery.
 
 The CLI and windowed Companion entry module are excluded from the aggregate coverage denominator because their process, Tk, and Windows-shell boundaries are validated through parser/unit tests, real Windows packaging, scheduled-task lifecycle checks, and launch smoke tests.
 

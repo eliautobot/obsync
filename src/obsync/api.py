@@ -22,7 +22,7 @@ from fastapi import (
     Response,
     UploadFile,
 )
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -41,6 +41,7 @@ class RegistrationRequest(BaseModel):
     os_name: str = ""
     os_version: str = ""
     agent_version: str = ""
+    agent_token: str = Field(default="", max_length=256)
 
 
 class RootRequest(BaseModel):
@@ -288,6 +289,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def meta() -> dict[str, Any]:
         return {"name": "Obsync", "version": __version__, "authentication": "session"}
 
+    @app.get("/api/v1/downloads/windows-companion", include_in_schema=False)
+    async def download_windows_companion() -> Response:
+        filename = "obsync-companion-windows-x64.exe"
+        bundled = Path(__file__).with_name("downloads") / filename
+        if bundled.is_file():
+            return FileResponse(
+                bundled,
+                filename=filename,
+                media_type="application/vnd.microsoft.portable-executable",
+            )
+        return RedirectResponse(
+            f"https://github.com/eliautobot/obsync/releases/download/v{__version__}/{filename}",
+            status_code=307,
+        )
+
     @app.get("/api/v1/auth/status")
     async def auth_status(request: Request) -> dict[str, bool]:
         status = service.setup_status()
@@ -423,6 +439,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def agents(_token: AdminDependency) -> dict[str, Any]:
         return {"items": service.list_agents()}
 
+    @app.delete("/api/v1/admin/agents/{agent_id}")
+    async def disconnect_agent(agent_id: str, _token: AdminDependency) -> dict[str, Any]:
+        try:
+            return service.disconnect_agent(agent_id)
+        except ValueError as exc:
+            status = 409 if "vault writer" in str(exc).lower() else 404
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+
     @app.get("/api/v1/admin/roots")
     async def roots(_token: AdminDependency) -> dict[str, Any]:
         return {"items": service.list_roots()}
@@ -555,6 +579,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not settings.allow_registration:
             raise HTTPException(status_code=403, detail="Agent enrollment is disabled")
         return service.register_agent(payload.code, payload.model_dump(exclude={"code"}))
+
+    @app.get("/api/v1/agent/status")
+    async def agent_status(agent: AgentDependency) -> dict[str, Any]:
+        return {
+            "connected": True,
+            "agent_id": agent["id"],
+            "name": agent["name"],
+            "server_version": __version__,
+        }
 
     @app.post("/api/v1/agent/heartbeat")
     async def heartbeat(payload: dict[str, Any], agent: AgentDependency) -> dict[str, bool]:

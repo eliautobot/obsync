@@ -59,28 +59,44 @@ curl --fail http://127.0.0.1:7769/api/v1/health
 
 Keep the existing `.env` file. Do not copy `.env.example` over it during an update; the example file documents new options but does not contain the installation's vault path or other settings.
 
+On a Windows Docker Desktop host, use PowerShell and first enter the exact folder containing both `.git` and `docker-compose.yml`:
+
+```powershell
+Set-Location "C:\Users\you\Documents\Obsync\obsync"
+Test-Path .\.git
+Test-Path .\docker-compose.yml
+git status --short
+git pull --ff-only
+docker compose build --pull
+docker compose up -d
+docker compose ps
+Invoke-RestMethod -Uri "http://127.0.0.1:7769/api/v1/health"
+```
+
+Both `Test-Path` commands must return `True`. If either is false, locate the Compose file with `Get-ChildItem "$HOME\Documents" -Filter docker-compose.yml -Recurse` and change into that folder. PowerShell does not use the Linux `\` character for line continuation.
+
 The `docker compose up -d` command recreates the application container while keeping the named data volume and vault mount. Database migrations run automatically when the updated server starts.
 
 To install a specific release instead of the newest `main` branch:
 
 ```bash
 git fetch --tags
-git checkout v0.6.0
+git checkout v0.7.0
 docker compose build --pull
 docker compose up -d
 ```
 
-Replace `v0.6.0` with the desired release tag. A tag checkout is intentionally fixed to that release; check out `main` again before using `git pull` for later updates.
+Replace `v0.7.0` with the desired release tag. A tag checkout is intentionally fixed to that release; check out `main` again before using `git pull` for later updates.
 
 ## Update a server using the published Docker image
 
 Pull the desired tag, then recreate the container using the same environment, ports, data volume, and vault mount as the existing deployment:
 
 ```bash
-docker pull ghcr.io/eliautobot/obsync:0.6.0
+docker pull ghcr.io/eliautobot/obsync:0.7.0
 ```
 
-Replace `0.6.0` with the desired version. Prefer a numbered tag for predictable deployments. If your Compose file references the published image, the complete update is:
+Replace `0.7.0` with the desired version. Prefer a numbered tag for predictable deployments. If your Compose file references the published image, the complete update is:
 
 ```bash
 docker compose pull
@@ -97,7 +113,7 @@ The server and desktop agents should normally use the same release. Update the s
 
 ### Windows Companion
 
-1. Download `obsync-companion-windows-x64.exe` from the matching [GitHub release](https://github.com/eliautobot/obsync/releases).
+1. In Obsync, open **Sources → Add another computer → Download Windows Companion**. Published containers serve the matching executable directly.
 2. Open it as the same Windows user that owns the existing pairing and watched folders.
 3. Leave the pairing code blank when the existing server address is unchanged, then click **Connect and install**.
 4. The Companion installs the new version, refreshes its automatic-start task, and starts in the background.
@@ -125,7 +141,7 @@ Install the matching release tag:
 
 ```bash
 python -m pip install --upgrade \
-  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.6.0"
+  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.7.0"
 obsync --version
 obsync agent scan
 ```

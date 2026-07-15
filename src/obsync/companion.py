@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -9,10 +10,13 @@ import socket
 import subprocess
 import sys
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 
+import httpx
 from platformdirs import user_data_path
 
 from . import __version__
@@ -48,6 +52,55 @@ def scheduled_task_command(executable: Path, config_path: Path) -> str:
     return subprocess.list2cmdline([str(executable), "--background", "--config", str(config_path)])
 
 
+def parse_pairing_details(value: str) -> dict[str, str]:
+    try:
+        payload = json.loads(value.strip())
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError(
+            "Copy the setup details from Obsync, then try Paste setup details again"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ValueError("The copied setup details are not valid")
+    details = {
+        "server": str(payload.get("server", "")).strip().rstrip("/"),
+        "code": str(payload.get("code", "")).strip().upper(),
+        "name": str(payload.get("name", "")).strip(),
+    }
+    if not details["server"].startswith(("http://", "https://")) or not details["code"]:
+        raise ValueError("The copied setup details are incomplete")
+    return details
+
+
+@contextmanager
+def setup_instance_lock(path: Path | None = None) -> Iterator[bool]:
+    """Allow only one setup window so a one-time code cannot be submitted twice."""
+    if not is_windows():
+        yield True
+        return
+    import msvcrt
+
+    lock_path = path or (companion_data_dir() / "setup.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle: BinaryIO = lock_path.open("a+b")
+    try:
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            yield False
+        else:
+            try:
+                yield True
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    finally:
+        handle.close()
+
+
 def _windows_creation_flags() -> int:
     return int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
@@ -61,6 +114,13 @@ def install_startup_task(
     if not is_windows():
         raise ValueError("Automatic companion startup is currently available on Windows")
     command = scheduled_task_command(executable, config_path)
+    run(
+        ["schtasks.exe", "/End", "/TN", TASK_NAME],
+        check=False,
+        capture_output=True,
+        text=True,
+        creationflags=_windows_creation_flags(),
+    )
     result = run(
         [
             "schtasks.exe",
@@ -83,6 +143,18 @@ def install_startup_task(
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "Windows rejected the startup task").strip()
         raise ValueError(f"Could not enable automatic startup: {detail}")
+    verification = run(
+        ["schtasks.exe", "/Query", "/TN", TASK_NAME],
+        check=False,
+        capture_output=True,
+        text=True,
+        creationflags=_windows_creation_flags(),
+    )
+    if verification.returncode != 0:
+        detail = (
+            verification.stderr or verification.stdout or "Windows could not find the startup task"
+        ).strip()
+        raise ValueError(f"Could not verify automatic startup: {detail}")
 
 
 def start_background_companion(
@@ -90,7 +162,20 @@ def start_background_companion(
     config_path: Path,
     *,
     popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> None:
+    if is_windows():
+        result = run(
+            ["schtasks.exe", "/Run", "/TN", TASK_NAME],
+            check=False,
+            capture_output=True,
+            text=True,
+            creationflags=_windows_creation_flags(),
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "Windows could not start Obsync").strip()
+            raise ValueError(f"Could not start the Obsync background app: {detail}")
+        return
     flags = (
         int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
         | int(getattr(subprocess, "DETACHED_PROCESS", 0))
@@ -105,6 +190,25 @@ def start_background_companion(
         close_fds=True,
         creationflags=flags,
     )
+
+
+async def existing_pairing_is_valid(config: AgentConfig) -> bool:
+    if not config.server_url or not config.agent_token:
+        return False
+    async with httpx.AsyncClient(
+        base_url=config.server_url.rstrip("/"),
+        headers={"Authorization": f"Bearer {config.agent_token}"},
+        verify=config.verify_tls,
+        timeout=10,
+    ) as client:
+        response = await client.get("/api/v1/agent/status")
+        if response.status_code == 404:
+            # Compatibility with Obsync 0.6 and earlier.
+            response = await client.post(
+                "/api/v1/agent/heartbeat",
+                json={"agent_version": __version__},
+            )
+    return response.is_success
 
 
 def _current_standalone_executable() -> Path:
@@ -135,15 +239,33 @@ async def install_companion(
         )
 
     target_config = config_path or default_config_path()
-    if code:
-        config = await pair_agent(server_url=server, code=code, name=name)
-    else:
-        config = AgentConfig.load(target_config)
-        if not config.agent_token:
-            raise ValueError("Enter the one-time pairing code shown in Obsync")
-        if config.server_url.rstrip("/") != server:
-            raise ValueError("A new server requires a new pairing code")
+    existing = AgentConfig.load(target_config)
+    existing_matches = bool(existing.agent_token and existing.server_url.rstrip("/") == server)
+    try:
+        existing_valid = existing_matches and await existing_pairing_is_valid(existing)
+    except httpx.RequestError as exc:
+        raise ValueError(
+            "Could not reach the Obsync server. Check the address and that both computers are "
+            "connected to the same LAN or VPN."
+        ) from exc
+    if existing_valid:
+        config = existing
         config.name = name
+    elif code:
+        try:
+            config = await pair_agent(server_url=server, code=code, name=name)
+        except httpx.RequestError as exc:
+            raise ValueError(
+                "Could not reach the Obsync server. Check the address and that both computers "
+                "are connected to the same LAN or VPN."
+            ) from exc
+    else:
+        if existing.agent_token and existing.server_url.rstrip("/") == server:
+            raise ValueError(
+                "This saved connection is no longer authorized. Create a new pairing code in "
+                "Obsync and enter it here."
+            )
+        raise ValueError("Enter the one-time pairing code shown in Obsync")
 
     if vault_path:
         config.set_vault(Path(vault_path))
@@ -204,8 +326,8 @@ def run_setup_gui(
     existing = AgentConfig.load(target_config)
     root = tk.Tk()
     root.title(f"Obsync Companion {__version__}")
-    root.geometry("560x570")
-    root.minsize(520, 520)
+    root.geometry("560x620")
+    root.minsize(520, 580)
 
     frame = ttk.Frame(root, padding=24)
     frame.pack(fill="both", expand=True)
@@ -229,6 +351,20 @@ def run_setup_gui(
     vault_value = tk.StringVar(value=existing.vault_path)
     status_value = tk.StringVar(value="Ready to connect.")
 
+    def paste_setup_details() -> None:
+        try:
+            details = parse_pairing_details(root.clipboard_get())
+            server_value.set(details["server"])
+            code_value.set(details["code"])
+            name_value.set(details["name"] or name_value.get())
+            status_value.set("Setup details pasted. Review them, then connect.")
+        except (tk.TclError, ValueError) as exc:
+            messagebox.showerror("Could not paste setup details", str(exc), parent=root)
+
+    ttk.Button(frame, text="Paste setup details", command=paste_setup_details).pack(
+        anchor="w", pady=(0, 14)
+    )
+
     def add_field(
         label: str,
         variable: tk.StringVar,
@@ -250,7 +386,7 @@ def run_setup_gui(
     add_field(
         "One-time pairing code",
         code_value,
-        "Copy the 12-character code shown in Obsync. It expires after 20 minutes.",
+        "Required for the first connection. Leave it blank when repairing an existing connection.",
     )
     add_field(
         "Computer name",
@@ -364,21 +500,34 @@ def main(argv: Sequence[str] | None = None) -> None:
     config_path = Path(args.config).expanduser() if args.config else default_config_path()
     if args.background:
         raise SystemExit(run_background(config_path))
-    try:
-        code = run_setup_gui(
-            server_url=args.server,
-            enrollment_code=args.code,
-            computer_name=args.name,
-            config_path=config_path,
-        )
-    except (ValueError, OSError) as exc:
-        try:
-            from tkinter import messagebox
+    with setup_instance_lock() as acquired:
+        if not acquired:
+            try:
+                from tkinter import messagebox
 
-            messagebox.showerror("Obsync Companion", str(exc))
-        except Exception:
-            pass
-        code = 2
+                messagebox.showinfo(
+                    "Obsync Companion is already open",
+                    "Use the setup window that is already open. "
+                    "Only one window can pair at a time.",
+                )
+            except Exception:
+                pass
+            raise SystemExit(0)
+        try:
+            code = run_setup_gui(
+                server_url=args.server,
+                enrollment_code=args.code,
+                computer_name=args.name,
+                config_path=config_path,
+            )
+        except (ValueError, OSError) as exc:
+            try:
+                from tkinter import messagebox
+
+                messagebox.showerror("Obsync Companion", str(exc))
+            except Exception:
+                pass
+            code = 2
     raise SystemExit(code)
 
 

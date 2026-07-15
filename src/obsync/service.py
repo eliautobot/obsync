@@ -367,19 +367,43 @@ class ObsyncService:
 
     def register_agent(self, code: str, payload: dict[str, str]) -> dict[str, str]:
         now = datetime.now(UTC)
-        enrollment = self.db.query_one(
-            "SELECT * FROM enrollments WHERE code_hash = ?", (hash_token(code.upper()),)
-        )
-        if not enrollment or enrollment["used_at"]:
-            raise ValueError("Enrollment code is invalid or already used")
-        if datetime.fromisoformat(enrollment["expires_at"]) < now:
-            raise ValueError("Enrollment code has expired")
-
+        proposed_token = str(payload.get("agent_token") or "").strip()
+        if proposed_token and (
+            not proposed_token.startswith("agent_") or not 32 <= len(proposed_token) <= 128
+        ):
+            raise ValueError("Agent credential is invalid")
         agent_id = str(uuid.uuid4())
-        token = new_token("agent")
+        token = proposed_token or new_token("agent")
         name = (payload.get("name") or payload.get("hostname") or "Unnamed device").strip()[:100]
         hostname = (payload.get("hostname") or name).strip()[:255]
         with self.db.transaction() as connection:
+            enrollment = connection.execute(
+                "SELECT * FROM enrollments WHERE code_hash = ?", (hash_token(code.upper()),)
+            ).fetchone()
+            if not enrollment:
+                raise ValueError("Enrollment code is invalid or already used")
+            if enrollment["used_at"]:
+                existing = (
+                    connection.execute(
+                        "SELECT * FROM agents WHERE id = ?", (enrollment["agent_id"],)
+                    ).fetchone()
+                    if enrollment["agent_id"]
+                    else None
+                )
+                if (
+                    proposed_token
+                    and existing
+                    and existing["enabled"]
+                    and verify_token(proposed_token, str(existing["token_hash"]))
+                ):
+                    return {
+                        "agent_id": str(existing["id"]),
+                        "agent_token": proposed_token,
+                        "name": str(existing["name"]),
+                    }
+                raise ValueError("Enrollment code is invalid or already used")
+            if datetime.fromisoformat(enrollment["expires_at"]) < now:
+                raise ValueError("Enrollment code has expired")
             connection.execute(
                 """
                 INSERT INTO agents(id, name, hostname, os_name, os_version, agent_version,
@@ -405,6 +429,50 @@ class ObsyncService:
             )
         self.db.add_event("agent.registered", f"Device {name} joined Obsync", agent_id=agent_id)
         return {"agent_id": agent_id, "agent_token": token, "name": name}
+
+    def disconnect_agent(self, agent_id: str) -> dict[str, Any]:
+        agent = self.db.query_one("SELECT * FROM agents WHERE id = ?", (agent_id,))
+        if not agent:
+            raise ValueError("Computer not found")
+        if (
+            self.db.get_setting("vault_mode", "local") == "agent"
+            and self.db.get_setting("vault_agent_id", "") == agent_id
+        ):
+            raise ValueError(
+                "This computer is the active vault writer. Choose another vault in Settings "
+                "before disconnecting it."
+            )
+        root_count = int(
+            (
+                self.db.query_one(
+                    "SELECT count(*) AS count FROM roots WHERE agent_id = ?", (agent_id,)
+                )
+                or {}
+            ).get("count", 0)
+        )
+        document_count = int(
+            (
+                self.db.query_one(
+                    "SELECT count(*) AS count FROM documents WHERE agent_id = ?", (agent_id,)
+                )
+                or {}
+            ).get("count", 0)
+        )
+        with self.db.transaction() as connection:
+            connection.execute("DELETE FROM enrollments WHERE agent_id = ?", (agent_id,))
+            connection.execute("DELETE FROM events WHERE agent_id = ?", (agent_id,))
+            connection.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
+        self.db.add_event(
+            "agent.disconnected",
+            f"Computer {agent['name']} was disconnected; source files and Obsidian notes were kept",
+        )
+        return {
+            "ok": True,
+            "agent_id": agent_id,
+            "name": agent["name"],
+            "removed_roots": root_count,
+            "removed_documents": document_count,
+        }
 
     def authenticate_agent(self, token: str) -> dict[str, Any] | None:
         if not token:

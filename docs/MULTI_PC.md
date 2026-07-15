@@ -28,12 +28,14 @@ Do not expose plain HTTP or an unauthenticated local-LLM endpoint to the public 
 For each PC:
 
 1. Create an expiring enrollment code in the central UI.
-2. On Windows, download the Companion, enter the server/code/name, and click **Connect and install**. On other systems, pair the agent once from the CLI.
+2. On Windows, download the Companion from Obsync, copy all setup details, paste them into the Companion, and click **Connect and install**. On other systems, pair the agent once from the CLI.
 3. Choose **Add folder** on that computer's card and select a local directory.
 4. Review the inventory comparison, then choose **Sync changes**.
 5. The Windows Companion starts automatically at sign-in; configure the CLI agent to start at login/boot on other systems.
 
 The central UI shows the device, its roots, last heartbeat, file counts, and comparison states. **Scan** compares without writing; **Sync changes** processes the pending red/orange items. Commands are received by the desktop agent within approximately 30 seconds.
+
+Use **Disconnect** to retire a stale computer. Its credential, server-side watched-folder ledger, and pending commands are removed. Original files and existing Obsidian notes remain untouched. If it is the active desktop vault writer, choose another vault first.
 
 ## Network folders
 

@@ -10,6 +10,7 @@ from obsync.companion import (
     TASK_NAME,
     install_companion,
     install_startup_task,
+    parse_pairing_details,
     scheduled_task_command,
     start_background_companion,
 )
@@ -36,13 +37,15 @@ def test_startup_task_is_per_user_and_non_elevated(monkeypatch, tmp_path: Path) 
     executable = tmp_path / "Obsync Companion.exe"
     config = tmp_path / "agent.yml"
     install_startup_task(executable, config, run=fake_run)
-    args, kwargs = calls[0]
+    assert calls[0][0][:2] == ["schtasks.exe", "/End"]
+    args, kwargs = calls[1]
     assert args[:2] == ["schtasks.exe", "/Create"]
     assert args[args.index("/TN") + 1] == TASK_NAME
     assert args[args.index("/SC") + 1] == "ONLOGON"
     assert args[args.index("/RL") + 1] == "LIMITED"
     assert "--background" in args[args.index("/TR") + 1]
     assert kwargs["check"] is False
+    assert calls[2][0][:2] == ["schtasks.exe", "/Query"]
 
 
 def test_startup_task_reports_windows_error(monkeypatch, tmp_path: Path) -> None:
@@ -55,7 +58,8 @@ def test_startup_task_reports_windows_error(monkeypatch, tmp_path: Path) -> None
         install_startup_task(tmp_path / "agent.exe", tmp_path / "agent.yml", run=fake_run)
 
 
-def test_background_launch_is_hidden_and_detached(tmp_path: Path) -> None:
+def test_background_launch_is_hidden_and_detached(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("obsync.companion.is_windows", lambda: False)
     calls: list[tuple[list[str], dict]] = []
 
     def fake_popen(args, **kwargs):
@@ -70,6 +74,31 @@ def test_background_launch_is_hidden_and_detached(tmp_path: Path) -> None:
     assert kwargs["stdin"] == subprocess.DEVNULL
     assert kwargs["stdout"] == subprocess.DEVNULL
     assert kwargs["stderr"] == subprocess.DEVNULL
+
+
+def test_windows_background_starts_through_scheduled_task(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("obsync.companion.is_windows", lambda: True)
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0, "SUCCESS", "")
+
+    start_background_companion(tmp_path / "agent.exe", tmp_path / "agent.yml", run=fake_run)
+    assert calls[0][0] == ["schtasks.exe", "/Run", "/TN", TASK_NAME]
+
+
+def test_pairing_details_round_trip() -> None:
+    details = parse_pairing_details(
+        '{"server":"http://server:7769/","code":"abcd-efgh-jkmn","name":"Office PC"}'
+    )
+    assert details == {
+        "server": "http://server:7769",
+        "code": "ABCD-EFGH-JKMN",
+        "name": "Office PC",
+    }
+    with pytest.raises(ValueError, match="Copy the setup details"):
+        parse_pairing_details("not json")
 
 
 @pytest.mark.asyncio
@@ -124,3 +153,51 @@ async def test_companion_pairs_copies_installs_and_starts(monkeypatch, tmp_path:
         ("start", destination, config_path),
     ]
     assert result.executable == destination
+
+
+@pytest.mark.asyncio
+async def test_companion_reuses_valid_pairing_and_repairs_startup(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("obsync.companion.is_windows", lambda: True)
+    source = tmp_path / "download" / "companion.exe"
+    source.parent.mkdir()
+    source.write_bytes(b"companion")
+    destination = tmp_path / "installed" / "Obsync Companion.exe"
+    config_path = tmp_path / "config" / "agent.yml"
+    AgentConfig(
+        server_url="http://server:7769",
+        agent_id="existing-agent",
+        agent_token="agent_existing_token_value_long_enough",
+        name="Old name",
+    ).save(config_path)
+    lifecycle = []
+
+    async def valid(_config):
+        return True
+
+    async def should_not_pair(**_kwargs):
+        raise AssertionError("A valid saved pairing must not consume the one-time code again")
+
+    monkeypatch.setattr("obsync.companion.existing_pairing_is_valid", valid)
+    monkeypatch.setattr("obsync.companion.pair_agent", should_not_pair)
+    monkeypatch.setattr("obsync.companion.installed_companion_path", lambda: destination)
+    monkeypatch.setattr(
+        "obsync.companion.install_startup_task",
+        lambda executable, config: lifecycle.append(("task", executable, config)),
+    )
+    monkeypatch.setattr(
+        "obsync.companion.start_background_companion",
+        lambda executable, config: lifecycle.append(("start", executable, config)),
+    )
+
+    result = await install_companion(
+        server_url="http://server:7769",
+        enrollment_code="ALREADY-USED-CODE",
+        computer_name="Main PC",
+        config_path=config_path,
+        source_executable=source,
+    )
+    assert result.computer_name == "Main PC"
+    assert AgentConfig.load(config_path).agent_id == "existing-agent"
+    assert [item[0] for item in lifecycle] == ["task", "start"]

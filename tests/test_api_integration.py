@@ -80,7 +80,10 @@ def test_ui_includes_guided_help_and_windows_companion(client: TestClient) -> No
     assert 'popover="manual"' in index
     assert "renderHelp" in app_js
     assert "Download Windows Companion" in app_js
-    assert "obsync-companion-windows-x64.exe" in app_js
+    assert "/api/v1/downloads/windows-companion" in app_js
+    download = client.get("/api/v1/downloads/windows-companion", follow_redirects=False)
+    assert download.status_code == 307
+    assert "obsync-companion-windows-x64.exe" in download.headers["location"]
     assert "Keep that PowerShell window open" not in app_js
     assert ".help-tip" in styles
     assert "backdrop-filter: blur(3px)" not in styles
@@ -106,6 +109,71 @@ def test_enrollment_is_single_use(client: TestClient, admin_headers: dict[str, s
     second = client.post("/api/v1/agents/register", json=payload)
     assert second.status_code == 400
     assert "already used" in second.json()["detail"]
+
+
+def test_enrollment_retry_with_same_client_credential_is_idempotent(
+    client: TestClient, admin_headers: dict[str, str]
+) -> None:
+    enrollment = client.post(
+        "/api/v1/admin/enrollments", headers=admin_headers, json={"label": "Retry PC"}
+    ).json()
+    credential = "agent_" + "r" * 48
+    payload = {
+        "code": enrollment["code"],
+        "name": "Retry PC",
+        "hostname": "retry-pc",
+        "os_name": "Windows",
+        "agent_token": credential,
+    }
+    first = client.post("/api/v1/agents/register", json=payload)
+    second = client.post("/api/v1/agents/register", json=payload)
+    assert first.status_code == second.status_code == 200
+    assert second.json() == first.json()
+    payload["agent_token"] = "agent_" + "x" * 48
+    rejected = client.post("/api/v1/agents/register", json=payload)
+    assert rejected.status_code == 400
+
+
+def test_admin_disconnects_computer_and_revokes_device(
+    client: TestClient,
+    admin_headers: dict[str, str],
+    enrolled_agent: dict[str, str],
+    agent_headers: dict[str, str],
+    registered_root: dict,
+) -> None:
+    response = client.delete(
+        f"/api/v1/admin/agents/{enrolled_agent['agent_id']}", headers=admin_headers
+    )
+    assert response.status_code == 200
+    assert response.json()["removed_roots"] == 1
+    assert response.json()["removed_documents"] == 0
+    assert client.get("/api/v1/admin/agents", headers=admin_headers).json()["items"] == []
+    assert client.post("/api/v1/agent/heartbeat", headers=agent_headers, json={}).status_code == 401
+    assert client.get("/api/v1/admin/roots", headers=admin_headers).json()["items"] == []
+
+
+def test_active_vault_writer_must_be_changed_before_disconnect(
+    client: TestClient,
+    admin_headers: dict[str, str],
+    enrolled_agent: dict[str, str],
+) -> None:
+    heartbeat = client.post(
+        "/api/v1/agent/heartbeat",
+        headers={"Authorization": f"Bearer {enrolled_agent['agent_token']}"},
+        json={"vault_path": "C:\\Vault", "vault_ready": True},
+    )
+    assert heartbeat.status_code == 200
+    settings = client.put(
+        "/api/v1/admin/settings",
+        headers=admin_headers,
+        json={"vault_mode": "agent", "vault_agent_id": enrolled_agent["agent_id"]},
+    )
+    assert settings.status_code == 200
+    response = client.delete(
+        f"/api/v1/admin/agents/{enrolled_agent['agent_id']}", headers=admin_headers
+    )
+    assert response.status_code == 409
+    assert "active vault writer" in response.json()["detail"]
 
 
 @pytest.mark.asyncio

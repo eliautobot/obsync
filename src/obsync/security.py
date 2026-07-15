@@ -103,7 +103,10 @@ def slugify(value: str, fallback: str = "untitled", max_length: int = 80) -> str
 def safe_relative_path(value: str) -> Path:
     if re.match(r"^[A-Za-z]:[\\/]", value):
         raise ValueError("Path must be relative and cannot contain a drive prefix")
-    candidate = Path(value.replace("\\", "/"))
+    normalized = value.replace("\\", "/")
+    if normalized.startswith("/"):
+        raise ValueError("Path must be relative and cannot start at a filesystem root")
+    candidate = Path(normalized)
     if candidate.is_absolute() or ".." in candidate.parts:
         raise ValueError("Path must be relative and cannot contain '..'")
     return Path(*(part for part in candidate.parts if part not in {"", "."}))

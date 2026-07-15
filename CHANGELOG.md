@@ -2,6 +2,29 @@
 
 All notable changes to Obsync will be documented here.
 
+## 0.7.0 - 2026-07-14
+
+### Added
+
+- Added a safe **Disconnect** action for paired computers that revokes access and removes stale device, folder, document, and command records without touching source files or Obsidian notes
+- Added one-click copying and pasting of all Windows pairing details
+- Bundled the matching Windows Companion inside published Docker images so the app serves its own desktop download
+- Added idempotent device registration and concurrent pairing stress coverage
+
+### Fixed
+
+- Prevented two Companion setup windows from consuming the same one-time pairing code
+- Reused valid saved pairings when reopening the Companion or repairing automatic startup
+- Replaced raw `400 Bad Request` setup errors with concise, actionable messages
+- Verified the Windows automatic-start task after installation and start the background agent through the tracked task
+- Stopped disconnected agents cleanly after the server revokes their credentials
+- Rejected absolute source paths consistently on Windows and Unix systems
+
+### Changed
+
+- Clarified why Docker installations need a one-time native desktop bridge for Windows folders
+- Added explicit PowerShell update commands and corrected Windows health-check guidance
+
 ## 0.6.0 - 2026-07-14
 
 ### Added

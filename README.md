@@ -24,6 +24,7 @@ The source stays untouched. Obsync is not a copy-for-copy file mirror; it is a l
 - Sends uncertain classifications to a review queue
 - Coordinates Windows, Linux, macOS, NAS, and network-share sources from one minimal web UI
 - Includes a guided Windows Companion that runs silently and starts automatically at sign-in
+- Safely disconnects old computers without deleting source files or Obsidian notes
 - Explains controls with contextual `?` tips and a complete in-app Help center
 - Runs the central server in Docker; the watcher agent can run natively or in Docker
 - Never moves, edits, or deletes a source file
@@ -105,6 +106,22 @@ curl --fail http://127.0.0.1:7769/api/v1/health
 
 `git status --short` should return no output before you pull. Keep your existing `.env` file; do not replace it with `.env.example` during an update.
 
+On Windows, use PowerShell and first enter the folder that actually contains both `.git` and `docker-compose.yml`:
+
+```powershell
+Set-Location "C:\Users\you\Documents\Obsync\obsync"
+Test-Path .\.git
+Test-Path .\docker-compose.yml
+git status --short
+git pull --ff-only
+docker compose build --pull
+docker compose up -d
+docker compose ps
+Invoke-RestMethod -Uri "http://127.0.0.1:7769/api/v1/health"
+```
+
+Both `Test-Path` commands must return `True`. If they do not, locate the Compose folder with `Get-ChildItem "$HOME\Documents" -Filter docker-compose.yml -Recurse` and change into the returned folder. PowerShell uses complete one-line commands; do not append Linux `\` line continuations.
+
 If your Compose file uses the published `ghcr.io/eliautobot/obsync` image instead of building from the repository, run:
 
 ```bash
@@ -118,12 +135,12 @@ Update Python-based desktop agents to the same release as the server, then verif
 
 ```bash
 python -m pip install --upgrade \
-  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.6.0"
+  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.7.0"
 obsync --version
 obsync agent scan
 ```
 
-Replace `v0.6.0` with the release you are installing. For Windows desktops, download the matching `obsync-companion-windows-x64.exe` from [GitHub Releases](https://github.com/eliautobot/obsync/releases), open it, and choose **Connect and install**. The Companion updates its per-user automatic-start entry and runs without a visible terminal. The command-line Windows and Linux agents remain available for advanced installations.
+Replace `v0.7.0` with the release you are installing. For Windows desktops, use **Sources → Add another computer → Download Windows Companion**, open it, and choose **Connect and install**. The Companion updates its per-user automatic-start entry and runs without a visible terminal. The command-line Windows and Linux agents remain available for advanced installations.
 
 Before any update, back up the Obsidian vault and Obsync `/data` volume. The full [Updating and rollback guide](docs/UPDATING.md) includes copy-and-paste backup commands for Linux and Windows, fixed-version installs, every agent type, verification, and safe rollback instructions.
 
@@ -131,7 +148,9 @@ Before any update, back up the Obsidian vault and Obsync `/data` volume. The ful
 
 The Obsync server appears automatically in **Sources** and is included in the Overview computer count. That card is the control plane; it is not a paired desktop. If Docker runs inside a VM or Docker Desktop, pair the physical Windows/macOS/Linux desktop whenever its folders or vault are outside the container—even if it is the same physical machine hosting Docker. Paired desktops are what appear in the folder and vault computer selectors.
 
-Choose **Sources → Add another computer**. Create a one-time pairing code, download the Windows Companion, and enter the server address, code, and computer name in its setup window. Click **Connect and install**. It installs for the current Windows user, runs silently, and starts automatically at sign-in—no Administrator access or persistent PowerShell window is required. Once the computer card appears, choose **Add folder**. The folder picker opens on that computer and Obsync immediately inventories the selected directory.
+Choose **Sources → Add another computer**. Create a one-time pairing code, download the Windows Companion, click **Copy all setup details**, then use **Paste setup details** in its setup window. Click **Connect and install**. It installs for the current Windows user, runs silently, and starts automatically at sign-in—no Administrator access or persistent PowerShell window is required. Once the computer card appears, choose **Add folder**. The folder picker opens on that computer and Obsync immediately inventories the selected directory.
+
+Use **Disconnect** on a computer card to revoke an old desktop and remove its Obsync ledger. Source files and existing Obsidian notes are always kept. If the computer is the active vault writer, select another vault in Settings first.
 
 Each watched folder shows a file comparison before syncing:
 
@@ -204,7 +223,7 @@ If a destination collision is not already an Obsync-managed note, processing sto
 - [Supported files](docs/SUPPORTED_FILES.md)
 - [Security model](docs/SECURITY.md)
 - [Development and testing](docs/DEVELOPMENT.md)
-- [v0.6.0 release notes](docs/releases/v0.6.0.md)
+- [v0.7.0 release notes](docs/releases/v0.7.0.md)
 
 ## Development
 

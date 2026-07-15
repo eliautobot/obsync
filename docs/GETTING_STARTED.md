@@ -68,12 +68,14 @@ The server is listed automatically and counts as one connected computer, but its
 On Windows:
 
 1. Open **Sources → Add another computer** and create a pairing code.
-2. Download and open `obsync-companion-windows-x64.exe`.
-3. Enter the displayed server address, one-time code, and computer name.
+2. Download and open the Windows Companion served by Obsync.
+3. Click **Copy all setup details** in Obsync, then **Paste setup details** in the Companion.
 4. Optionally choose the Obsidian vault on that computer.
 5. Click **Connect and install**.
 
-The Companion installs under the current user's Local AppData directory, creates a limited per-user automatic-start task, launches silently, and starts whenever that user signs in. It requires no Administrator access and leaves no PowerShell window open.
+The Companion installs under the current user's Local AppData directory, creates and verifies a limited per-user automatic-start task, launches silently, and starts whenever that user signs in. It requires no Administrator access and leaves no PowerShell window open. Reopening it reuses a valid saved connection and repairs startup rather than creating another computer.
+
+The one-time Companion is required when the server runs in Docker because containers and web browsers cannot safely browse or continuously watch arbitrary Windows user folders. After installation, all normal folder, scan, sync, and disconnect controls live in the Obsync web app.
 
 Early community builds are not code-signed, so Windows SmartScreen may identify the Companion as an unrecognized app. Verify that the file came from the official Obsync GitHub release before choosing **More info → Run anyway**.
 
@@ -94,6 +96,8 @@ From **Sources**, open the connected computer and choose **Add folder**. A nativ
 - Red: new or missing
 
 Inspect the list with **View files**, use **Scan** to compare again, and use **Sync changes** when ready.
+
+To retire a computer, choose **Disconnect** on its Sources card. Obsync revokes it and removes its device/folder ledger, but never changes source files or deletes existing notes. Change the active vault writer in Settings before disconnecting that computer.
 
 The equivalent CLI workflow is:
 
@@ -124,7 +128,7 @@ Only one paired computer is selected as the vault writer at a time. Obsync valid
 
 ### Windows
 
-Use the guided `obsync-companion-windows-x64.exe` release. **Connect and install** creates the automatic-start task and launches the agent without a visible terminal. Reopen the Companion if the startup task needs to be repaired. It runs as the current Windows user so it can access that user's Documents folder and vault. User-mapped network drives may not be ready at sign-in; UNC paths are more reliable for shares.
+Use the guided Windows Companion downloaded from **Sources → Add another computer**. **Connect and install** creates, verifies, and starts the automatic-start task without a visible terminal. Reopen the Companion if startup needs to be repaired; a valid saved pairing is reused automatically. It runs as the current Windows user so it can access that user's Documents folder and vault. User-mapped network drives may not be ready at sign-in; UNC paths are more reliable for shares.
 
 ### Linux systemd user service
 

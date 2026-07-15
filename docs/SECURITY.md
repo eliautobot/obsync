@@ -13,7 +13,7 @@
 - Devices enroll with short-lived, single-use codes.
 - Each device receives a distinct long random token.
 - The database stores SHA-256 token digests, not raw device tokens.
-- Device tokens can access only agent endpoints; root ownership is checked server-side.
+- Device tokens can access only agent endpoints; root ownership is checked server-side. Disconnecting a computer revokes its token immediately.
 - The Windows Companion installs per-user in Local AppData and creates a limited current-user `ONLOGON` scheduled task. It does not require elevation or install a system service.
 
 ## Network exposure
@@ -34,6 +34,7 @@ Do not publish Ollama or LM Studio directly to the Internet. The Obsync server s
 - Existing files without Obsync ownership markers are not overwritten.
 - Atomic sibling writes reduce partial-file risk.
 - Missing sources do not delete generated notes.
+- Disconnecting a computer removes only the server-side device ledger. Source files and existing Obsidian notes are retained.
 - Desktop vault writers accept only server-authenticated commands, use atomic writes, and refuse non-Obsync collisions.
 
 Mount source directories read-only when running an agent in Docker.
