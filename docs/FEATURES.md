@@ -59,7 +59,9 @@ Generated notes are grouped by destination prefix, source device, watched folder
 - Dashboard counts and event stream
 - Device and watched-root status
 - Native **Add folder**, per-folder **Scan**, **View files**, and **Sync changes** controls
-- Global **Start syncing / Stop syncing** control with active sync and AI cancellation
+- Global **Start Global Sync / Stop Global Sync** control with active sync and AI cancellation
+- Independent **Start / Pause / Stop** controls for every watched folder
+- Live status updates without manual page refreshes
 - Per-folder **Remove** action that preserves originals and existing notes
 - Green/orange/red comparison indicators and aggregate folder counts
 - One-time device enrollment codes

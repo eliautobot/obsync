@@ -154,11 +154,49 @@ def test_agent_config_round_trip_and_duplicate_root(tmp_path: Path) -> None:
 
     vault = tmp_path / "vault"
     vault.mkdir()
+    (vault / ".obsidian").mkdir()
     assert loaded.set_vault(vault) == vault.resolve()
     loaded.save(config_path)
     assert AgentConfig.load(config_path).vault_path == str(vault.resolve())
+    with pytest.raises(ValueError, match="vault folder itself"):
+        loaded.set_vault(vault / ".obsidian")
     with pytest.raises(ValueError, match="does not exist"):
         loaded.set_vault(tmp_path / "missing-vault")
+
+
+@pytest.mark.asyncio
+async def test_agent_duplicate_hint_and_file_guards_cover_safe_edges(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    root = RootConfig(root_key="edge-root", name="Edge", path=str(source))
+    config = AgentConfig(
+        server_url="http://server",
+        agent_token="agent_test_token",
+        name="Edge PC",
+    )
+    runtime = AgentRuntime(config, state=AgentState(tmp_path / "edge-state.db"))
+    assert runtime._vault_duplicate_hint(root, "Rules.txt") == ("", "")
+
+    config.vault_path = str(tmp_path / "missing-vault")
+    assert runtime._vault_duplicate_hint(root, "Rules.txt") == ("", "")
+    assert await runtime._stable_stat(tmp_path / "missing.txt") is None
+
+    paused = RootConfig(
+        root_key="paused-root",
+        name="Paused",
+        path=str(source),
+        sync_state="paused",
+    )
+    with pytest.raises(SyncPausedError, match="paused"):
+        await runtime.sync_file(paused, source / "missing.txt")
+
+    config.vault_path = str(tmp_path / "vault")
+    vault = Path(config.vault_path)
+    vault.mkdir()
+    unrelated = vault / "unrelated.md"
+    unrelated.write_text("# Unrelated Note\n", encoding="utf-8")
+    assert runtime._vault_duplicate_hint(root, "Rules.txt") == ("", "")
+    assert await runtime.sync_file(root, tmp_path / "outside.txt") is None
 
 
 @pytest.mark.asyncio
@@ -172,6 +210,7 @@ async def test_remote_vault_picker_command_updates_agent_and_server(
 ) -> None:
     selected_vault = tmp_path / "selected-vault"
     selected_vault.mkdir()
+    (selected_vault / ".obsidian").mkdir()
     config_path = tmp_path / "agent.yml"
     config = AgentConfig(
         server_url="http://testserver",
@@ -200,6 +239,67 @@ async def test_remote_vault_picker_command_updates_agent_and_server(
     agent = client.get("/api/v1/admin/agents", headers=admin_headers).json()["items"][0]
     assert agent["vault_ready"] == 1
     assert agent["vault_path"] == str(selected_vault.resolve())
+
+
+@pytest.mark.asyncio
+async def test_new_watcher_event_checks_desktop_vault_before_writing(
+    app,
+    client,
+    admin_headers,
+    enrolled_agent,
+    agent_headers,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "Laws and Rules.txt").write_text("New rules source", encoding="utf-8")
+    vault = tmp_path / "desktop-vault"
+    (vault / ".obsidian").mkdir(parents=True)
+    existing = vault / "Reference" / "12_Laws_and_Rules.md"
+    existing.parent.mkdir()
+    existing.write_text("# Laws and Rules\n\nExisting curated note.\n", encoding="utf-8")
+    root = RootConfig(root_key="live-duplicate", name="Live", path=str(source))
+    config = AgentConfig(
+        server_url="http://testserver",
+        agent_id=enrolled_agent["agent_id"],
+        agent_token=enrolled_agent["agent_token"],
+        name="Test PC",
+        settle_seconds=0.01,
+        vault_path=str(vault),
+        roots=[root],
+    )
+    client.post(
+        "/api/v1/agent/heartbeat",
+        headers=agent_headers,
+        json={"vault_path": str(vault), "vault_ready": True},
+    )
+    client.put(
+        "/api/v1/admin/settings",
+        headers=admin_headers,
+        json={"vault_mode": "agent", "vault_agent_id": enrolled_agent["agent_id"]},
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+        headers={"Authorization": f"Bearer {enrolled_agent['agent_token']}"},
+    ) as async_client:
+        runtime = AgentRuntime(
+            config,
+            state=AgentState(tmp_path / "live-duplicate-state.db"),
+            client=async_client,
+        )
+        result = await runtime.scan_all()
+
+    assert result["Live"]["errors"] == 0
+    document = client.get(
+        "/api/v1/admin/documents?comparison_status=possible-duplicate",
+        headers=admin_headers,
+    ).json()["items"][0]
+    assert document["duplicate_path"] == "Reference/12_Laws_and_Rules.md"
+    assert document["status"] == "duplicate-review"
+    assert list(vault.rglob("*.md")) == [existing]
 
 
 @pytest.mark.asyncio
@@ -444,6 +544,9 @@ async def test_desktop_vault_audit_reports_matching_modified_and_missing_notes(
         ),
         encoding="utf-8",
     )
+    manual = desktop_vault / "Reference" / "12_Laws_and_Rules.md"
+    manual.parent.mkdir()
+    manual.write_text("# Laws and Rules\n\nExisting curated note.\n", encoding="utf-8")
     client.post(
         "/api/v1/agent/heartbeat",
         headers=agent_headers,
@@ -474,6 +577,12 @@ async def test_desktop_vault_audit_reports_matching_modified_and_missing_notes(
                     "source_size": 3,
                     "sha256": hashlib.sha256(b"new").hexdigest(),
                 },
+                {
+                    "source_path": "Laws and Rules.txt",
+                    "source_mtime_ns": 1,
+                    "source_size": 5,
+                    "sha256": hashlib.sha256(b"rules").hexdigest(),
+                },
             ],
         },
     )
@@ -497,6 +606,12 @@ async def test_desktop_vault_audit_reports_matching_modified_and_missing_notes(
 
     docs = client.get("/api/v1/admin/documents", headers=admin_headers).json()["items"]
     states = {item["source_path"]: item["comparison_status"] for item in docs}
-    assert states == {"matching.txt": "in-sync", "new.txt": "new"}
+    assert states == {
+        "Laws and Rules.txt": "possible-duplicate",
+        "matching.txt": "in-sync",
+        "new.txt": "new",
+    }
     matching = next(item for item in docs if item["source_path"] == "matching.txt")
     assert matching["destination_path"] == "Imported/matching.md"
+    duplicate = next(item for item in docs if item["source_path"] == "Laws and Rules.txt")
+    assert duplicate["duplicate_path"] == "Reference/12_Laws_and_Rules.md"

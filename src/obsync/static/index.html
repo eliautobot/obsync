@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="light dark">
     <meta name="theme-color" content="#6d5dfc">
     <title>Obsync</title>
-    <link rel="stylesheet" href="/assets/styles.css?v=0.8.0">
+    <link rel="stylesheet" href="/assets/styles.css?v=0.9.0">
   </head>
   <body>
     <div class="app-shell" id="app" hidden>
@@ -21,6 +21,8 @@
         <nav class="nav" aria-label="Main navigation">
           <button class="nav-item active" data-view="overview"><span>⌂</span>Overview</button>
           <button class="nav-item" data-view="sources"><span>◎</span>Sources</button>
+          <button class="nav-item nav-subitem" data-view="vault"><span>◇</span>Obsidian Vault <b id="vault-badge" hidden>!</b></button>
+          <button class="nav-item nav-subitem" data-view="local-ai"><span>✦</span>Local AI</button>
           <button class="nav-item" data-view="documents"><span>▤</span>Documents</button>
           <button class="nav-item" data-view="review"><span>◇</span>Review <b id="review-badge" hidden>0</b></button>
           <button class="nav-item" data-view="settings"><span>⚙</span>Settings</button>
@@ -28,7 +30,7 @@
         </nav>
         <div class="sidebar-foot">
           <div class="server-dot"><i></i><span>Server connected</span></div>
-          <span id="version-label">v0.8.0</span>
+          <span id="version-label">v0.9.0</span>
         </div>
       </aside>
 
@@ -40,7 +42,8 @@
             <p id="page-subtitle">Your knowledge pipeline at a glance.</p>
           </div>
           <div class="topbar-actions">
-            <button class="pipeline-toggle running" id="pipeline-toggle" type="button" title="Stop syncing and cancel active AI work"><i></i><span>Stop syncing</span></button>
+            <span class="live-indicator" title="This page updates automatically"><i></i>Live</span>
+            <button class="pipeline-toggle running" id="pipeline-toggle" type="button" title="Stop all folder syncing and cancel active AI work"><i></i><span>Stop Global Sync</span></button>
             <button class="icon-button" id="refresh-button" aria-label="Refresh">↻</button>
             <button class="icon-button" id="theme-button" aria-label="Toggle theme">◐</button>
             <button class="icon-button" id="help-button" aria-label="Open Help">?</button>
@@ -109,6 +112,6 @@
       <div id="modal-body"></div>
     </dialog>
     <div class="toast" id="toast" role="status" popover="manual" hidden></div>
-    <script src="/assets/app.js?v=0.8.0" defer></script>
+    <script src="/assets/app.js?v=0.9.0" defer></script>
   </body>
 </html>

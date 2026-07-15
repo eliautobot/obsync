@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS roots (
     include_patterns TEXT NOT NULL DEFAULT '[]',
     exclude_patterns TEXT NOT NULL DEFAULT '[]',
     enabled INTEGER NOT NULL DEFAULT 1,
+    sync_state TEXT NOT NULL DEFAULT 'running',
     file_count INTEGER NOT NULL DEFAULT 0,
     last_scan_at TEXT,
     created_at TEXT NOT NULL,
@@ -126,6 +127,9 @@ CREATE TABLE IF NOT EXISTS documents (
     analysis_json TEXT NOT NULL DEFAULT '{}',
     status TEXT NOT NULL DEFAULT 'queued',
     comparison_status TEXT NOT NULL DEFAULT 'new',
+    duplicate_path TEXT NOT NULL DEFAULT '',
+    duplicate_title TEXT NOT NULL DEFAULT '',
+    duplicate_dismissed INTEGER NOT NULL DEFAULT 0,
     llm_status TEXT NOT NULL DEFAULT 'pending',
     confidence REAL NOT NULL DEFAULT 0,
     needs_review INTEGER NOT NULL DEFAULT 0,
@@ -207,6 +211,9 @@ class Database:
                 "inventory_scan_id": "TEXT NOT NULL DEFAULT ''",
                 "inventory_seen_at": "TEXT",
                 "comparison_status": "TEXT NOT NULL DEFAULT 'new'",
+                "duplicate_path": "TEXT NOT NULL DEFAULT ''",
+                "duplicate_title": "TEXT NOT NULL DEFAULT ''",
+                "duplicate_dismissed": "INTEGER NOT NULL DEFAULT 0",
             }.items():
                 if name not in document_columns:
                     connection.execute(f"ALTER TABLE documents ADD COLUMN {name} {declaration}")
@@ -218,6 +225,13 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_documents_inventory "
                 "ON documents(root_id, inventory_scan_id)"
             )
+            root_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(roots)").fetchall()
+            }
+            if "sync_state" not in root_columns:
+                connection.execute(
+                    "ALTER TABLE roots ADD COLUMN sync_state TEXT NOT NULL DEFAULT 'running'"
+                )
             connection.execute(
                 """
                 UPDATE documents
@@ -238,9 +252,9 @@ class Database:
                 connection.execute("ALTER TABLE enrollments ADD COLUMN agent_id TEXT")
             row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
-                connection.execute("INSERT INTO schema_meta(version) VALUES (4)")
-            elif int(row["version"]) < 4:
-                connection.execute("UPDATE schema_meta SET version = 4")
+                connection.execute("INSERT INTO schema_meta(version) VALUES (5)")
+            elif int(row["version"]) < 5:
+                connection.execute("UPDATE schema_meta SET version = 5")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

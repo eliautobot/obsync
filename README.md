@@ -14,10 +14,13 @@ The source stays untouched. Obsync is not a copy-for-copy file mirror; it is a l
 - Watches multiple folders on multiple computers
 - Detects additions, updates, renames, and missing source files
 - Scans first and compares every source with the actual managed note in Obsidian
+- Requires an explicit Obsidian vault choice before Global Sync can start
 - Shows green **In Obsidian**, orange **Modified**, and red **New/Missing** states before syncing
 - Adopts matching existing Obsync notes so database rebuilds do not create duplicates
+- Holds likely title matches for review before creating a second note
 - Extracts text from Markdown, text, PDF, Word, Excel, PowerPoint, HTML, email, CSV, JSON, source code, and images with optional OCR
 - Organizes documents with Ollama, LM Studio, or another OpenAI-compatible local model
+- Supports custom Local AI organization instructions while retaining a protected safety prompt
 - Falls back to deterministic rules whenever the LLM is unavailable
 - Generates Obsidian properties, summaries, tags, categories, and `[[wikilinks]]`
 - Preserves everything written below the generated note's **My notes** heading
@@ -25,6 +28,8 @@ The source stays untouched. Obsync is not a copy-for-copy file mirror; it is a l
 - Coordinates Windows, Linux, macOS, NAS, and network-share sources from one minimal web UI
 - Includes Obsync Desktop for Windows with built-in folder watching, start/stop controls, silent background operation, and automatic startup
 - Stops active sync and AI classification from one global control without changing source files or existing notes
+- Starts, pauses, or stops each watched folder independently
+- Updates computer, folder, document, and review status live without a page refresh
 - Removes individual watched folders from a computer without deleting the real folder or existing Obsidian notes
 - Safely disconnects old computers without deleting source files or Obsidian notes
 - Explains controls with contextual `?` tips and a complete in-app Help center
@@ -57,7 +62,7 @@ Read [Architecture](docs/ARCHITECTURE.md) and [Multi-PC setup](docs/MULTI_PC.md)
 
 1. Clone the repository and enter it.
 2. Copy `.env.example` to `.env`.
-3. Start with the included vault mount, or point `OBSYNC_VAULT_HOST_PATH` at a host-accessible vault. A vault on another desktop can be selected later from **Settings**.
+3. Start with the included vault mount, or point `OBSYNC_VAULT_HOST_PATH` at a host-accessible vault. Confirm the exact destination later in **Obsidian Vault**.
 4. Start the server.
 
 ```bash
@@ -137,12 +142,12 @@ Update Python-based desktop agents to the same release as the server, then verif
 
 ```bash
 python -m pip install --upgrade \
-  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.8.0"
+  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.9.0"
 obsync --version
 obsync agent scan
 ```
 
-Replace `v0.8.0` with the release you are installing. For Windows, use **Sources → Add another computer → Download Obsync Desktop**, open it, and choose **Connect and install**. Obsync Desktop includes the watcher and local controls, updates its per-user automatic-start entry, and runs without a visible terminal. Command-line Windows and Linux agents remain available for advanced installations.
+Replace `v0.9.0` with the release you are installing. For Windows, use **Sources → Add another computer → Download Obsync Desktop**, right-click it, choose **Run as administrator**, and then choose **Connect and install**. Elevation is required only for setup; the watcher runs with limited permissions and no visible terminal. Command-line Windows and Linux agents remain available for advanced installations.
 
 Before any update, back up the Obsidian vault and Obsync `/data` volume. The full [Updating and rollback guide](docs/UPDATING.md) includes copy-and-paste backup commands for Linux and Windows, fixed-version installs, every agent type, verification, and safe rollback instructions.
 
@@ -150,11 +155,11 @@ Before any update, back up the Obsidian vault and Obsync `/data` volume. The ful
 
 The Obsync server appears automatically in **Sources** and is included in the Overview computer count. That card is the control plane; it is not a paired desktop. If Docker runs inside a VM or Docker Desktop, pair the physical Windows/macOS/Linux desktop whenever its folders or vault are outside the container—even if it is the same physical machine hosting Docker. Paired desktops are what appear in the folder and vault computer selectors.
 
-Choose **Sources → Add another computer**. Create a one-time pairing code, download Obsync Desktop, click **Copy all setup details**, then use **Paste setup details** in the desktop app. Click **Connect and install**. It installs for the current Windows user, runs silently, and starts automatically at sign-in—no Administrator access or persistent PowerShell window is required. Its window also provides **Start this PC**, **Stop this PC**, and **Open Obsync**. Once the computer card appears, choose **Add folder**.
+Choose **Sources → Add another computer**. Create a one-time pairing code, download Obsync Desktop, right-click it and choose **Run as administrator**, click **Copy all setup details**, then use **Paste setup details** in the desktop app. Click **Connect and install**. It installs for the current Windows user, runs silently with limited permissions, and starts automatically at sign-in. Its window also provides **Start this PC**, **Stop this PC**, and **Open Obsync**. Once the computer card appears, confirm the exact destination under **Obsidian Vault**, choose **Start Global Sync**, then add folders.
 
-Use **Disconnect** on a computer card to revoke an old desktop and remove its Obsync ledger. Source files and existing Obsidian notes are always kept. If the computer is the active vault writer, select another vault in Settings first.
+Use **Disconnect** on a computer card to revoke an old desktop and remove its Obsync ledger. Source files and existing Obsidian notes are always kept. If the computer is the active vault writer, select another destination in **Obsidian Vault** first.
 
-Use the global **Stop syncing** control to cancel active sync and AI classification while keeping every connection intact. Connected desktops continue heartbeating but stop processing. **Start syncing** resumes watching and reconciles changes that occurred while stopped. Use **Remove** on one watched folder to remove only that folder from Obsync; its originals and existing notes are kept.
+Use **Stop Global Sync** to cancel all active sync and AI classification while keeping every connection intact. **Start Global Sync** resumes every running folder and immediately reconciles changes that occurred while stopped. Every folder also has independent **Start**, **Pause**, and **Stop** controls. Use **Remove** to forget only that folder; its originals and existing notes are kept.
 
 Each watched folder shows a file comparison before syncing:
 
@@ -164,6 +169,8 @@ Each watched folder shows a file comparison before syncing:
 - Red **Missing**: the expected managed note or original source is missing.
 
 Use **View files** to inspect the inventory, **Scan** to compare again without writing, and **Sync changes** to extract, classify, tag, and write only the new or changed items. Matching managed notes already in the vault are adopted instead of duplicated.
+
+Before a new note is written, the default duplicate policy compares its title with every Markdown note in the selected vault. Strong title matches are held as **Possible duplicate** for a person to inspect. This is intentionally conservative; it is not a claim that two differently titled documents contain identical information.
 
 The equivalent manual commands are:
 
@@ -193,13 +200,15 @@ Open **Help** from the sidebar or the top-right `?` button for a five-step quick
 
 ## Local LLM setup
 
-Open **Settings → Local AI organization**.
+Open the dedicated **Local AI** tab.
 
 - Ollama: base URL such as `http://host.docker.internal:11434`, model such as `qwen3:8b`
 - LM Studio: base URL such as `http://host.docker.internal:1234`, then select the model loaded in LM Studio
 - OpenAI-compatible: use any compatible local endpoint and optional API key
 
 Use **Check connection** before saving. The check lists available models instead of running inference, so it is fast and does not wait for a cold model to load. If the model stops, Obsync continues syncing using filenames, folders, extensions, and extracted text; those notes enter review when confidence is below the configured threshold.
+
+The optional custom instructions refine titles, summaries, categories, and tags. Obsync always keeps its protected JSON and prompt-injection rules. The model has no Obsidian API access: the Obsync server or Desktop app indexes the chosen vault, and the model receives source text plus an optional allowlist of candidate note titles.
 
 ## Generated-note safety
 
@@ -227,6 +236,7 @@ If a destination collision is not already an Obsync-managed note, processing sto
 - [Supported files](docs/SUPPORTED_FILES.md)
 - [Security model](docs/SECURITY.md)
 - [Development and testing](docs/DEVELOPMENT.md)
+- [v0.9.0 release notes](docs/releases/v0.9.0.md)
 - [v0.8.0 release notes](docs/releases/v0.8.0.md)
 - [v0.7.0 release notes](docs/releases/v0.7.0.md)
 

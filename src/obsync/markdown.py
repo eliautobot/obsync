@@ -221,3 +221,44 @@ def set_source_status(content: str, status: str) -> str:
 
 def note_title_from_path(path: Path) -> str:
     return re.sub(r"[-_]", " ", path.stem).strip()
+
+
+def note_title(content: str, path: Path) -> str:
+    """Read a human title without requiring a note to be managed by Obsync."""
+    if content.startswith("---\n"):
+        try:
+            frontmatter, _body = content[4:].split("\n---", 1)
+            values = yaml.safe_load(frontmatter) or {}
+            if isinstance(values, dict) and str(values.get("title", "")).strip():
+                return str(values["title"]).strip()[:200]
+        except (ValueError, yaml.YAMLError):
+            pass
+    heading = re.search(r"(?m)^#\s+(.+?)\s*$", content[:20_000])
+    if heading:
+        return heading.group(1).strip()[:200]
+    return note_title_from_path(path)[:200]
+
+
+def normalized_note_title(value: str) -> str:
+    """Normalize filenames/headings for conservative existing-note duplicate checks."""
+    words = re.findall(r"[a-z0-9]+", value.casefold().replace("&", " and "))
+    while words and words[0].isdigit():
+        words.pop(0)
+    return " ".join(words)
+
+
+def likely_same_note_title(first: str, second: str) -> bool:
+    """Return true only for strong title matches to avoid false duplicate warnings."""
+    left = normalized_note_title(first)
+    right = normalized_note_title(second)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    ignored = {"a", "an", "and", "for", "of", "the", "to"}
+    left_words = {word for word in left.split() if word not in ignored}
+    right_words = {word for word in right.split() if word not in ignored}
+    if len(left_words) < 2 or len(right_words) < 2:
+        return False
+    overlap = len(left_words & right_words)
+    return overlap / max(len(left_words), len(right_words)) >= 0.9

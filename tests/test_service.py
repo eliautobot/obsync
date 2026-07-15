@@ -6,8 +6,10 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from obsync.config import Settings
+from obsync.db import Database
 from obsync.security import hash_token
-from obsync.service import PipelinePausedError
+from obsync.service import ObsyncService, PipelinePausedError
 
 
 def test_expired_enrollment_is_rejected(app) -> None:
@@ -162,3 +164,73 @@ def test_stopping_pipeline_cancels_pending_desktop_note_write(app) -> None:
     assert command is not None
     assert command["status"] == "cancelled"
     assert command["result"] == "Stopped by user"
+
+
+def test_first_run_requires_explicit_vault_choice_before_global_sync(tmp_path) -> None:
+    service = ObsyncService(
+        Settings(
+            data_dir=tmp_path / "data",
+            vault_path=tmp_path / "vault",
+            admin_token="",
+        )
+    )
+    assert service.pipeline_status()["enabled"] is False
+    assert service.settings_for_ui()["vault_confirmed"] == "false"
+    with pytest.raises(ValueError, match="Choose and save an Obsidian Vault"):
+        service.resume_pipeline()
+
+    saved = service.update_settings({"vault_mode": "local"})
+    assert saved["vault_confirmed"] == "true"
+    started = service.resume_pipeline()
+    assert started["enabled"] is True
+    assert started["reconciliations"] == 0
+
+
+def test_upgrade_stops_existing_pipeline_until_vault_is_reconfirmed(tmp_path) -> None:
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        vault_path=tmp_path / "vault",
+        admin_token="",
+    )
+    settings.prepare()
+    database = Database(settings.database_path)
+    database.initialize()
+    database.set_settings({"sync_enabled": ("true", False)})
+
+    service = ObsyncService(settings, db=database)
+    assert service.pipeline_status()["enabled"] is False
+    assert service.settings_for_ui()["vault_confirmed"] == "false"
+
+
+def test_vault_and_ai_settings_validate_unsafe_or_invalid_choices(app) -> None:
+    service = app.state.service
+    with pytest.raises(ValueError, match="Vault mode"):
+        service.update_settings({"vault_mode": "unknown"})
+    with pytest.raises(ValueError, match="connected computer"):
+        service.update_settings({"vault_mode": "agent", "vault_agent_id": "missing"})
+    with pytest.raises(ValueError, match="Duplicate policy"):
+        service.update_settings({"duplicate_policy": "overwrite"})
+    with pytest.raises(ValueError, match="8,000"):
+        service.update_settings({"llm_instructions": "x" * 8001})
+
+    enrollment = service.create_enrollment("Bad vault PC")
+    registered = service.register_agent(enrollment["code"], {"name": "Bad vault PC"})
+    service.heartbeat(
+        registered["agent_id"],
+        vault_path=r"C:\Notes\.obsidian",
+        vault_ready=True,
+    )
+    with pytest.raises(ValueError, match="hidden .obsidian"):
+        service.update_settings({"vault_mode": "agent", "vault_agent_id": registered["agent_id"]})
+
+    saved = service.update_settings(
+        {
+            "llm_enabled": True,
+            "llm_vault_context": False,
+            "llm_api_key": "configured",
+            "llm_instructions": "Use concise titles.",
+        }
+    )
+    assert saved["llm_enabled"] == "true"
+    assert saved["llm_vault_context"] == "false"
+    assert saved["llm_instructions"] == "Use concise titles."

@@ -46,7 +46,7 @@ $env:OBSYNC_VAULT_HOST_PATH = "C:\Users\me\Documents\My Vault"
 docker compose up -d --build
 ```
 
-Docker cannot open a browser-based folder picker for arbitrary host folders after the container starts. The host path must be mounted when Docker starts. If the vault is in Windows Documents on a different PC, use **Settings → Obsidian vault → Vault on a desktop** instead; the paired desktop agent opens the native Windows folder picker and writes the managed Markdown locally.
+Docker cannot open a browser-based folder picker for arbitrary host folders after the container starts. The host path must be mounted when Docker starts. If the vault is in Windows Documents on a different PC, use **Obsidian Vault → Vault on a desktop** instead; the paired desktop agent opens the native Windows folder picker and writes the managed Markdown locally.
 
 Keep the vault on a local filesystem whenever possible. If it is itself on a synced/cloud folder, test carefully for filesystem locking behavior.
 
@@ -73,7 +73,7 @@ On Windows:
 4. Optionally choose the Obsidian vault on that computer.
 5. Click **Connect and install**.
 
-Obsync Desktop installs under the current user's Local AppData directory, bundles the folder watcher, creates and verifies a limited per-user automatic-start task, launches silently, and starts whenever that user signs in. It requires no Administrator access and leaves no PowerShell window open. Reopening it exposes **Start this PC**, **Stop this PC**, and **Open Obsync**, reuses a valid saved connection, and repairs startup rather than creating another computer.
+Right-click Obsync Desktop and choose **Run as administrator** for setup. It installs under the current user's Local AppData directory, bundles the folder watcher, creates and verifies a limited per-user automatic-start task, launches silently, and starts whenever that user signs in. Elevation is used only by setup; the background task runs with limited permissions and leaves no PowerShell window open. Reopening it exposes **Start this PC**, **Stop this PC**, and **Open Obsync**, reuses a valid saved connection, and repairs startup rather than creating another computer.
 
 The one-time Desktop installation is required when the server runs in Docker because containers and web browsers cannot safely browse or continuously watch arbitrary Windows user folders. It is the Windows half of Obsync, not a separate product or separately managed agent download.
 
@@ -97,7 +97,7 @@ From **Sources**, open the connected computer and choose **Add folder**. A nativ
 
 Inspect the list with **View files**, use **Scan** to compare again, and use **Sync changes** when ready.
 
-Use the top **Stop syncing** button whenever you need all synchronization and AI classification to end. Connected computers stay connected and continue reporting their status, but work is rejected or cancelled. Choose **Start syncing** to resume; periodic reconciliation detects anything that changed while stopped.
+Use **Stop Global Sync** whenever you need all synchronization and AI classification to end. Connected computers stay connected and continue reporting their status, but work is rejected or cancelled. Choose **Start Global Sync** to resume and immediately reconcile anything that changed while stopped. Use a folder's own **Start**, **Pause**, and **Stop** controls when only that source should change state.
 
 Use **Remove** on one folder to remove it from that computer's Obsync list. Obsync deletes only its local/server tracking records. The real folder, original files, and existing Obsidian notes remain untouched. Adding the folder later starts a fresh comparison.
 

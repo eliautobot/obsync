@@ -64,6 +64,10 @@ def test_first_run_setup_uses_hashed_credentials_and_secure_cookies(tmp_path: Pa
     csrf_token = client.cookies.get("obsync_csrf")
     assert session_token and csrf_token
 
+    status = client.get("/api/v1/auth/status").json()
+    assert status["authenticated"] is True
+    assert status["username"] == "owner"
+
     user = app.state.service.db.query_one("SELECT * FROM admin_users")
     session = app.state.service.db.query_one("SELECT * FROM admin_sessions")
     assert user["username"] == "owner"

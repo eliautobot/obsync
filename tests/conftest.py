@@ -22,7 +22,15 @@ def app_settings(tmp_path: Path) -> Settings:
 
 @pytest.fixture
 def app(app_settings: Settings):
-    return create_app(app_settings)
+    application = create_app(app_settings)
+    # Most integration tests exercise syncing rather than first-run vault onboarding.
+    application.state.service.db.set_settings(
+        {
+            "vault_confirmed": ("true", False),
+            "sync_enabled": ("true", False),
+        }
+    )
+    return application
 
 
 @pytest.fixture

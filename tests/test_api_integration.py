@@ -87,7 +87,12 @@ def test_ui_includes_guided_help_and_obsync_desktop(client: TestClient) -> None:
     legacy = client.get("/api/v1/downloads/windows-companion", follow_redirects=False)
     assert legacy.headers["location"] == "/api/v1/downloads/windows-desktop"
     assert 'id="pipeline-toggle"' in index
-    assert "Stop syncing" in index
+    assert "Stop Global Sync" in index
+    assert 'data-view="vault"' in index
+    assert 'data-view="local-ai"' in index
+    assert "Please choose which Obsidian Vault your files will be synced to" in app_js
+    assert "Run as administrator" in app_js
+    assert "setInterval(liveRefresh, 3000)" in app_js
     assert "Remove folder" in app_js
     assert "Keep that PowerShell window open" not in app_js
     assert ".help-tip" in styles
@@ -131,11 +136,12 @@ def test_pipeline_can_stop_cancel_pending_work_and_resume(
         b"This must not be processed while stopped.",
     )
     assert blocked.status_code == 409
-    assert "Syncing is stopped" in blocked.json()["detail"]
+    assert "Global syncing is stopped" in blocked.json()["detail"]
 
     started = client.post("/api/v1/admin/pipeline/start", headers=admin_headers)
     assert started.status_code == 200
     assert started.json()["enabled"] is True
+    assert started.json()["reconciliations"] == 1
     synced = sync_text(
         client,
         agent_headers,
@@ -145,6 +151,121 @@ def test_pipeline_can_stop_cancel_pending_work_and_resume(
     )
     assert synced.status_code == 200
     assert synced.json()["result"] == "synced"
+
+
+def test_each_folder_can_pause_stop_and_reconcile_independently(
+    client: TestClient,
+    admin_headers: dict[str, str],
+    agent_headers: dict[str, str],
+    registered_root: dict,
+) -> None:
+    queued = client.post(f"/api/v1/admin/roots/{registered_root['id']}/scan", headers=admin_headers)
+    assert queued.status_code == 200
+
+    paused = client.post(
+        f"/api/v1/admin/roots/{registered_root['id']}/state",
+        headers=admin_headers,
+        json={"sync_state": "paused"},
+    )
+    assert paused.status_code == 200
+    assert paused.json()["sync_state"] == "paused"
+    assert paused.json()["cancelled_commands"] == 1
+    blocked = sync_text(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "paused.txt",
+        b"This folder alone is paused.",
+    )
+    assert blocked.status_code == 409
+    assert "paused" in blocked.json()["detail"]
+
+    stopped = client.post(
+        f"/api/v1/admin/roots/{registered_root['id']}/state",
+        headers=admin_headers,
+        json={"sync_state": "stopped"},
+    )
+    assert stopped.status_code == 200
+    assert stopped.json()["sync_state"] == "stopped"
+
+    started = client.post(
+        f"/api/v1/admin/roots/{registered_root['id']}/state",
+        headers=admin_headers,
+        json={"sync_state": "running"},
+    )
+    assert started.status_code == 200
+    assert started.json()["sync_state"] == "running"
+    resumed = sync_text(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "resumed-folder.txt",
+        b"Only this folder resumed.",
+    )
+    assert resumed.status_code == 200
+    commands = client.get("/api/v1/agent/commands", headers=agent_headers).json()["items"]
+    state_commands = [item for item in commands if item["command"] == "set_root_state"]
+    assert [item["payload"]["sync_state"] for item in state_commands] == [
+        "paused",
+        "stopped",
+        "running",
+    ]
+
+
+def test_existing_vault_title_is_held_for_duplicate_review(
+    client: TestClient,
+    admin_headers: dict[str, str],
+    agent_headers: dict[str, str],
+    registered_root: dict,
+    app_settings,
+) -> None:
+    existing = app_settings.vault_path / "Reference" / "12_Laws_and_Rules.md"
+    existing.parent.mkdir(parents=True)
+    existing.write_text("# Laws and Rules\n\nExisting curated information.\n", encoding="utf-8")
+    content = b"New source material about laws and rules."
+
+    found = inventory(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "duplicate-scan",
+        {"Laws and Rules.txt": content},
+    )
+    assert found.status_code == 200
+    assert found.json()["counts"] == {"possible-duplicate": 1}
+    document = client.get(
+        "/api/v1/admin/documents?comparison_status=possible-duplicate",
+        headers=admin_headers,
+    ).json()["items"][0]
+    assert document["status"] == "duplicate-review"
+    assert document["duplicate_path"] == "Reference/12_Laws_and_Rules.md"
+
+    held = sync_text(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "Laws and Rules.txt",
+        content,
+    )
+    assert held.status_code == 200
+    assert held.json()["result"] == "possible-duplicate"
+    assert list(app_settings.vault_path.rglob("*.md")) == [existing]
+
+    allowed = client.post(
+        f"/api/v1/admin/documents/{document['id']}/allow-duplicate",
+        headers=admin_headers,
+    )
+    assert allowed.status_code == 200
+    created = sync_text(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "Laws and Rules.txt",
+        content,
+    )
+    assert created.status_code == 200
+    assert created.json()["result"] == "synced"
+    assert len(list(app_settings.vault_path.rglob("*.md"))) == 2
 
 
 def test_removing_folder_keeps_source_and_obsidian_note(

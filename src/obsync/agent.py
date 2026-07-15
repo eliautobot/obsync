@@ -24,8 +24,11 @@ from . import __version__
 from .desktop import choose_directory
 from .markdown import (
     is_managed_note,
+    likely_same_note_title,
     managed_note_metadata,
     merge_preserving_manual,
+    note_title,
+    note_title_from_path,
     set_source_status,
 )
 from .security import new_token, safe_vault_path
@@ -53,6 +56,11 @@ class RootConfig:
         ]
     )
     enabled: bool = True
+    sync_state: str = "running"
+
+    def __post_init__(self) -> None:
+        if self.sync_state not in {"running", "paused", "stopped"}:
+            self.sync_state = "running"
 
 
 @dataclass(slots=True)
@@ -117,6 +125,15 @@ class AgentConfig:
         resolved = path.expanduser().resolve()
         if not resolved.is_dir():
             raise ValueError(f"Vault folder does not exist: {resolved}")
+        if resolved.name.casefold() == ".obsidian":
+            raise ValueError(
+                "Choose the Obsidian vault folder itself, not its hidden .obsidian settings folder"
+            )
+        if not (resolved / ".obsidian").is_dir():
+            raise ValueError(
+                "That folder does not look like an Obsidian vault. Choose the folder that "
+                "contains .obsidian"
+            )
         if not os.access(resolved, os.W_OK):
             raise ValueError(f"Vault folder is not writable: {resolved}")
         self.vault_path = str(resolved)
@@ -279,6 +296,10 @@ class AgentRuntime:
                 continue
             self._root_ids[root.root_key] = payload["id"]
 
+    @staticmethod
+    def _root_is_running(root: RootConfig) -> bool:
+        return root.enabled and root.sync_state == "running"
+
     def _remove_local_root(self, root_key: str) -> RootConfig | None:
         task = self._watch_tasks.pop(root_key, None)
         if task:
@@ -328,10 +349,39 @@ class AgentRuntime:
             return None
         return second
 
+    def _vault_duplicate_hint(self, root: RootConfig, source_path: str) -> tuple[str, str]:
+        """Find a strong title match before a new watcher event can write remotely."""
+        if not self.config.vault_path:
+            return "", ""
+        vault = Path(self.config.vault_path).expanduser().resolve()
+        if not vault.is_dir():
+            return "", ""
+        source_title = note_title_from_path(Path(source_path))
+        for candidate in vault.rglob("*.md"):
+            if candidate.is_symlink() or not candidate.is_file() or ".obsidian" in candidate.parts:
+                continue
+            try:
+                content = candidate.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                continue
+            metadata = managed_note_metadata(content)
+            if metadata and (
+                metadata.get("obsync_machine", "").casefold() == self.config.name.casefold()
+                and metadata.get("obsync_root", "").casefold() == root.name.casefold()
+                and metadata.get("obsync_source", "") == source_path
+            ):
+                continue
+            title = note_title(content, candidate)
+            if likely_same_note_title(source_title, title):
+                return candidate.relative_to(vault).as_posix(), title
+        return "", ""
+
     async def sync_file(
         self, root: RootConfig, path: Path, *, force: bool = False
     ) -> dict[str, Any] | None:
         self._require_sync_enabled()
+        if not self._root_is_running(root):
+            raise SyncPausedError(f"Syncing is {root.sync_state} for {root.name}")
         root_path = Path(root.path).resolve()
         try:
             resolved = path.resolve()
@@ -360,6 +410,9 @@ class AgentRuntime:
             return {"result": "metadata-only", "source_path": relative}
         renamed = self.state.find_missing_by_hash(root.root_key, sha256)
         previous_path = renamed["relative_path"] if renamed else ""
+        duplicate_path = duplicate_title = ""
+        if not previous and not renamed:
+            duplicate_path, duplicate_title = self._vault_duplicate_hint(root, relative)
         root_id = self._root_ids[root.root_key]
         with resolved.open("rb") as handle:
             response = await self._request(
@@ -372,6 +425,8 @@ class AgentRuntime:
                     "source_size": str(stat.st_size),
                     "sha256": sha256,
                     "previous_path": previous_path,
+                    "duplicate_path": duplicate_path,
+                    "duplicate_title": duplicate_title,
                 },
                 files={"file": (resolved.name, handle, "application/octet-stream")},
             )
@@ -423,6 +478,8 @@ class AgentRuntime:
 
     async def inventory_root(self, root: RootConfig) -> dict[str, Any]:
         self._require_sync_enabled()
+        if not self._root_is_running(root):
+            raise SyncPausedError(f"Syncing is {root.sync_state} for {root.name}")
         root_path = Path(root.path).expanduser().resolve()
         if not root_path.is_dir():
             raise ValueError(f"Watched folder is unavailable: {root_path}")
@@ -483,12 +540,14 @@ class AgentRuntime:
         await self.register_roots()
         results = {}
         for root in self.config.roots:
-            if root.enabled:
+            if self._root_is_running(root):
                 results[root.name] = await self.inventory_root(root)
         return results
 
     async def sync_pending_root(self, root: RootConfig) -> dict[str, int]:
         self._require_sync_enabled()
+        if not self._root_is_running(root):
+            raise SyncPausedError(f"Syncing is {root.sync_state} for {root.name}")
         if root.root_key not in self._root_ids:
             await self.register_roots()
         root_id = self._root_ids[root.root_key]
@@ -514,7 +573,7 @@ class AgentRuntime:
         await self.register_roots()
         results = {}
         for root in self.config.roots:
-            if root.enabled:
+            if self._root_is_running(root):
                 results[root.name] = await self.sync_pending_root(root)
         return results
 
@@ -522,7 +581,7 @@ class AgentRuntime:
         await self.register_roots()
         results = {}
         for root in self.config.roots:
-            if root.enabled:
+            if self._root_is_running(root):
                 results[root.name] = await self.scan_root(root)
         return results
 
@@ -603,13 +662,17 @@ class AgentRuntime:
         source_agent = str(payload.get("source_agent", "")).casefold()
         root_name = str(payload.get("root_name", "")).casefold()
         index: dict[tuple[str, str, str], tuple[str, dict[str, str]]] = {}
+        catalog: list[dict[str, str]] = []
         for note in vault.rglob("*.md"):
-            if note.is_symlink() or not note.is_file():
+            if note.is_symlink() or not note.is_file() or ".obsidian" in note.parts:
                 continue
             try:
-                metadata = managed_note_metadata(note.read_text(encoding="utf-8"))
+                content = note.read_text(encoding="utf-8")
+                metadata = managed_note_metadata(content)
             except (OSError, UnicodeError):
                 continue
+            relative = note.relative_to(vault).as_posix()
+            catalog.append({"path": relative, "title": note_title(content, note)})
             if not metadata:
                 continue
             key = (
@@ -617,7 +680,7 @@ class AgentRuntime:
                 metadata["obsync_root"].casefold(),
                 metadata["obsync_source"],
             )
-            index.setdefault(key, (note.relative_to(vault).as_posix(), metadata))
+            index.setdefault(key, (relative, metadata))
 
         results: list[dict[str, str]] = []
         for item in payload.get("documents", []):
@@ -637,9 +700,32 @@ class AgentRuntime:
                 if match:
                     destination, metadata = match
             if not metadata:
-                state = "modified" if note_exists else "vault-missing" if destination else "new"
+                duplicate = None
+                if payload.get("duplicate_policy", "review") == "review" and not item.get(
+                    "duplicate_dismissed"
+                ):
+                    source_title = note_title_from_path(Path(str(item.get("source_path", ""))))
+                    duplicate = next(
+                        (
+                            candidate
+                            for candidate in catalog
+                            if candidate["path"] != destination
+                            and likely_same_note_title(source_title, candidate["title"])
+                        ),
+                        None,
+                    )
+                state = (
+                    "modified"
+                    if note_exists
+                    else "vault-missing"
+                    if destination
+                    else "possible-duplicate"
+                    if duplicate
+                    else "new"
+                )
                 note_hash = ""
             else:
+                duplicate = None
                 note_hash = metadata.get("obsync_hash", "")
                 state = (
                     "in-sync"
@@ -652,12 +738,18 @@ class AgentRuntime:
                     "comparison_status": state,
                     "destination_path": destination,
                     "note_hash": note_hash,
+                    "duplicate_path": duplicate["path"] if duplicate else "",
+                    "duplicate_title": duplicate["title"] if duplicate else "",
                 }
             )
         return json.dumps(results, ensure_ascii=False)
 
     def _ensure_watch_task(self, root: RootConfig) -> None:
-        if not self._running or root.root_key in self._watch_tasks or self._stop.is_set():
+        existing = self._watch_tasks.get(root.root_key)
+        if existing and existing.done():
+            self._watch_tasks.pop(root.root_key, None)
+            existing = None
+        if not self._running or not self._root_is_running(root) or existing or self._stop.is_set():
             return
         self._watch_tasks[root.root_key] = asyncio.create_task(self._watch_root(root))
 
@@ -670,6 +762,7 @@ class AgentRuntime:
                 if command["command"] in {
                     "scan",
                     "sync",
+                    "reconcile",
                     "scan_root",
                     "sync_root",
                     "resync",
@@ -683,6 +776,13 @@ class AgentRuntime:
                     result = json.dumps(await self.inventory_all())
                 elif command["command"] == "sync":
                     result = json.dumps(await self.sync_pending_all())
+                elif command["command"] == "reconcile":
+                    result = json.dumps(
+                        {
+                            "inventory": await self.inventory_all(),
+                            "sync": await self.sync_pending_all(),
+                        }
+                    )
                 elif command["command"] == "scan_root":
                     payload = command.get("payload", {})
                     root = next(r for r in self.config.roots if r.root_key == payload["root_key"])
@@ -732,6 +832,34 @@ class AgentRuntime:
                             "root_key": str(payload.get("root_key", "")),
                         }
                     )
+                elif command["command"] == "set_root_state":
+                    payload = command.get("payload", {})
+                    root = next(r for r in self.config.roots if r.root_key == payload["root_key"])
+                    requested = str(payload.get("sync_state", ""))
+                    if requested not in {"running", "paused", "stopped"}:
+                        raise ValueError("Folder state must be running, paused, or stopped")
+                    root.sync_state = requested
+                    root.enabled = True
+                    if requested == "stopped":
+                        task = self._watch_tasks.pop(root.root_key, None)
+                        if task:
+                            task.cancel()
+                    elif requested == "running":
+                        self._ensure_watch_task(root)
+                    self.config.save(self.config_path)
+                    response = await self._request("POST", "/api/v1/agent/roots", json=asdict(root))
+                    self._root_ids[root.root_key] = response.json()["id"]
+                    reconciliation: dict[str, Any] = {}
+                    if requested == "running" and self._server_sync_enabled:
+                        reconciliation["inventory"] = await self.inventory_root(root)
+                        reconciliation["sync"] = await self.sync_pending_root(root)
+                    result = json.dumps(
+                        {
+                            "root_key": root.root_key,
+                            "sync_state": root.sync_state,
+                            **reconciliation,
+                        }
+                    )
                 else:
                     raise ValueError(f"Unknown command: {command['command']}")
             except Exception as exc:
@@ -749,7 +877,7 @@ class AgentRuntime:
             try:
                 async for changes in awatch(root_path, stop_event=self._stop):
                     for change, changed_path in changes:
-                        if not self._server_sync_enabled:
+                        if not self._server_sync_enabled or not self._root_is_running(root):
                             continue
                         path = Path(changed_path)
                         if change == Change.deleted:
@@ -814,7 +942,7 @@ class AgentRuntime:
             asyncio.create_task(self._reconcile_loop()),
         ]
         for root in self.config.roots:
-            if root.enabled:
+            if self._root_is_running(root):
                 self._ensure_watch_task(root)
         try:
             await asyncio.gather(*tasks)

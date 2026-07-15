@@ -44,6 +44,17 @@ def is_windows() -> bool:
     return os.name == "nt"
 
 
+def windows_is_admin() -> bool:
+    if not is_windows():
+        return False
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except (AttributeError, OSError):
+        return False
+
+
 def companion_data_dir() -> Path:
     return user_data_path("Obsync") / "desktop"
 
@@ -54,6 +65,40 @@ def installed_companion_path() -> Path:
 
 def scheduled_task_command(executable: Path, config_path: Path) -> str:
     return subprocess.list2cmdline([str(executable), "--background", "--config", str(config_path)])
+
+
+def register_url_protocol(
+    executable: Path,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> None:
+    """Register obsync:// for the current Windows user so the web app can open Desktop."""
+    if not is_windows():
+        return
+    key = r"HKCU\Software\Classes\obsync"
+    command = subprocess.list2cmdline([str(executable), "%1"])
+    additions = [
+        (key, "", "URL:Obsync Desktop"),
+        (key, "URL Protocol", ""),
+        (rf"{key}\shell\open\command", "", command),
+    ]
+    for path, name, value in additions:
+        args = ["reg.exe", "ADD", path, "/F"]
+        if name:
+            args.extend(["/V", name])
+        else:
+            args.append("/VE")
+        args.extend(["/D", value])
+        result = run(
+            args,
+            check=False,
+            capture_output=True,
+            text=True,
+            creationflags=_windows_creation_flags(),
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "Windows rejected the app link").strip()
+            raise ValueError(f"Could not register the Obsync Desktop app link: {detail}")
 
 
 def parse_pairing_details(value: str) -> dict[str, str]:
@@ -282,6 +327,11 @@ async def install_companion(
 ) -> CompanionInstall:
     if not is_windows():
         raise ValueError("The guided Obsync Desktop installer is available on Windows")
+    if not windows_is_admin():
+        raise ValueError(
+            "Close Obsync Desktop, right-click it, and choose Run as administrator before "
+            "connecting. Administrator access is needed only for setup."
+        )
     server = server_url.strip().rstrip("/")
     code = enrollment_code.strip()
     name = computer_name.strip() or socket.gethostname()
@@ -328,6 +378,7 @@ async def install_companion(
     destination.parent.mkdir(parents=True, exist_ok=True)
     if source != destination.resolve():
         shutil.copy2(source, destination)
+    register_url_protocol(destination)
     install_startup_task(destination, saved_config)
     start_background_companion(destination, saved_config)
     return CompanionInstall(
@@ -392,6 +443,15 @@ def run_setup_gui(
         ),
         wraplength=500,
     ).pack(anchor="w", pady=(6, 20))
+    ttk.Label(
+        frame,
+        text=(
+            "Administrator required for setup: close this window and use Run as administrator "
+            "before Connect and install. Background syncing runs with limited permissions."
+        ),
+        foreground="#9c2f2f",
+        wraplength=500,
+    ).pack(anchor="w", pady=(0, 16))
 
     fields = ttk.Frame(frame)
     fields.pack(fill="x")
@@ -468,7 +528,7 @@ def run_setup_gui(
     ttk.Button(fields, text="Choose vault folder…", command=choose_vault).pack(anchor="w")
     ttk.Label(
         fields,
-        text="Optional. You can also select the vault later from Obsync Settings.",
+        text="Optional. You can also select the vault later from the Obsidian Vault tab.",
     ).pack(anchor="w", pady=(3, 14))
 
     status = ttk.Label(frame, textvariable=status_value, wraplength=500)
@@ -484,7 +544,7 @@ def run_setup_gui(
         desktop_controls,
         text=(
             "Stopping here stops this PC's watcher. To cancel server-side AI work too, use "
-            "Stop syncing in the Obsync dashboard."
+            "Stop Global Sync in the Obsync dashboard."
         ),
         wraplength=500,
     ).pack(anchor="w", pady=(3, 10))
@@ -558,6 +618,14 @@ def run_setup_gui(
         messagebox.showerror("Could not connect", message, parent=root)
 
     def connect() -> None:
+        if is_windows() and not windows_is_admin():
+            messagebox.showerror(
+                "Run Obsync Desktop as administrator",
+                "Close this window, right-click Obsync Desktop, choose Run as administrator, "
+                "then connect again. Administrator access is needed only for setup.",
+                parent=root,
+            )
+            return
         selected_vault = vault_value.get().strip() if has_vault.get() else ""
         if has_vault.get() and not selected_vault:
             choose_vault()
@@ -609,6 +677,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--server", default="", help="Prefill the Obsync server address")
     parser.add_argument("--code", default="", help="Prefill the one-time pairing code")
     parser.add_argument("--name", default="", help="Prefill the computer name")
+    parser.add_argument("launch_uri", nargs="?", default="", help=argparse.SUPPRESS)
     return parser
 
 

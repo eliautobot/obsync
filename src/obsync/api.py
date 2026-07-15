@@ -313,15 +313,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return RedirectResponse("/api/v1/downloads/windows-desktop", status_code=307)
 
     @app.get("/api/v1/auth/status")
-    async def auth_status(request: Request) -> dict[str, bool]:
+    async def auth_status(request: Request) -> dict[str, Any]:
         status = service.setup_status()
         local = _is_local_admin_request(request, settings)
-        return {
+        result: dict[str, Any] = {
             **status,
             "legacy_migration_required": status["legacy_migration_required"] and local,
             "account_registered": not status["setup_required"],
             "temporary_admin_available": status["setup_required"] and local,
         }
+        session = service.authenticate_admin_session(request.cookies.get(SESSION_COOKIE, ""))
+        if session:
+            result.update(
+                {
+                    "authenticated": True,
+                    "username": session["username"],
+                    "legacy": False,
+                    "temporary": False,
+                }
+            )
+        return result
 
     @app.post("/api/v1/auth/setup")
     def auth_setup(payload: SetupRequest, request: Request, response: Response) -> dict[str, Any]:
@@ -513,17 +524,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/v1/admin/roots/{root_id}/scan")
     async def scan_root(root_id: str, _token: AdminDependency) -> dict[str, Any]:
-        root = service.db.query_one("SELECT agent_id, root_key FROM roots WHERE id = ?", (root_id,))
-        if not root:
-            raise HTTPException(status_code=404, detail="Watched folder not found")
-        return service.queue_command(root["agent_id"], "scan_root", {"root_key": root["root_key"]})
+        return service.queue_root_command(root_id, "scan_root")
 
     @app.post("/api/v1/admin/roots/{root_id}/sync")
     async def sync_root(root_id: str, _token: AdminDependency) -> dict[str, Any]:
-        root = service.db.query_one("SELECT agent_id, root_key FROM roots WHERE id = ?", (root_id,))
-        if not root:
-            raise HTTPException(status_code=404, detail="Watched folder not found")
-        return service.queue_command(root["agent_id"], "sync_root", {"root_key": root["root_key"]})
+        return service.queue_root_command(root_id, "sync_root")
+
+    @app.post("/api/v1/admin/roots/{root_id}/state")
+    async def set_root_state(
+        root_id: str, payload: dict[str, Any], _token: AdminDependency
+    ) -> dict[str, Any]:
+        return service.set_root_state(root_id, str(payload.get("sync_state", "")))
 
     @app.get("/api/v1/admin/commands/{command_id}")
     async def command_status(command_id: str, _token: AdminDependency) -> dict[str, Any]:
@@ -562,6 +573,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def approve_document(document_id: str, _token: AdminDependency) -> dict[str, bool]:
         service.approve_document(document_id)
         return {"ok": True}
+
+    @app.post("/api/v1/admin/documents/{document_id}/allow-duplicate")
+    async def allow_duplicate(document_id: str, _token: AdminDependency) -> dict[str, Any]:
+        return service.allow_duplicate(document_id)
 
     @app.post("/api/v1/admin/documents/{document_id}/retry")
     async def retry_document(document_id: str, _token: AdminDependency) -> dict[str, Any]:
@@ -659,6 +674,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         agent: AgentDependency,
         sha256: Annotated[str, Form()] = "",
         previous_path: Annotated[str, Form()] = "",
+        duplicate_path: Annotated[str, Form()] = "",
+        duplicate_title: Annotated[str, Form()] = "",
     ) -> dict[str, Any]:
         suffix = Path(source_path).suffix[:20]
         staged = settings.data_dir / "tmp" / f"{uuid.uuid4().hex}{suffix}"
@@ -685,6 +702,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 staged_file=staged,
                 claimed_hash=sha256,
                 previous_path=previous_path,
+                duplicate_path=duplicate_path,
+                duplicate_title=duplicate_title,
             )
         finally:
             await file.close()

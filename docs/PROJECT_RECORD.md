@@ -9,7 +9,7 @@ Obsync is a self-hosted ingestion layer that keeps an Obsidian vault aligned wit
 - Source: <https://github.com/eliautobot/obsync>
 - License: MIT
 - Initial release: `v0.1.0`
-- Current development version: `v0.8.0`
+- Current development version: `v0.9.0`
 
 ## Product decisions
 
@@ -38,6 +38,8 @@ Version 0.6.0 adds a guided Windows Companion that installs per-user, runs silen
 Version 0.7.0 adds safe computer disconnection, transactionally idempotent pairing, duplicate-window prevention, saved-pairing repair, verified Windows automatic startup, one-click setup-detail transfer, and an app-served matching Windows Companion download.
 
 Version 0.8.0 turns the Windows component into Obsync Desktop with bundled watcher controls, adds global start/stop with active AI cancellation, and adds safe watched-folder removal that preserves originals and notes.
+
+Version 0.9.0 separates vault, Local AI, and application settings; requires explicit vault confirmation; adds conservative duplicate review, custom AI instructions, per-folder controls, live UI updates, immediate reconciliation, one-click Desktop launching, and clear Windows administrator setup guidance.
 
 ## Initial validation
 

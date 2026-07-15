@@ -12,6 +12,7 @@ from obsync.companion import (
     install_companion,
     install_startup_task,
     parse_pairing_details,
+    register_url_protocol,
     scheduled_task_command,
     start_background_companion,
     stop_background_companion,
@@ -121,9 +122,41 @@ def test_pairing_details_round_trip() -> None:
         parse_pairing_details("not json")
 
 
+def test_windows_app_link_is_registered_for_current_user(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("obsync.companion.is_windows", lambda: True)
+    calls: list[list[str]] = []
+
+    def fake_run(args, **_kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "SUCCESS", "")
+
+    executable = tmp_path / "Obsync Desktop.exe"
+    register_url_protocol(executable, run=fake_run)
+    assert len(calls) == 3
+    assert all(call[:3] == ["reg.exe", "ADD", call[2]] for call in calls)
+    assert calls[0][2] == r"HKCU\Software\Classes\obsync"
+    assert calls[1][calls[1].index("/V") + 1] == "URL Protocol"
+    assert str(executable) in calls[2][calls[2].index("/D") + 1]
+    assert "%1" in calls[2][calls[2].index("/D") + 1]
+
+
+@pytest.mark.asyncio
+async def test_companion_install_requires_administrator(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("obsync.companion.is_windows", lambda: True)
+    monkeypatch.setattr("obsync.companion.windows_is_admin", lambda: False)
+    with pytest.raises(ValueError, match="Run as administrator"):
+        await install_companion(
+            server_url="http://server:7769",
+            enrollment_code="AAAA-BBBB-CCCC",
+            computer_name="Office PC",
+            source_executable=tmp_path / "desktop.exe",
+        )
+
+
 @pytest.mark.asyncio
 async def test_companion_pairs_copies_installs_and_starts(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("obsync.companion.is_windows", lambda: True)
+    monkeypatch.setattr("obsync.companion.windows_is_admin", lambda: True)
     source = tmp_path / "download" / "companion.exe"
     source.parent.mkdir()
     source.write_bytes(b"standalone companion")
@@ -131,6 +164,7 @@ async def test_companion_pairs_copies_installs_and_starts(monkeypatch, tmp_path:
     config_path = tmp_path / "config" / "agent.yml"
     vault = tmp_path / "vault"
     vault.mkdir()
+    (vault / ".obsidian").mkdir()
     lifecycle: list[tuple[str, Path, Path]] = []
 
     async def fake_pair_agent(**kwargs):
@@ -145,6 +179,7 @@ async def test_companion_pairs_copies_installs_and_starts(monkeypatch, tmp_path:
 
     monkeypatch.setattr("obsync.companion.pair_agent", fake_pair_agent)
     monkeypatch.setattr("obsync.companion.installed_companion_path", lambda: destination)
+    monkeypatch.setattr("obsync.companion.register_url_protocol", lambda executable: None)
     monkeypatch.setattr(
         "obsync.companion.install_startup_task",
         lambda executable, config: lifecycle.append(("task", executable, config)),
@@ -180,6 +215,7 @@ async def test_companion_reuses_valid_pairing_and_repairs_startup(
     monkeypatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr("obsync.companion.is_windows", lambda: True)
+    monkeypatch.setattr("obsync.companion.windows_is_admin", lambda: True)
     source = tmp_path / "download" / "companion.exe"
     source.parent.mkdir()
     source.write_bytes(b"companion")
@@ -202,6 +238,7 @@ async def test_companion_reuses_valid_pairing_and_repairs_startup(
     monkeypatch.setattr("obsync.companion.existing_pairing_is_valid", valid)
     monkeypatch.setattr("obsync.companion.pair_agent", should_not_pair)
     monkeypatch.setattr("obsync.companion.installed_companion_path", lambda: destination)
+    monkeypatch.setattr("obsync.companion.register_url_protocol", lambda executable: None)
     monkeypatch.setattr(
         "obsync.companion.install_startup_task",
         lambda executable, config: lifecycle.append(("task", executable, config)),

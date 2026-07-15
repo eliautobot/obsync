@@ -19,8 +19,11 @@ from .extractors import extract_document
 from .llm import Analysis, LLMAnalyzer, LLMConfig
 from .markdown import (
     is_managed_note,
+    likely_same_note_title,
     managed_note_metadata,
     merge_preserving_manual,
+    note_title,
+    note_title_from_path,
     render_markdown,
     set_source_status,
 )
@@ -39,7 +42,8 @@ from .security import (
 )
 
 DEFAULT_SETTINGS: dict[str, tuple[str, bool]] = {
-    "sync_enabled": ("true", False),
+    "sync_enabled": ("false", False),
+    "vault_confirmed": ("false", False),
     "vault_mode": ("local", False),
     "vault_agent_id": ("", False),
     "llm_enabled": ("false", False),
@@ -48,6 +52,9 @@ DEFAULT_SETTINGS: dict[str, tuple[str, bool]] = {
     "llm_model": ("", False),
     "llm_api_key": ("", True),
     "llm_timeout_seconds": ("120", False),
+    "llm_instructions": ("", False),
+    "llm_vault_context": ("true", False),
+    "duplicate_policy": ("review", False),
     "review_threshold": ("0.65", False),
 }
 
@@ -62,6 +69,7 @@ PIPELINE_COMMANDS = frozenset(
         "set_source_status",
         "audit_vault",
         "select_source",
+        "reconcile",
     }
 )
 
@@ -81,7 +89,13 @@ class ObsyncService:
         self.db = db or Database(settings.database_path)
         self.db.initialize()
         self._ensure_defaults()
-        self._inventory_vault_indexes: dict[str, dict[tuple[str, str, str], dict[str, str]]] = {}
+        self._inventory_vault_indexes: dict[
+            str,
+            tuple[
+                dict[tuple[str, str, str], dict[str, str]],
+                list[dict[str, str]],
+            ],
+        ] = {}
         self._active_processing: dict[str, tuple[str, asyncio.Task[Any]]] = {}
         self._dummy_password_hash = hash_password("obsync-invalid-password")
         self._bootstrap_admin_from_env()
@@ -89,6 +103,10 @@ class ObsyncService:
     def _ensure_defaults(self) -> None:
         existing = self.db.get_settings()
         missing = {key: value for key, value in DEFAULT_SETTINGS.items() if key not in existing}
+        # Upgrades must stop before the first write until the user explicitly
+        # confirms the destination vault in the new Vault screen.
+        if "vault_confirmed" not in existing:
+            missing["sync_enabled"] = ("false", False)
         if missing:
             self.db.set_settings(missing)
 
@@ -109,7 +127,11 @@ class ObsyncService:
     def require_pipeline_enabled(self) -> None:
         if not self.pipeline_enabled():
             raise PipelinePausedError(
-                "Syncing is stopped. Choose Start syncing before scanning or processing files."
+                "Global syncing is stopped. Choose Start Global Sync before processing files."
+            )
+        if self.db.get_setting("vault_confirmed", "false").lower() != "true":
+            raise ValueError(
+                "Choose and save an Obsidian Vault before adding or syncing source folders"
             )
 
     def pipeline_status(self) -> dict[str, Any]:
@@ -176,12 +198,18 @@ class ObsyncService:
         return {**self.pipeline_status(), "cancelled_commands": len(cancelled)}
 
     def resume_pipeline(self) -> dict[str, Any]:
+        if self.db.get_setting("vault_confirmed", "false").lower() != "true":
+            raise ValueError("Choose and save an Obsidian Vault before starting Global Sync")
         self.db.set_settings({"sync_enabled": ("true", False)})
+        reconciliations = 0
+        for agent in self.db.query_all("SELECT id FROM agents WHERE enabled = 1"):
+            self.queue_command(agent["id"], "reconcile")
+            reconciliations += 1
         self.db.add_event(
             "pipeline.started",
             "Syncing was started; connected computers will reconcile missed changes",
         )
-        return self.pipeline_status()
+        return {**self.pipeline_status(), "reconciliations": reconciliations}
 
     def has_admin_account(self) -> bool:
         return self.db.query_one("SELECT id FROM admin_users LIMIT 1") is not None
@@ -679,13 +707,16 @@ class ObsyncService:
         name = str(payload.get("name") or Path(str(payload.get("path", "Folder"))).name or "Folder")
         destination = str(payload.get("destination") or "Obsync")
         safe_relative_path(destination)
+        sync_state = str(payload.get("sync_state") or "running")
+        if sync_state not in {"running", "paused", "stopped"}:
+            raise ValueError("Folder state must be running, paused, or stopped")
         include = json.dumps(list(payload.get("include_patterns") or ["**/*"]))
         exclude = json.dumps(list(payload.get("exclude_patterns") or []))
         self.db.execute(
             """
             INSERT INTO roots(id, agent_id, root_key, name, path, destination, include_patterns,
-                              exclude_patterns, enabled, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              exclude_patterns, enabled, sync_state, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(agent_id, root_key) DO UPDATE SET
                 name = excluded.name,
                 path = excluded.path,
@@ -693,6 +724,7 @@ class ObsyncService:
                 include_patterns = excluded.include_patterns,
                 exclude_patterns = excluded.exclude_patterns,
                 enabled = excluded.enabled,
+                sync_state = excluded.sync_state,
                 updated_at = excluded.updated_at
             """,
             (
@@ -705,6 +737,7 @@ class ObsyncService:
                 include,
                 exclude,
                 int(bool(payload.get("enabled", True))),
+                sync_state,
                 now,
                 now,
             ),
@@ -712,6 +745,84 @@ class ObsyncService:
         root = self.db.query_one("SELECT * FROM roots WHERE id = ?", (root_id,))
         assert root is not None
         return self._decode_root(root)
+
+    def set_root_state(self, root_id: str, sync_state: str) -> dict[str, Any]:
+        if sync_state not in {"running", "paused", "stopped"}:
+            raise ValueError("Folder state must be running, paused, or stopped")
+        root = self.db.query_one(
+            "SELECT r.*, a.name AS agent_name FROM roots r "
+            "JOIN agents a ON a.id = r.agent_id WHERE r.id = ?",
+            (root_id,),
+        )
+        if not root:
+            raise ValueError("Watched folder not found")
+
+        cancelled = 0
+        active = 0
+        if sync_state != "running":
+            active = self._cancel_processing(root_id=root_id)
+            now = utc_now()
+            pending = self.db.query_all(
+                "SELECT id, command, payload_json FROM commands "
+                "WHERE agent_id = ? AND status = 'pending'",
+                (root["agent_id"],),
+            )
+            with self.db.transaction() as connection:
+                for row in pending:
+                    payload = json.loads(row.get("payload_json") or "{}")
+                    matches_root = str(payload.get("root_key", "")) == root["root_key"]
+                    document_id = str(payload.get("document_id", ""))
+                    if document_id:
+                        document = connection.execute(
+                            "SELECT root_id FROM documents WHERE id = ?", (document_id,)
+                        ).fetchone()
+                        matches_root = bool(document and document["root_id"] == root_id)
+                    if row["command"] in PIPELINE_COMMANDS and matches_root:
+                        connection.execute(
+                            "UPDATE commands SET status = 'cancelled', result = ?, "
+                            "completed_at = ? "
+                            "WHERE id = ? AND status = 'pending'",
+                            (f"Folder {sync_state} by user", now, row["id"]),
+                        )
+                        cancelled += 1
+
+        self.db.execute(
+            "UPDATE roots SET sync_state = ?, enabled = 1, updated_at = ? WHERE id = ?",
+            (sync_state, utc_now(), root_id),
+        )
+        command = self.queue_command(
+            root["agent_id"],
+            "set_root_state",
+            {"root_key": root["root_key"], "sync_state": sync_state},
+        )
+        label = {"running": "started", "paused": "paused", "stopped": "stopped"}[sync_state]
+        self.db.add_event(
+            f"root.{label}",
+            f"{root['name']} on {root['agent_name']} was {label}",
+            level="warning" if sync_state != "running" else "info",
+            agent_id=root["agent_id"],
+            root_id=root_id,
+            details={"active_jobs": active, "cancelled_commands": cancelled},
+        )
+        updated = self.db.query_one("SELECT * FROM roots WHERE id = ?", (root_id,))
+        assert updated is not None
+        return {
+            **self._decode_root(updated),
+            "command_id": command["id"],
+            "cancelled_commands": cancelled,
+            "active_jobs": active,
+        }
+
+    def queue_root_command(self, root_id: str, command: str) -> dict[str, Any]:
+        root = self.db.query_one(
+            "SELECT agent_id, root_key, sync_state, enabled FROM roots WHERE id = ?",
+            (root_id,),
+        )
+        if not root:
+            raise ValueError("Watched folder not found")
+        if not root["enabled"] or root["sync_state"] != "running":
+            raise PipelinePausedError(f"Folder syncing is {root['sync_state']}")
+        return self.queue_command(root["agent_id"], command, {"root_key": root["root_key"]})
 
     def remove_root(self, root_id: str) -> dict[str, Any]:
         root = self.db.query_one(
@@ -769,7 +880,9 @@ class ObsyncService:
                    sum(CASE WHEN d.comparison_status IN ('vault-missing', 'source-missing')
                             THEN 1 ELSE 0 END) AS missing_count,
                    sum(CASE WHEN d.comparison_status = 'checking' THEN 1 ELSE 0 END)
-                       AS checking_count
+                       AS checking_count,
+                   sum(CASE WHEN d.comparison_status = 'possible-duplicate' THEN 1 ELSE 0 END)
+                       AS duplicate_count
             FROM roots r
             JOIN agents a ON a.id = r.agent_id
             LEFT JOIN documents d ON d.root_id = r.id
@@ -781,17 +894,23 @@ class ObsyncService:
         sql += " GROUP BY r.id ORDER BY a.name COLLATE NOCASE, r.name COLLATE NOCASE"
         return [self._decode_root(row) for row in self.db.query_all(sql, params)]
 
-    def _local_vault_index(self) -> dict[tuple[str, str, str], dict[str, str]]:
+    def _local_vault_snapshot(
+        self,
+    ) -> tuple[dict[tuple[str, str, str], dict[str, str]], list[dict[str, str]]]:
         index: dict[tuple[str, str, str], dict[str, str]] = {}
+        catalog: list[dict[str, str]] = []
         if not self.settings.vault_path.is_dir():
-            return index
+            return index, catalog
         for path in self.settings.vault_path.rglob("*.md"):
-            if path.is_symlink() or not path.is_file():
+            if path.is_symlink() or not path.is_file() or ".obsidian" in path.parts:
                 continue
             try:
-                metadata = managed_note_metadata(path.read_text(encoding="utf-8"))
+                content = path.read_text(encoding="utf-8")
+                metadata = managed_note_metadata(content)
             except (OSError, UnicodeError):
                 continue
+            relative = path.relative_to(self.settings.vault_path).as_posix()
+            catalog.append({"path": relative, "title": note_title(content, path)})
             if not metadata:
                 continue
             key = (
@@ -799,9 +918,23 @@ class ObsyncService:
                 metadata["obsync_root"].casefold(),
                 metadata["obsync_source"],
             )
-            metadata["destination_path"] = path.relative_to(self.settings.vault_path).as_posix()
+            metadata["destination_path"] = relative
             index.setdefault(key, metadata)
-        return index
+        return index, catalog
+
+    @staticmethod
+    def _possible_duplicate(
+        source_title: str,
+        catalog: list[dict[str, str]],
+        *,
+        current_destination: str = "",
+    ) -> dict[str, str] | None:
+        for note in catalog:
+            if current_destination and note["path"] == current_destination:
+                continue
+            if likely_same_note_title(source_title, note["title"]):
+                return note
+        return None
 
     @staticmethod
     def _identity_key(agent_name: str, root_name: str, source_path: str) -> tuple[str, str, str]:
@@ -814,7 +947,8 @@ class ObsyncService:
         agent_name: str,
         root_name: str,
         vault_index: dict[tuple[str, str, str], dict[str, str]],
-    ) -> tuple[str, str, str]:
+        vault_catalog: list[dict[str, str]],
+    ) -> tuple[str, str, str, str, str]:
         destination = str(document.get("destination_path") or "")
         metadata: dict[str, str] | None = None
         if destination:
@@ -827,19 +961,40 @@ class ObsyncService:
             except (OSError, UnicodeError, ValueError):
                 metadata = None
             if metadata is None:
-                return ("modified" if note_exists else "vault-missing"), destination, ""
+                return (
+                    "modified" if note_exists else "vault-missing",
+                    destination,
+                    "",
+                    "",
+                    "",
+                )
         else:
             metadata = vault_index.get(
                 self._identity_key(agent_name, root_name, str(document["source_path"]))
             )
             if not metadata:
-                return "new", "", ""
+                duplicate = None
+                if self.db.get_setting(
+                    "duplicate_policy", "review"
+                ) == "review" and not document.get("duplicate_dismissed"):
+                    duplicate = self._possible_duplicate(
+                        note_title_from_path(Path(str(document["source_path"]))), vault_catalog
+                    )
+                if duplicate:
+                    return (
+                        "possible-duplicate",
+                        "",
+                        "",
+                        duplicate["path"],
+                        duplicate["title"],
+                    )
+                return "new", "", "", "", ""
             destination = metadata["destination_path"]
 
         note_hash = str(metadata.get("obsync_hash", ""))
         observed_hash = str(document.get("observed_hash") or document.get("source_hash") or "")
         state = "in-sync" if note_hash and note_hash == observed_hash else "modified"
-        return state, destination, note_hash
+        return state, destination, note_hash, "", ""
 
     def inventory_files(
         self,
@@ -856,6 +1011,8 @@ class ObsyncService:
         )
         if not root or not root["enabled"]:
             raise ValueError("Watched folder is unknown or disabled")
+        if root.get("sync_state", "running") != "running":
+            raise PipelinePausedError(f"Folder syncing is {root['sync_state']}")
         if not scan_id or len(scan_id) > 100:
             raise ValueError("Inventory scan id is invalid")
         now = utc_now()
@@ -864,10 +1021,11 @@ class ObsyncService:
             if scan_id not in self._inventory_vault_indexes:
                 if len(self._inventory_vault_indexes) >= 8:
                     self._inventory_vault_indexes.pop(next(iter(self._inventory_vault_indexes)))
-                self._inventory_vault_indexes[scan_id] = self._local_vault_index()
-            vault_index = self._inventory_vault_indexes[scan_id]
+                self._inventory_vault_indexes[scan_id] = self._local_vault_snapshot()
+            vault_index, vault_catalog = self._inventory_vault_indexes[scan_id]
         else:
             vault_index = {}
+            vault_catalog = []
 
         for item in items:
             source_path = safe_relative_path(str(item.get("source_path", ""))).as_posix()
@@ -944,13 +1102,22 @@ class ObsyncService:
             if local_mode:
                 document = self.db.query_one("SELECT * FROM documents WHERE id = ?", (document_id,))
                 assert document is not None
-                comparison, destination, note_hash = self._compare_local_document(
-                    document,
-                    agent_name=str(agent["name"]),
-                    root_name=str(root["name"]),
-                    vault_index=vault_index,
+                comparison, destination, note_hash, duplicate_path, duplicate_title = (
+                    self._compare_local_document(
+                        document,
+                        agent_name=str(agent["name"]),
+                        root_name=str(root["name"]),
+                        vault_index=vault_index,
+                        vault_catalog=vault_catalog,
+                    )
                 )
-                values: list[Any] = [comparison, destination, now]
+                values: list[Any] = [
+                    comparison,
+                    destination,
+                    duplicate_path,
+                    duplicate_title,
+                    now,
+                ]
                 source_hash_sql = ""
                 if note_hash and not document["source_hash"]:
                     source_hash_sql = ", source_hash = ?, status = 'synced', processed_at = ?"
@@ -959,10 +1126,17 @@ class ObsyncService:
                 self.db.execute(
                     f"""
                     UPDATE documents SET comparison_status = ?, destination_path = ?,
+                        duplicate_path = ?, duplicate_title = ?,
                         updated_at = ? {source_hash_sql} WHERE id = ?
                     """,
                     values,
                 )
+                if comparison == "possible-duplicate":
+                    self.db.execute(
+                        "UPDATE documents SET status = 'duplicate-review', needs_review = 1 "
+                        "WHERE id = ?",
+                        (document_id,),
+                    )
 
         audit_commands: list[str] = []
         if complete:
@@ -992,7 +1166,7 @@ class ObsyncService:
                 vault_agent = self._remote_vault_agent()
                 documents = self.db.query_all(
                     """
-                    SELECT id, source_path, observed_hash, destination_path
+                    SELECT id, source_path, observed_hash, destination_path, duplicate_dismissed
                     FROM documents WHERE root_id = ? AND inventory_scan_id = ?
                     ORDER BY source_path
                     """,
@@ -1005,6 +1179,7 @@ class ObsyncService:
                         {
                             "source_agent": agent["name"],
                             "root_name": root["name"],
+                            "duplicate_policy": self.db.get_setting("duplicate_policy", "review"),
                             "documents": documents[start : start + 100],
                         },
                     )
@@ -1049,11 +1224,13 @@ class ObsyncService:
 
     def vault_status(self) -> dict[str, Any]:
         mode = self.db.get_setting("vault_mode", "local")
+        confirmed = self.db.get_setting("vault_confirmed", "false").lower() == "true"
         if mode == "agent":
             agent_id = self.db.get_setting("vault_agent_id", "")
             agent = self.db.query_one("SELECT * FROM agents WHERE id = ?", (agent_id,))
             return {
                 "mode": "agent",
+                "configured": confirmed,
                 "agent_id": agent_id,
                 "agent_name": agent["name"] if agent else "",
                 "path": agent["vault_path"] if agent else "",
@@ -1062,6 +1239,7 @@ class ObsyncService:
             }
         return {
             "mode": "local",
+            "configured": confirmed,
             "agent_id": "",
             "agent_name": "Obsync server",
             "path": str(self.settings.vault_path),
@@ -1099,9 +1277,12 @@ class ObsyncService:
             model=self.db.get_setting("llm_model", ""),
             api_key=self.db.get_setting("llm_api_key", ""),
             timeout_seconds=max(5, min(timeout, 600)),
+            custom_instructions=self.db.get_setting("llm_instructions", ""),
         )
 
     def _candidate_titles(self, source_path: str, limit: int = 100) -> list[str]:
+        if self.db.get_setting("llm_vault_context", "true").lower() != "true":
+            return []
         words = {
             word.lower()
             for word in Path(source_path).stem.replace("_", " ").replace("-", " ").split()
@@ -1172,6 +1353,8 @@ class ObsyncService:
         staged_file: Path,
         claimed_hash: str = "",
         previous_path: str = "",
+        duplicate_path: str = "",
+        duplicate_title: str = "",
     ) -> dict[str, Any]:
         self.require_pipeline_enabled()
         source_rel = safe_relative_path(source_path).as_posix()
@@ -1180,12 +1363,23 @@ class ObsyncService:
         )
         if not root or not root["enabled"]:
             raise ValueError("Watched folder is unknown or disabled")
+        if root.get("sync_state", "running") != "running":
+            raise PipelinePausedError(f"Folder syncing is {root['sync_state']}")
         if staged_file.stat().st_size > self.settings.max_upload_bytes:
             raise ValueError(f"File exceeds the {self.settings.max_upload_mb} MB upload limit")
 
         actual_hash = self._sha256(staged_file)
         if claimed_hash and claimed_hash.lower() != actual_hash:
             raise ValueError("Uploaded file hash does not match the agent manifest")
+
+        duplicate_hint_path = ""
+        duplicate_hint_title = str(duplicate_title).strip()[:200]
+        if duplicate_path:
+            duplicate_hint_path = safe_relative_path(duplicate_path).as_posix()
+        if duplicate_hint_path and not likely_same_note_title(
+            note_title_from_path(Path(source_rel)), duplicate_hint_title
+        ):
+            duplicate_hint_path = duplicate_hint_title = ""
 
         existing = self.db.query_one(
             "SELECT * FROM documents WHERE agent_id = ? AND root_id = ? AND source_path = ?",
@@ -1231,6 +1425,13 @@ class ObsyncService:
                 ),
             )
             return {**self._decode_document(existing), "result": "unchanged"}
+        if (
+            existing
+            and existing.get("comparison_status") == "possible-duplicate"
+            and not existing.get("duplicate_dismissed")
+            and self.db.get_setting("duplicate_policy", "review") == "review"
+        ):
+            return {**self._decode_document(existing), "result": "possible-duplicate"}
 
         document_id = existing["id"] if existing else str(uuid.uuid4())
         now = utc_now()
@@ -1279,6 +1480,34 @@ class ObsyncService:
                 ),
             )
 
+        if (
+            duplicate_hint_path
+            and self.db.get_setting("duplicate_policy", "review") == "review"
+            and not (existing and existing.get("destination_path"))
+            and not (existing and existing.get("duplicate_dismissed"))
+        ):
+            self.db.execute(
+                """
+                UPDATE documents SET status = 'duplicate-review',
+                    comparison_status = 'possible-duplicate', needs_review = 1,
+                    duplicate_path = ?, duplicate_title = ?, error = '', updated_at = ?
+                WHERE id = ?
+                """,
+                (duplicate_hint_path, duplicate_hint_title, utc_now(), document_id),
+            )
+            self.db.add_event(
+                "document.duplicate_review",
+                f"Held {source_rel}; it may match {duplicate_hint_title}",
+                level="warning",
+                agent_id=agent["id"],
+                root_id=root_id,
+                document_id=document_id,
+                details={"duplicate_path": duplicate_hint_path},
+            )
+            row = self.db.query_one("SELECT * FROM documents WHERE id = ?", (document_id,))
+            assert row is not None
+            return {**self._decode_document(row), "result": "possible-duplicate"}
+
         task = asyncio.current_task()
         if task is not None:
             self._active_processing[document_id] = (root_id, task)
@@ -1300,6 +1529,57 @@ class ObsyncService:
             except ValueError:
                 threshold = 0.65
             needs_review = analysis.confidence < max(0.0, min(1.0, threshold))
+            duplicate = None
+            if (
+                self.db.get_setting("duplicate_policy", "review") == "review"
+                and not (existing and existing.get("duplicate_dismissed"))
+                and self.db.get_setting("vault_mode", "local") == "local"
+            ):
+                _managed_index, vault_catalog = self._local_vault_snapshot()
+                duplicate = self._possible_duplicate(
+                    analysis.title,
+                    vault_catalog,
+                    current_destination=str(existing.get("destination_path", ""))
+                    if existing
+                    else "",
+                )
+            if duplicate:
+                updated_at = utc_now()
+                self.db.execute(
+                    """
+                    UPDATE documents SET mime_type = ?, title = ?, category = ?, tags_json = ?,
+                        summary = ?, analysis_json = ?, status = 'duplicate-review',
+                        comparison_status = 'possible-duplicate', llm_status = ?, confidence = ?,
+                        needs_review = 1, duplicate_path = ?, duplicate_title = ?, error = '',
+                        updated_at = ? WHERE id = ?
+                    """,
+                    (
+                        extracted.mime_type,
+                        analysis.title,
+                        analysis.category,
+                        json.dumps(analysis.tags, ensure_ascii=False),
+                        analysis.summary,
+                        json.dumps(analysis.as_dict(), ensure_ascii=False),
+                        "analyzed" if analysis.provider != "rules" else "rules",
+                        analysis.confidence,
+                        duplicate["path"],
+                        duplicate["title"],
+                        updated_at,
+                        document_id,
+                    ),
+                )
+                self.db.add_event(
+                    "document.duplicate_review",
+                    f"Held {source_rel}; it may match {duplicate['title']}",
+                    level="warning",
+                    agent_id=agent["id"],
+                    root_id=root_id,
+                    document_id=document_id,
+                    details={"duplicate_path": duplicate["path"]},
+                )
+                row = self.db.query_one("SELECT * FROM documents WHERE id = ?", (document_id,))
+                assert row is not None
+                return {**self._decode_document(row), "result": "possible-duplicate"}
             destination = (
                 existing["destination_path"]
                 if existing and existing["destination_path"]
@@ -1534,15 +1814,17 @@ class ObsyncService:
     def pending_root_documents(self, agent_id: str, root_id: str) -> list[dict[str, Any]]:
         self.require_pipeline_enabled()
         root = self.db.query_one(
-            "SELECT id FROM roots WHERE id = ? AND agent_id = ? AND enabled = 1",
+            "SELECT id, sync_state FROM roots WHERE id = ? AND agent_id = ? AND enabled = 1",
             (root_id, agent_id),
         )
         if not root:
             raise ValueError("Watched folder is unknown or disabled")
+        if root["sync_state"] != "running":
+            raise PipelinePausedError(f"Folder syncing is {root['sync_state']}")
         return self.db.query_all(
             """
             SELECT id, source_path, comparison_status FROM documents
-            WHERE root_id = ? AND comparison_status != 'in-sync'
+            WHERE root_id = ? AND comparison_status NOT IN ('in-sync', 'possible-duplicate')
             ORDER BY source_path
             """,
             (root_id,),
@@ -1560,6 +1842,39 @@ class ObsyncService:
             "UPDATE documents SET needs_review = 0, updated_at = ? WHERE id = ?",
             (utc_now(), document_id),
         )
+
+    def allow_duplicate(self, document_id: str) -> dict[str, Any]:
+        document = self.db.query_one("SELECT * FROM documents WHERE id = ?", (document_id,))
+        if not document:
+            raise ValueError("Document not found")
+        root = self.db.query_one(
+            "SELECT root_key, sync_state, enabled FROM roots WHERE id = ?",
+            (document["root_id"],),
+        )
+        if not root:
+            raise ValueError("Watched folder not found")
+        self.db.execute(
+            """
+            UPDATE documents SET duplicate_dismissed = 1, comparison_status = 'new',
+                status = 'discovered', needs_review = 0, error = '', updated_at = ? WHERE id = ?
+            """,
+            (utc_now(), document_id),
+        )
+        command = None
+        if self.pipeline_enabled() and root["enabled"] and root["sync_state"] == "running":
+            command = self.queue_command(
+                document["agent_id"],
+                "resync",
+                {"root_key": root["root_key"], "source_path": document["source_path"]},
+            )
+        self.db.add_event(
+            "document.duplicate_allowed",
+            f"Allowed a separate Obsync note for {document['source_path']}",
+            agent_id=document["agent_id"],
+            root_id=document["root_id"],
+            document_id=document_id,
+        )
+        return {"ok": True, "command": command}
 
     def queue_command(
         self, agent_id: str, command: str, payload: dict[str, Any] | None = None
@@ -1657,11 +1972,30 @@ class ObsyncService:
                 if not document:
                     continue
                 comparison = str(row.get("comparison_status", ""))
-                if comparison not in {"in-sync", "modified", "new", "vault-missing"}:
+                if comparison not in {
+                    "in-sync",
+                    "modified",
+                    "new",
+                    "vault-missing",
+                    "possible-duplicate",
+                }:
                     continue
                 destination = str(row.get("destination_path", ""))
                 note_hash = str(row.get("note_hash", ""))
-                values: list[Any] = [comparison, destination[:2000], now]
+                duplicate_path = str(row.get("duplicate_path", ""))[:2000]
+                duplicate_title = str(row.get("duplicate_title", ""))[:200]
+                if document.get("duplicate_dismissed"):
+                    duplicate_path = ""
+                    duplicate_title = ""
+                    if comparison == "possible-duplicate":
+                        comparison = "new"
+                values: list[Any] = [
+                    comparison,
+                    destination[:2000],
+                    duplicate_path,
+                    duplicate_title,
+                    now,
+                ]
                 source_hash_sql = ""
                 if note_hash and not document["source_hash"]:
                     source_hash_sql = ", source_hash = ?, status = 'synced', processed_at = ?"
@@ -1670,10 +2004,17 @@ class ObsyncService:
                 self.db.execute(
                     f"""
                     UPDATE documents SET comparison_status = ?, destination_path = ?,
+                        duplicate_path = ?, duplicate_title = ?,
                         updated_at = ? {source_hash_sql} WHERE id = ?
                     """,
                     values,
                 )
+                if comparison == "possible-duplicate":
+                    self.db.execute(
+                        "UPDATE documents SET status = 'duplicate-review', needs_review = 1 "
+                        "WHERE id = ?",
+                        (audit_document_id,),
+                    )
             self.db.add_event(
                 "vault.audited",
                 f"Compared {len(audit_rows)} files with the desktop Obsidian vault",
@@ -1725,6 +2066,9 @@ class ObsyncService:
             "llm_model": False,
             "llm_api_key": True,
             "llm_timeout_seconds": False,
+            "llm_instructions": False,
+            "llm_vault_context": False,
+            "duplicate_policy": False,
             "review_threshold": False,
         }
         values: dict[str, tuple[str, bool]] = {}
@@ -1738,6 +2082,19 @@ class ObsyncService:
             )
             if not agent or not agent["vault_ready"] or not agent["vault_path"]:
                 raise ValueError("Select a connected computer with an available Obsidian vault")
+            vault_leaf = str(agent["vault_path"]).replace("\\", "/").rstrip("/").split("/")[-1]
+            if vault_leaf.casefold() == ".obsidian":
+                raise ValueError(
+                    "Choose the vault folder itself on that computer, not its hidden "
+                    ".obsidian folder"
+                )
+        if requested_mode == "local" and not self.settings.vault_path.is_dir():
+            raise ValueError("The server-mounted vault folder is unavailable")
+        duplicate_policy = str(payload.get("duplicate_policy", "")).strip()
+        if duplicate_policy and duplicate_policy not in {"review", "allow"}:
+            raise ValueError("Duplicate policy must be review or allow")
+        if "llm_instructions" in payload and len(str(payload["llm_instructions"])) > 8000:
+            raise ValueError("AI instructions must be 8,000 characters or fewer")
         for key, secret in allowed.items():
             if key not in payload:
                 continue
@@ -1748,7 +2105,15 @@ class ObsyncService:
                 value = "true" if value else "false"
             values[key] = (str(value).strip(), secret)
         if values:
+            if requested_mode:
+                values["vault_confirmed"] = ("true", False)
             self.db.set_settings(values)
+            if duplicate_policy == "allow":
+                self.db.execute(
+                    "UPDATE documents SET comparison_status = 'new', needs_review = 0, "
+                    "updated_at = ? WHERE comparison_status = 'possible-duplicate'",
+                    (utc_now(),),
+                )
             self.db.add_event("settings.updated", "Obsync settings were updated")
         return self.settings_for_ui()
 

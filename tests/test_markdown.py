@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from obsync.llm import Analysis
@@ -7,7 +9,11 @@ from obsync.markdown import (
     GENERATED_END,
     GENERATED_START,
     is_managed_note,
+    likely_same_note_title,
     merge_preserving_manual,
+    normalized_note_title,
+    note_title,
+    note_title_from_path,
     render_markdown,
     set_source_status,
 )
@@ -71,3 +77,26 @@ def test_missing_status_can_be_set_and_cleared() -> None:
     assert "obsync_status: active" in restored
     assert "Source file is missing" not in restored
     assert is_managed_note(restored)
+
+
+def test_note_titles_are_read_from_properties_heading_or_filename() -> None:
+    path = Path("Reference/12_laws-and-rules.md")
+    assert note_title("---\ntitle: Plumbing Rules\n---\n# Ignored\n", path) == "Plumbing Rules"
+    assert note_title("---\n: invalid yaml\n---\n# Heading Wins\n", path) == "Heading Wins"
+    assert note_title("No title in this note", path) == "12 laws and rules"
+    assert note_title_from_path(path) == "12 laws and rules"
+
+
+def test_duplicate_title_matching_is_conservative() -> None:
+    assert normalized_note_title("12_Laws & Rules") == "laws and rules"
+    assert likely_same_note_title("Laws and Rules", "12_Laws_and_Rules")
+    assert (
+        likely_same_note_title(
+            "Cape Coral Permit Application Rules",
+            "Cape Coral Permit Application Rule",
+        )
+        is False
+    )
+    assert not likely_same_note_title("Report", "Annual Report")
+    assert not likely_same_note_title("", "Annual Report")
+    assert not likely_same_note_title("Permit Checklist", "Insurance Checklist")

@@ -81,22 +81,22 @@ To install a specific release instead of the newest `main` branch:
 
 ```bash
 git fetch --tags
-git checkout v0.8.0
+git checkout v0.9.0
 docker compose build --pull
 docker compose up -d
 ```
 
-Replace `v0.8.0` with the desired release tag. A tag checkout is intentionally fixed to that release; check out `main` again before using `git pull` for later updates.
+Replace `v0.9.0` with the desired release tag. A tag checkout is intentionally fixed to that release; check out `main` again before using `git pull` for later updates.
 
 ## Update a server using the published Docker image
 
 Pull the desired tag, then recreate the container using the same environment, ports, data volume, and vault mount as the existing deployment:
 
 ```bash
-docker pull ghcr.io/eliautobot/obsync:0.8.0
+docker pull ghcr.io/eliautobot/obsync:0.9.0
 ```
 
-Replace `0.8.0` with the desired version. Prefer a numbered tag for predictable deployments. If your Compose file references the published image, the complete update is:
+Replace `0.9.0` with the desired version. Prefer a numbered tag for predictable deployments. If your Compose file references the published image, the complete update is:
 
 ```bash
 docker compose pull
@@ -114,11 +114,11 @@ The server and desktop agents should normally use the same release. Update the s
 ### Obsync Desktop for Windows
 
 1. In Obsync, open **Sources → Add another computer → Download Obsync Desktop**. Published containers serve the matching executable directly.
-2. Open it as the same Windows user that owns the existing pairing and watched folders.
+2. Right-click it, choose **Run as administrator**, and approve the one-time setup prompt.
 3. Leave the pairing code blank when the existing server address is unchanged, then click **Connect and install**.
 4. Obsync Desktop installs the new version, migrates the legacy Companion task when present, refreshes automatic startup, and starts its built-in watcher in the background.
 
-The versioned executable lives under Local AppData, while pairing, vault, and watched-folder configuration live separately and are preserved. The installer verifies the new `Obsync Desktop` startup task and removes the legacy `Obsync Companion` task.
+The versioned executable lives under Local AppData, while pairing, vault, and watched-folder configuration live separately and are preserved. The installer verifies the new limited `Obsync Desktop` startup task, registers the `obsync://` app link, and removes the legacy `Obsync Companion` task. The background watcher does not remain elevated.
 
 ### Windows standalone command-line agent
 
@@ -141,7 +141,7 @@ Install the matching release tag:
 
 ```bash
 python -m pip install --upgrade \
-  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.8.0"
+  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.9.0"
 obsync --version
 obsync agent scan
 ```

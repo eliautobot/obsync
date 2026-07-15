@@ -40,11 +40,11 @@ Every network connection starts from the agent. No inbound port is required on a
 
 ### Obsync Desktop for Windows
 
-Obsync Desktop packages the watch-agent runtime, pairing, background startup, local watcher controls, and a dashboard shortcut in one windowed app. Published server images serve the matching executable directly. It accepts all setup details through one clipboard paste, pairs with a one-time code, stores device configuration separately from the executable, copies the versioned app into Local AppData, creates and verifies a limited current-user `ONLOGON` task, and starts the background runtime with no console window. Upgrading replaces the legacy `Obsync Companion` startup task without losing pairing, roots, or vault selection. Only one setup window may run at a time; valid pairings are reused for repair. It does not install a Windows service, request elevation, or open an inbound port.
+Obsync Desktop packages the watch-agent runtime, pairing, background startup, local watcher controls, and a dashboard shortcut in one windowed app. Published server images serve the matching executable directly. It accepts all setup details through one clipboard paste, pairs with a one-time code, stores device configuration separately from the executable, copies the versioned app into Local AppData, creates and verifies a limited current-user `ONLOGON` task, registers the per-user `obsync://` app link, and starts the background runtime with no console window. Upgrading replaces the legacy `Obsync Companion` startup task without losing pairing, roots, or vault selection. Only one setup window may run at a time; valid pairings are reused for repair. The setup window requires one-time elevation because some Windows installations reject Task Scheduler registration otherwise. The installed task still runs with limited permissions. Obsync Desktop does not install a Windows service or open an inbound port.
 
 ### Pipeline control
 
-The server stores a durable running/stopped flag and returns it with every desktop heartbeat. While stopped, agents remain connected but skip filesystem work, reconciliation, scans, syncs, and AI-related commands. The server rejects new processing requests, cancels queued work, and cancels active asynchronous extraction/classification tasks. Restarting re-enables work; periodic inventory reconciles changes that occurred while stopped. Configuration and safe folder-removal commands remain available.
+The server stores a durable global running/stopped flag plus an independent running/paused/stopped state for every root. Global Stop cancels queued and active work across all roots. A per-root Pause or Stop cancels only that root while other folders continue. Starting either level queues immediate inventory and pending-work reconciliation rather than waiting for the periodic interval. Configuration and safe folder-removal commands remain available.
 
 ### LLM providers
 
@@ -53,7 +53,7 @@ The server—not each agent—connects to the configured model endpoint. Support
 - Ollama `/api/chat` for classification and `/api/tags` for connection checks
 - OpenAI-compatible `/v1/chat/completions` for classification and `/v1/models` for connection checks, including LM Studio
 
-The server sends extracted text, metadata, and an allowlist of candidate related-note titles. It rejects related links not present in that allowlist.
+The server sends extracted text, metadata, and an optional allowlist of candidate related-note titles. User organization instructions are appended below a protected system prompt and cannot replace its JSON or untrusted-document rules. The model has no Obsidian API access. Obsync itself indexes the selected vault and rejects related links not present in the allowlist.
 
 ## Data flow
 
@@ -62,15 +62,16 @@ The server sends extracted text, metadata, and an allowlist of candidate related
 2. Agent inventories stable files with relative paths, size, modification time, and SHA-256
 3. Server compares the manifest with its ledger and the active Obsidian vault writer
 4. Existing managed notes are adopted by source identity instead of duplicated
-5. UI reports in-sync, modified, new, vault-missing, and source-missing states
-6. Sync uploads only pending source files
-7. Server checks agent token, root ownership, size, hash, and safe path
-8. Extractor produces bounded plain text
-9. LLM returns structured classification, or rules provide fallback
-10. Server chooses/stabilizes destination and renders Markdown
-11. Server merges the preserved manual section
-12. Server writes atomically under `/vault`, or queues the managed note for the selected desktop vault writer
-13. SQLite ledger, comparison state, and event stream are updated
+5. Strong title matches against any Markdown note are held for duplicate review
+6. UI reports in-sync, modified, new, possible-duplicate, vault-missing, and source-missing states
+7. Sync uploads only pending source files
+8. Server checks agent token, root ownership, size, hash, and safe path
+9. Extractor produces bounded plain text
+10. LLM returns structured classification, or rules provide fallback
+11. Server chooses/stabilizes destination and renders Markdown
+12. Server merges the preserved manual section
+13. Server writes atomically under `/vault`, or queues the managed note for the selected desktop vault writer
+14. SQLite ledger, comparison state, and event stream are updated
 ```
 
 At any processing boundary, the global Stop control can cancel the operation before a vault write. Cancelled documents remain pending/paused and are eligible for reconciliation after Start.

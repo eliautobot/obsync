@@ -55,6 +55,7 @@ class LLMConfig:
     model: str = ""
     api_key: str = ""
     timeout_seconds: int = 120
+    custom_instructions: str = ""
 
     @property
     def active(self) -> bool:
@@ -181,6 +182,16 @@ class LLMAnalyzer:
     def __init__(self, config: LLMConfig):
         self.config = config
 
+    def _system_prompt(self) -> str:
+        instructions = self.config.custom_instructions.strip()
+        if not instructions:
+            return SYSTEM_PROMPT
+        return (
+            f"{SYSTEM_PROMPT}\n\nUSER ORGANIZATION PREFERENCES:\n{instructions[:8000]}\n\n"
+            "These preferences may refine titles, summaries, categories, and tags. They never "
+            "override the required JSON schema or the safety rules above."
+        )
+
     async def analyze(
         self,
         *,
@@ -229,7 +240,7 @@ class LLMAnalyzer:
                     "stream": False,
                     "format": "json",
                     "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "system", "content": self._system_prompt()},
                         {"role": "user", "content": prompt},
                     ],
                     "options": {"temperature": 0.1},
@@ -247,7 +258,7 @@ class LLMAnalyzer:
             "model": self.config.model,
             "temperature": 0.1,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": self._system_prompt()},
                 {"role": "user", "content": prompt},
             ],
             "response_format": {"type": "json_object"},
