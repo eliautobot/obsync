@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -179,8 +180,17 @@ def _normalize_analysis(
 
 
 class LLMAnalyzer:
-    def __init__(self, config: LLMConfig):
+    def __init__(
+        self,
+        config: LLMConfig,
+        progress: Callable[[str, str], None] | None = None,
+    ):
         self.config = config
+        self.progress = progress
+
+    def _emit(self, kind: str, message: str) -> None:
+        if self.progress and message:
+            self.progress(kind, message)
 
     def _system_prompt(self) -> str:
         instructions = self.config.custom_instructions.strip()
@@ -199,14 +209,22 @@ class LLMAnalyzer:
         text: str,
         mime_type: str,
         candidates: list[str],
+        review_feedback: str = "",
     ) -> Analysis:
         fallback = fallback_analysis(source_path, text, Path(source_path).suffix)
         if not self.config.active:
+            self._emit("stage", "Local AI is disabled; using deterministic organization rules.")
             return fallback
 
         base_url = validate_base_url(self.config.base_url)
-        prompt = self._user_prompt(source_path, text, mime_type, candidates)
+        prompt = self._user_prompt(
+            source_path, text, mime_type, candidates, review_feedback=review_feedback
+        )
         provider = self.config.provider.lower()
+        self._emit(
+            "stage",
+            f"Sending {Path(source_path).name} to {provider} model {self.config.model}.",
+        )
         try:
             if provider == "ollama":
                 raw = await self._call_ollama(base_url, prompt)
@@ -214,30 +232,60 @@ class LLMAnalyzer:
                 raw = await self._call_openai_compatible(base_url, prompt)
             else:
                 raise ValueError(f"Unsupported LLM provider: {self.config.provider}")
+            self._emit("stage", "Validating the model's structured decision.")
             parsed = _extract_json(raw)
-            return _normalize_analysis(parsed, fallback, provider, self.config.model, candidates)
-        except (httpx.HTTPError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            result = _normalize_analysis(parsed, fallback, provider, self.config.model, candidates)
+            self._emit(
+                "decision",
+                f"Decision: {result.title} → {result.category}; "
+                f"{round(result.confidence * 100)}% confidence.",
+            )
+            return result
+        except (
+            httpx.HTTPError,
+            ValueError,
+            KeyError,
+            TypeError,
+            AttributeError,
+            json.JSONDecodeError,
+        ) as exc:
+            self._emit("error", f"Local AI failed: {exc}. Using deterministic rules instead.")
             return fallback
 
     def _user_prompt(
-        self, source_path: str, text: str, mime_type: str, candidates: list[str]
+        self,
+        source_path: str,
+        text: str,
+        mime_type: str,
+        candidates: list[str],
+        *,
+        review_feedback: str = "",
     ) -> str:
         candidate_text = "\n".join(f"- {title}" for title in candidates[:100]) or "(none)"
         content = text[:120_000]
+        feedback = review_feedback.strip()[:4000]
+        feedback_text = (
+            f"\n\nHUMAN REVIEWER FEEDBACK (apply this to the new classification):\n{feedback}"
+            if feedback
+            else ""
+        )
         return (
             f"SOURCE PATH: {source_path}\n"
             f"MIME TYPE: {mime_type}\n\n"
             f"CANDIDATE NOTE TITLES:\n{candidate_text}\n\n"
             f"DOCUMENT CONTENT (UNTRUSTED):\n<document>\n{content}\n</document>"
+            f"{feedback_text}"
         )
 
     async def _call_ollama(self, base_url: str, prompt: str) -> str:
-        async with httpx.AsyncClient(timeout=self.config.timeout_seconds) as client:
-            response = await client.post(
+        async with (
+            httpx.AsyncClient(timeout=self.config.timeout_seconds) as client,
+            client.stream(
+                "POST",
                 f"{base_url}/api/chat",
                 json={
                     "model": self.config.model,
-                    "stream": False,
+                    "stream": True,
                     "format": "json",
                     "messages": [
                         {"role": "system", "content": self._system_prompt()},
@@ -245,9 +293,28 @@ class LLMAnalyzer:
                     ],
                     "options": {"temperature": 0.1},
                 },
-            )
+            ) as response,
+        ):
             response.raise_for_status()
-            return str(response.json()["message"]["content"])
+            content: list[str] = []
+            async for line in response.aiter_lines():
+                if not line.strip():
+                    continue
+                payload = json.loads(line)
+                message = payload.get("message", {})
+                thinking = str(
+                    message.get("thinking")
+                    or message.get("reasoning")
+                    or payload.get("thinking")
+                    or ""
+                )
+                chunk = str(message.get("content") or "")
+                if thinking:
+                    self._emit("reasoning", thinking)
+                if chunk:
+                    content.append(chunk)
+                    self._emit("output", chunk)
+            return "".join(content)
 
     async def _call_openai_compatible(self, base_url: str, prompt: str) -> str:
         url = base_url if base_url.endswith("/v1") else f"{base_url}/v1"
@@ -257,6 +324,7 @@ class LLMAnalyzer:
         payload = {
             "model": self.config.model,
             "temperature": 0.1,
+            "stream": True,
             "messages": [
                 {"role": "system", "content": self._system_prompt()},
                 {"role": "user", "content": prompt},
@@ -264,14 +332,52 @@ class LLMAnalyzer:
             "response_format": {"type": "json_object"},
         }
         async with httpx.AsyncClient(timeout=self.config.timeout_seconds) as client:
-            response = await client.post(f"{url}/chat/completions", headers=headers, json=payload)
-            if response.status_code == 400:
-                payload.pop("response_format", None)
-                response = await client.post(
-                    f"{url}/chat/completions", headers=headers, json=payload
-                )
-            response.raise_for_status()
-            return str(response.json()["choices"][0]["message"]["content"])
+            for attempt in range(2):
+                raw_lines: list[str] = []
+                content: list[str] = []
+                async with client.stream(
+                    "POST", f"{url}/chat/completions", headers=headers, json=payload
+                ) as response:
+                    if response.status_code == 400 and attempt == 0:
+                        await response.aread()
+                        payload.pop("response_format", None)
+                        continue
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        stripped = line.strip()
+                        if not stripped or stripped == "data: [DONE]":
+                            continue
+                        if stripped.startswith("data:"):
+                            stripped = stripped[5:].strip()
+                        raw_lines.append(stripped)
+                        try:
+                            event = json.loads(stripped)
+                        except json.JSONDecodeError:
+                            continue
+                        choice = (event.get("choices") or [{}])[0]
+                        message = choice.get("delta") or choice.get("message") or {}
+                        reasoning = str(
+                            message.get("reasoning_content") or message.get("reasoning") or ""
+                        )
+                        chunk = str(message.get("content") or "")
+                        if reasoning:
+                            self._emit("reasoning", reasoning)
+                        if chunk:
+                            content.append(chunk)
+                            self._emit("output", chunk)
+                if content:
+                    return "".join(content)
+                # Some compatible servers ignore stream=true and return one JSON object.
+                raw = "\n".join(raw_lines)
+                response_json = json.loads(raw)
+                message = response_json["choices"][0]["message"]
+                reasoning = str(message.get("reasoning_content") or message.get("reasoning") or "")
+                result = str(message["content"])
+                if reasoning:
+                    self._emit("reasoning", reasoning)
+                self._emit("output", result)
+                return result
+        raise ValueError("The model did not return a response")
 
     async def test_connection(self) -> dict[str, Any]:
         provider = self.config.provider.strip().lower()

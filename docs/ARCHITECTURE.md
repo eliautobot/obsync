@@ -14,7 +14,7 @@ The server is the control plane and authoritative processing ledger. It provides
 - Format-specific extraction
 - Optional local-LLM classification
 - Atomic local generated-note writes or authenticated remote write commands
-- Review queue, event history, and remote command queue
+- Review queue, bounded live processing activity, event history, and remote command queue
 
 The Docker container receives two persistent mounts in server-mounted mode:
 
@@ -55,6 +55,8 @@ The server—not each agent—connects to the configured model endpoint. Support
 
 The server sends extracted text, metadata, and an optional allowlist of candidate related-note titles. User organization instructions are appended below a protected system prompt and cannot replace its JSON or untrusted-document rules. The model has no Obsidian API access. Obsync itself indexes the selected vault and rejects related links not present in the allowlist.
 
+Classification requests use streaming responses when the provider supports them. Obsync exposes the current file, pipeline stages, model-emitted reasoning/output fields, and decision in a read-only live view. This trace is bounded in memory and is not persisted as a chat transcript. An administrator can cancel an individual inference without stopping the global pipeline; the source file remains untouched and the document moves to Review.
+
 ## Data flow
 
 ```text
@@ -67,14 +69,16 @@ The server sends extracted text, metadata, and an optional allowlist of candidat
 7. Sync uploads only pending source files
 8. Server checks agent token, root ownership, size, hash, and safe path
 9. Extractor produces bounded plain text
-10. LLM returns structured classification, or rules provide fallback
+10. LLM streams visible activity and returns structured classification, or rules provide fallback
 11. Server chooses/stabilizes destination and renders Markdown
 12. Server merges the preserved manual section
 13. Server writes atomically under `/vault`, or queues the managed note for the selected desktop vault writer
 14. SQLite ledger, comparison state, and event stream are updated
 ```
 
-At any processing boundary, the global Stop control can cancel the operation before a vault write. Cancelled documents remain pending/paused and are eligible for reconciliation after Start.
+At any processing boundary, the global Stop control can cancel the operation before a vault write. Cancelled documents remain pending/paused and are eligible for reconciliation after Start. The narrower **Stop inference** action cancels only one active model request and routes that document to Review while Global Sync remains enabled.
+
+Review decisions are explicit. Approve accepts the current classification or existing duplicate match, Disregard creates no new note, never deletes an existing one, and remains ignored across ordinary rescans, Redo AI review forces an unchanged source through classification again with optional one-run reviewer feedback, and Create separate note overrides a possible-duplicate hold.
 
 ## Identity and idempotency
 
@@ -91,6 +95,7 @@ Obsync replaces the properties and generated region. Text following `## My notes
 - Agent offline: changes remain on disk and the next rescan finds them.
 - Server offline: agent requests fail, local ledger remains unchanged, and later scans retry.
 - LLM offline/malformed: rule-based analysis completes the note and usually sends it to review.
+- LLM stopped by user: that inference is cancelled, its document enters Review, and other synchronization remains active.
 - Process crash during write: atomic replace leaves either the old complete note or the new complete note.
 - Filesystem event missed: periodic full reconciliation repairs state.
 - Source removed: note is retained and marked `source-missing`.

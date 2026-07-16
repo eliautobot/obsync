@@ -13,7 +13,31 @@ const state = {
   documentsQuery: { search: "", comparison: "" },
   liveTimer: null,
   liveRefreshing: false,
+  liveSignature: "",
 };
+
+function captureScrollState() {
+  const panels = {};
+  $$('[data-preserve-scroll="true"]').forEach((element, index) => {
+    const key = element.dataset.scrollKey || String(index);
+    panels[key] = { top: element.scrollTop, left: element.scrollLeft };
+  });
+  return { windowY: window.scrollY, panels };
+}
+
+function restoreScrollState(snapshot) {
+  if (!snapshot) return;
+  requestAnimationFrame(() => {
+    window.scrollTo({ top: snapshot.windowY, left: 0, behavior: "auto" });
+    $$('[data-preserve-scroll="true"]').forEach((element, index) => {
+      const saved = snapshot.panels[element.dataset.scrollKey || String(index)];
+      if (saved) {
+        element.scrollTop = saved.top;
+        element.scrollLeft = saved.left;
+      }
+    });
+  });
+}
 
 function cookie(name) {
   const prefix = `${encodeURIComponent(name)}=`;
@@ -203,7 +227,7 @@ async function openAccountSettings() {
       <p class="form-error" id="account-error" role="alert"></p>
       <div class="modal-actions"><button class="secondary" type="button" id="account-cancel">Cancel</button><button class="primary" type="submit">Save changes</button></div>
     </form>`;
-  modal.showModal();
+  if (!modal.open) modal.showModal();
   $("#account-cancel").addEventListener("click", () => modal.close());
   $("#account-form").addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -248,7 +272,7 @@ async function openSecuritySetup() {
       <p class="form-error" id="secure-admin-error" role="alert"></p>
       <div class="modal-actions"><button class="secondary" id="continue-temporary" type="button">Continue for now</button><button class="primary" type="submit">Secure account</button></div>
     </form>`;
-  modal.showModal();
+  if (!modal.open) modal.showModal();
   $("#continue-temporary").addEventListener("click", () => modal.close());
   $("#secure-admin-form").addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -302,6 +326,18 @@ function updateShellStatus(data) {
   $("#vault-badge").hidden = !vaultMissing;
 }
 
+function overviewSignature(data) {
+  return JSON.stringify({
+    stats: data.stats,
+    pipeline: data.pipeline,
+    vault: [data.vault?.configured, data.vault?.writable, data.vault?.path],
+    event: data.recent_events?.[0]?.id || 0,
+    active: (data.active_work || []).map((item) => [
+      item.document_id, item.phase, item.updated_at, item.outcome,
+    ]),
+  });
+}
+
 async function liveRefresh() {
   if (state.liveRefreshing || !state.session || document.hidden || $("#modal").open) return;
   const active = document.activeElement;
@@ -309,8 +345,13 @@ async function liveRefresh() {
   state.liveRefreshing = true;
   try {
     const overview = await api("/api/v1/admin/overview");
+    const signature = overviewSignature(overview);
+    const changed = signature !== state.liveSignature;
+    state.liveSignature = signature;
     updateShellStatus(overview);
-    if (["overview", "sources", "documents", "review", "settings"].includes(state.view)) {
+    if (state.view === "local-ai") {
+      await refreshAiActivity();
+    } else if (changed && ["overview", "sources", "documents", "review", "settings"].includes(state.view)) {
       await navigate(state.view, { silent: true });
     }
   } catch (_error) {
@@ -407,6 +448,7 @@ function loading() {
 }
 
 async function navigate(view, { silent = false } = {}) {
+  const scrollState = silent ? captureScrollState() : null;
   state.view = view;
   const [title, subtitle] = viewMeta[view];
   $("#page-title").textContent = title;
@@ -424,6 +466,7 @@ async function navigate(view, { silent = false } = {}) {
     if (view === "review") await renderDocuments(true);
     if (view === "settings") await renderSettings();
     if (view === "help") await renderHelp();
+    restoreScrollState(scrollState);
   } catch (error) {
     $("#content").innerHTML = `<div class="empty"><div class="empty-icon">!</div><p>${escapeHtml(error.message)}</p><button class="secondary" id="try-again">Try again</button></div>`;
     $("#try-again")?.addEventListener("click", () => navigate(view));
@@ -441,6 +484,7 @@ const comparisonMeta = {
   "vault-missing": ["Missing from Obsidian", "bad"],
   "source-missing": ["Source missing", "bad"],
   "possible-duplicate": ["Possible duplicate", "warn"],
+  ignored: ["Disregarded", "neutral"],
   checking: ["Checking vault", "neutral"],
 };
 
@@ -583,13 +627,20 @@ async function openRootFiles(root) {
   modal.showModal();
   try {
     const data = await api(`/api/v1/admin/documents?root_id=${encodeURIComponent(root.id)}&limit=500`);
+    const byId = new Map(data.items.map((item) => [item.id, item]));
     const rows = data.items.map((doc) => `<div class="inventory-file">
       ${comparisonBadge(doc.comparison_status)}
       <div><strong>${escapeHtml(doc.source_name)}</strong><small title="${escapeHtml(doc.source_path)}">${escapeHtml(doc.source_path)}</small>${doc.duplicate_path ? `<small class="duplicate-match">Possible existing note: ${escapeHtml(doc.duplicate_title || doc.duplicate_path)} · ${escapeHtml(doc.duplicate_path)}</small>` : ""}</div>
-      ${doc.comparison_status === "possible-duplicate" ? `<button class="secondary allow-duplicate" data-id="${doc.id}">Create separate note</button>` : ""}
+      ${doc.needs_review ? `<div class="document-actions inventory-actions">${doc.status === "ai-stopped" ? "" : `<button class="secondary approve" data-id="${doc.id}">Approve</button>`}<button class="quiet redo-review" data-id="${doc.id}">Redo AI review</button><button class="danger disregard-review" data-id="${doc.id}">Disregard</button>${doc.comparison_status === "possible-duplicate" ? `<button class="quiet allow-duplicate" data-id="${doc.id}">Create separate note</button>` : ""}</div>` : ""}
     </div>`).join("");
-    $("#modal-body").innerHTML = `${rows || '<div class="empty">No files found in the latest scan.</div>'}
+    $("#modal-body").innerHTML = `<div class="inventory-scroll" data-preserve-scroll="true" data-scroll-key="folder-inventory">${rows || '<div class="empty">No files found in the latest scan.</div>'}</div>
       <div class="status-legend">${comparisonBadge("in-sync")}${comparisonBadge("modified")}${comparisonBadge("new")}${comparisonBadge("vault-missing")}</div>`;
+    const reload = async () => { modal.close(); await openRootFiles(root); await refreshReviewBadge(); };
+    $$(".approve", $("#modal-body")).forEach((button) => button.addEventListener("click", async () => {
+      await api(`/api/v1/admin/documents/${button.dataset.id}/approve`, { method: "POST" }); toast("Review approved."); await reload();
+    }));
+    $$(".disregard-review", $("#modal-body")).forEach((button) => button.addEventListener("click", () => openDisregardReview(byId.get(button.dataset.id), async () => openRootFiles(root))));
+    $$(".redo-review", $("#modal-body")).forEach((button) => button.addEventListener("click", () => openRedoReview(byId.get(button.dataset.id), async () => openRootFiles(root))));
     $$(".allow-duplicate", $("#modal-body")).forEach((button) => button.addEventListener("click", async () => {
       button.disabled = true;
       try {
@@ -607,6 +658,7 @@ async function openRootFiles(root) {
 async function renderOverview() {
   const data = await api("/api/v1/admin/overview");
   state.overview = data;
+  state.liveSignature = overviewSignature(data);
   updateShellStatus(data);
   const stats = data.stats;
   $("#review-badge").hidden = !stats.review;
@@ -614,6 +666,13 @@ async function renderOverview() {
   const events = data.recent_events.map((event) => `
     <li class="event ${escapeHtml(event.level)}"><i class="event-dot"></i><p>${escapeHtml(event.message)}</p><small>${relativeTime(event.created_at)}</small></li>
   `).join("") || '<li class="empty">No activity yet.</li>';
+  const activeRows = (data.active_work || []).map((work) => `
+    <div class="active-work-row">
+      <span class="activity-spinner" aria-hidden="true"></span>
+      <div><strong>${escapeHtml(work.source_name)}</strong><small title="${escapeHtml(work.source_path)}">${escapeHtml(work.agent_name)} · ${escapeHtml(work.root_name)} · ${escapeHtml(work.source_path)}</small></div>
+      <div class="active-work-stage"><span>${escapeHtml(work.phase_label || work.phase)}</span><small>${work.elapsed_seconds || 0}s</small></div>
+    </div>
+  `).join("") || '<div class="active-work-empty"><span>✓</span><div><strong>No file is active</strong><small>Obsync is waiting for the next source change or manual sync.</small></div></div>';
   $("#content").innerHTML = `
     ${data.vault.configured === false ? '<div class="pipeline-banner vault-required"><div><strong>Choose your Obsidian Vault before syncing</strong><p>Obsync will not write anything until you confirm the destination in the Obsidian Vault tab.</p></div><button class="primary" data-go="vault">Choose vault</button></div>' : ""}
     ${data.pipeline.enabled ? "" : '<div class="pipeline-banner"><div><strong>Global sync is stopped</strong><p>All folder watching, scans, syncs, and AI classification are paused. Source files and existing notes are unchanged.</p></div></div>'}
@@ -623,10 +682,11 @@ async function renderOverview() {
       ${statCard("Needs review", stats.review, "◇", stats.review ? "warn" : "", "Documents whose automated classification confidence is below your review threshold.")}
       ${statCard("Errors", stats.errors, "!", stats.errors ? "bad" : "", "Documents that could not be extracted, classified, compared, or written.")}
     </div>
+    <section class="panel active-work-panel"><div class="panel-head"><h3>${headingWithHelp("Current active file", "The exact source file Obsync is extracting, reviewing with Local AI, checking, or writing right now.")}</h3><span class="active-count">${(data.active_work || []).length ? `${data.active_work.length} active` : "Idle"}</span></div><div class="panel-scroll active-work-list" data-preserve-scroll="true" data-scroll-key="overview-active">${activeRows}</div></section>
     <div class="grid-two">
-      <section class="panel"><div class="panel-head"><h3>${headingWithHelp("Recent activity", "The latest scans, syncs, warnings, and connection events.")}</h3><button class="quiet" data-go="documents" title="Open the complete document list">View all</button></div><ul class="event-list">${events}</ul></section>
+      <section class="panel"><div class="panel-head"><h3>${headingWithHelp("Recent activity", "The latest scans, syncs, warnings, and connection events.")}</h3><button class="quiet" data-go="documents" title="Open the complete document list">View all</button></div><ul class="event-list panel-scroll" data-preserve-scroll="true" data-scroll-key="overview-events">${events}</ul></section>
       <section class="panel"><div class="panel-head"><h3>${headingWithHelp("System", "A quick check of the active vault, watched folders, and missing sources.")}</h3></div>
-        <div class="event-list">
+        <div class="event-list panel-scroll" data-preserve-scroll="true" data-scroll-key="overview-system">
           <div class="event"><i class="event-dot"></i><p>Obsidian vault<br><small>${escapeHtml(data.vault.path)}</small></p><small>${data.vault.writable ? "Ready" : "Unavailable"}</small></div>
           <div class="event"><i class="event-dot"></i><p>Watched folders</p><small>${stats.roots}</small></div>
           <div class="event"><i class="event-dot"></i><p>Missing sources</p><small>${stats.missing}</small></div>
@@ -805,6 +865,37 @@ function statusClass(status) {
   return ["error", "processing"].includes(status) ? status : "";
 }
 
+function openDisregardReview(documentItem, onComplete) {
+  const modal = $("#modal");
+  $("#modal-title").textContent = "Disregard this file";
+  $("#modal-body").innerHTML = `<div class="warning-box"><strong>${escapeHtml(documentItem.title || documentItem.source_name)}</strong><p>Obsync will keep the source file unchanged, create no new note, never delete an existing managed note, and remove this item from Review. You can still request a new AI review later from Documents.</p></div><div class="modal-actions"><button class="secondary" id="disregard-cancel" type="button">Cancel</button><button class="danger" id="disregard-confirm" type="button">Disregard file</button></div>`;
+  if (!modal.open) modal.showModal();
+  $("#disregard-cancel").addEventListener("click", () => modal.close());
+  $("#disregard-confirm").addEventListener("click", async () => {
+    const button = $("#disregard-confirm"); button.disabled = true;
+    try {
+      await api(`/api/v1/admin/documents/${documentItem.id}/disregard`, { method: "POST" });
+      modal.close(); toast("File disregarded. No note will be created."); await onComplete();
+    } catch (error) { toast(error.message, true); button.disabled = false; }
+  });
+}
+
+function openRedoReview(documentItem, onComplete) {
+  const modal = $("#modal");
+  $("#modal-title").textContent = "Redo AI review";
+  $("#modal-body").innerHTML = `<p class="modal-note">Local AI will re-read <strong>${escapeHtml(documentItem.source_name)}</strong> from the source computer. Add specific corrections such as the category, title style, or tag the model should use.</p><form id="redo-review-form"><div class="field">${labelWithHelp("review-feedback", "Notes for the AI (optional)", "Your feedback is added to this one re-review and stored with the document for audit history.")}<textarea id="review-feedback" rows="6" maxlength="4000" placeholder="Example: Use the tag permit-renewal instead of permit, and categorize this under Licenses.">${escapeHtml(documentItem.review_feedback || "")}</textarea><small>Up to 4,000 characters. The protected safety and JSON rules still apply.</small></div><div class="modal-actions"><button class="secondary" id="redo-cancel" type="button">Cancel</button><button class="primary" type="submit">Run AI review again</button></div></form>`;
+  if (!modal.open) modal.showModal();
+  $("#redo-cancel").addEventListener("click", () => modal.close());
+  $("#redo-review-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const button = $('#redo-review-form button[type="submit"]'); button.disabled = true; button.textContent = "Queueing…";
+    try {
+      await api(`/api/v1/admin/documents/${documentItem.id}/redo-review`, { method: "POST", body: { feedback: $("#review-feedback").value.trim() } });
+      modal.close(); toast("New AI review queued. Open Local AI to watch it live."); await onComplete();
+    } catch (error) { toast(error.message, true); button.disabled = false; button.textContent = "Run AI review again"; }
+  });
+}
+
 async function renderDocuments(reviewOnly) {
   const title = reviewOnly ? "Review queue" : "Knowledge documents";
   const titleHelp = reviewOnly
@@ -817,20 +908,24 @@ async function renderDocuments(reviewOnly) {
     const query = new URLSearchParams({ search: $("#doc-search").value, comparison_status: $("#doc-status").value, limit: "200" });
     if (reviewOnly) query.set("review", "true");
     const data = await api(`/api/v1/admin/documents?${query}`);
-    const rows = data.items.map((doc) => `<tr>
-      <td><div class="doc-title">${escapeHtml(doc.title || doc.source_name)}</div><div class="doc-path" title="${escapeHtml(doc.source_path)}">${escapeHtml(doc.source_path)}</div></td>
-      <td>${escapeHtml(doc.agent_name)}<br><small>${escapeHtml(doc.root_name)}</small></td>
-      <td>${(doc.tags || []).slice(0, 4).map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join("")}</td>
-      <td>${comparisonBadge(doc.comparison_status)}<br><small>${escapeHtml(doc.status)}</small></td>
-      <td>${Math.round((doc.confidence || 0) * 100)}%</td>
-      <td>${doc.comparison_status === "possible-duplicate" ? `<small class="duplicate-match">Matches ${escapeHtml(doc.duplicate_title || doc.duplicate_path)}</small><button class="secondary allow-duplicate" data-id="${doc.id}">Create separate note</button>` : reviewOnly ? `<button class="quiet approve" data-id="${doc.id}">Approve</button>` : ""}${doc.status === "error" ? `<button class="quiet retry" data-id="${doc.id}">Retry</button>` : ""}</td>
-    </tr>`).join("");
-    $("#doc-results").innerHTML = rows ? `<div class="table-wrap"><table><thead><tr><th>${headingWithHelp("Document", "The generated title and original file path.")}</th><th>${headingWithHelp("Source", "The paired computer and watched folder containing the original file.")}</th><th>${headingWithHelp("Tags", "Keywords assigned by the local model or deterministic fallback.")}</th><th>${headingWithHelp("State", "The current comparison between the source file and its managed Obsidian note.")}</th><th>${headingWithHelp("Confidence", "How confident Obsync is in the assigned classification. Items below the threshold enter Review.")}</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>` : '<div class="panel empty"><div class="empty-icon">◇</div><p>Nothing here.</p></div>';
+    const byId = new Map(data.items.map((item) => [item.id, item]));
+    const rows = data.items.map((doc) => {
+      const reviewActions = reviewOnly ? `<div class="document-actions">${doc.status === "ai-stopped" ? "" : `<button class="secondary approve" data-id="${doc.id}" title="${doc.comparison_status === "possible-duplicate" ? "Accept the possible duplicate match and create no separate note" : "Accept the current AI organization"}">Approve</button>`}<button class="quiet redo-review" data-id="${doc.id}">Redo AI review</button><button class="danger disregard-review" data-id="${doc.id}">Disregard</button>${doc.comparison_status === "possible-duplicate" ? `<button class="quiet allow-duplicate" data-id="${doc.id}">Create separate note</button>` : ""}</div>` : "";
+      return `<tr>
+        <td data-label="Document"><div class="doc-title">${escapeHtml(doc.title || doc.source_name)}</div><div class="doc-path" title="${escapeHtml(doc.source_path)}">${escapeHtml(doc.source_path)}</div>${doc.summary ? `<div class="doc-summary">${escapeHtml(doc.summary)}</div>` : ""}</td>
+        <td data-label="Source"><strong>${escapeHtml(doc.agent_name)}</strong><small>${escapeHtml(doc.root_name)}</small><div class="doc-tags">${(doc.tags || []).slice(0, 4).map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join("")}</div></td>
+        <td data-label="State">${comparisonBadge(doc.comparison_status)}<small>${escapeHtml(doc.status)} · ${Math.round((doc.confidence || 0) * 100)}% confidence</small>${doc.duplicate_path ? `<small class="duplicate-match">Possible match: ${escapeHtml(doc.duplicate_title || doc.duplicate_path)}</small>` : ""}</td>
+        <td data-label="Actions">${reviewActions}${doc.status === "error" ? `<button class="quiet retry" data-id="${doc.id}">Retry sync</button>` : ""}${doc.status === "ignored" && !reviewOnly ? `<button class="quiet redo-review" data-id="${doc.id}">Redo AI review</button>` : ""}</td>
+      </tr>`;
+    }).join("");
+    $("#doc-results").innerHTML = rows ? `<div class="table-wrap document-table-panel" data-preserve-scroll="true" data-scroll-key="documents-table"><table class="document-table"><colgroup><col class="document-column"><col class="source-column"><col class="state-column"><col class="actions-column"></colgroup><thead><tr><th>${headingWithHelp("Document", "The generated title, original path, and summary.")}</th><th>${headingWithHelp("Source and tags", "The source computer, watched folder, and assigned tags.")}</th><th>${headingWithHelp("State", "The source-to-vault comparison, processing state, confidence, and possible match.")}</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<div class="panel empty"><div class="empty-icon">◇</div><p>Nothing here.</p></div>';
     $$(".approve").forEach((button) => button.addEventListener("click", async () => {
       await api(`/api/v1/admin/documents/${button.dataset.id}/approve`, { method: "POST" });
       toast("Classification approved.");
       await Promise.all([load(), refreshReviewBadge()]);
     }));
+    $$(".disregard-review").forEach((button) => button.addEventListener("click", () => openDisregardReview(byId.get(button.dataset.id), async () => Promise.all([load(), refreshReviewBadge()]))));
+    $$(".redo-review").forEach((button) => button.addEventListener("click", () => openRedoReview(byId.get(button.dataset.id), async () => Promise.all([load(), refreshReviewBadge()]))));
     $$(".retry").forEach((button) => button.addEventListener("click", async () => {
       await api(`/api/v1/admin/documents/${button.dataset.id}/retry`, { method: "POST" }); toast("Retry queued on the source device.");
     }));
@@ -1007,10 +1102,52 @@ async function renderVault() {
   });
 }
 
+function aiActivityMarkup(activity) {
+  const sessions = activity.active?.length ? activity.active : activity.last ? [activity.last] : [];
+  if (!sessions.length) {
+    return `<section class="settings-card ai-live-card"><div class="ai-live-head"><div><span class="eyebrow">LIVE AI SESSION</span><h3>Local AI is idle</h3></div><span class="status-pill offline">idle</span></div><div class="ai-idle"><span>✦</span><p>No model inference is active. Start a folder sync or request a re-review to see the file, model activity, streamed response, and decision here.</p></div></section>`;
+  }
+  return sessions.map((session) => {
+    const isActive = Boolean((activity.active || []).find((item) => item.document_id === session.document_id));
+    const events = (session.events || []).map((event) => `<div class="ai-trace-event ${escapeHtml(event.kind)}"><span>${escapeHtml(event.kind === "reasoning" ? "MODEL THINKING" : event.kind === "output" ? "MODEL OUTPUT" : event.kind.toUpperCase())}</span><pre>${escapeHtml(event.message)}</pre></div>`).join("") || '<div class="ai-trace-event stage"><span>STAGE</span><pre>Waiting for model activity…</pre></div>';
+    return `<section class="settings-card ai-live-card ${isActive ? "active" : "completed"}">
+      <div class="ai-live-head"><div><span class="eyebrow">${isActive ? "LIVE AI SESSION" : "LAST AI SESSION"}</span><h3>${escapeHtml(session.source_name)}</h3><p title="${escapeHtml(session.source_path)}">${escapeHtml(session.agent_name)} · ${escapeHtml(session.root_name)} · ${escapeHtml(session.source_path)}</p></div><span class="status-pill ${isActive ? "" : "offline"}">${isActive ? "working" : escapeHtml(session.outcome || "finished")}</span></div>
+      <div class="ai-session-meta"><div><small>Stage</small><strong>${escapeHtml(session.phase_label || session.phase || "Finished")}</strong></div><div><small>Model</small><strong>${escapeHtml(session.provider || activity.provider)}${session.model || activity.model ? ` · ${escapeHtml(session.model || activity.model)}` : ""}</strong></div><div><small>Elapsed</small><strong>${session.elapsed_seconds || 0}s</strong></div></div>
+      <div class="ai-trace" data-preserve-scroll="true" data-scroll-key="ai-trace-${escapeHtml(session.document_id)}" aria-live="polite">${events}</div>
+      <div class="ai-live-actions"><small>This is a read-only view of model-emitted activity and Obsync's processing stages.</small>${isActive && session.cancellable ? `<button class="danger stop-inference" type="button" data-document="${escapeHtml(session.document_id)}">Stop inference</button>` : ""}</div>
+    </section>`;
+  }).join("");
+}
+
+function wireAiActivityControls() {
+  $$(".stop-inference").forEach((button) => button.addEventListener("click", async () => {
+    button.disabled = true;
+    button.textContent = "Stopping…";
+    try {
+      const result = await api("/api/v1/admin/ai/stop", { method: "POST", body: { document_id: button.dataset.document } });
+      toast(result.stopped ? "AI inference stop requested. The file was moved to Review." : "That inference already finished.");
+      await refreshAiActivity();
+      await refreshReviewBadge();
+    } catch (error) { toast(error.message, true); button.disabled = false; button.textContent = "Stop inference"; }
+  }));
+}
+
+async function refreshAiActivity() {
+  const host = $("#ai-live-host");
+  if (!host) return;
+  const scrollState = captureScrollState();
+  const activity = await api("/api/v1/admin/ai/activity");
+  host.innerHTML = aiActivityMarkup(activity);
+  wireAiActivityControls();
+  restoreScrollState(scrollState);
+}
+
 async function renderLocalAI() {
-  const settings = await api("/api/v1/admin/settings");
+  const [settings, activity] = await Promise.all([
+    api("/api/v1/admin/settings"), api("/api/v1/admin/ai/activity"),
+  ]);
   const enabled = settings.llm_enabled === "true";
-  $("#content").innerHTML = `<form class="settings-layout" id="ai-settings-form">
+  $("#content").innerHTML = `<div class="settings-layout"><div id="ai-live-host">${aiActivityMarkup(activity)}</div><form class="settings-layout" id="ai-settings-form">
     <section class="settings-card"><h3>${headingWithHelp("Local AI connection", "Optional local classification through Ollama, LM Studio, or another OpenAI-compatible server.")}</h3>
       <div class="field-grid">
         <label class="check-row full-width"><input id="llm-enabled" type="checkbox" ${enabled ? "checked" : ""}> Enable Local AI organization</label>
@@ -1033,7 +1170,8 @@ async function renderLocalAI() {
       <div class="info-box"><strong>What the AI can access</strong><p>The Local AI does not connect to the Obsidian API. Obsync scans the selected vault through the server mount or Desktop app. The AI receives extracted source text and, when enabled above, candidate note titles—not control of Obsidian.</p></div>
       <div class="settings-actions"><button class="primary" type="submit">Save Local AI settings</button></div>
     </section>
-  </form>`;
+  </form></div>`;
+  wireAiActivityControls();
   $("#llm-provider").value = settings.llm_provider || "ollama";
   $("#duplicate-policy").value = settings.duplicate_policy || "review";
   $("#ai-settings-form").addEventListener("submit", async (event) => {
@@ -1064,7 +1202,7 @@ async function renderSettings() {
   const desktopRows = state.agents.map((agent) => `<div class="connection-row"><span class="status-pill ${agent.status}">${agent.status}</span><div><strong>${escapeHtml(agent.name)}</strong><small>${escapeHtml(agent.os_name)} · Desktop ${escapeHtml(agent.agent_version || "unknown")} · seen ${relativeTime(agent.last_seen_at)}</small></div></div>`).join("") || '<div class="empty">No Desktop apps connected.</div>';
   $("#content").innerHTML = `<div class="settings-layout">
     <section class="settings-card"><h3>Obsync server</h3><div class="connection-row"><span class="status-pill online">online</span><div><strong>Version ${escapeHtml(meta.version)}</strong><small>${server.container ? "Docker" : escapeHtml(server.os_name)} · ${escapeHtml(location.origin)}</small></div></div><div class="settings-actions"><button class="secondary" id="verify-connections">Verify all connections</button><button class="quiet" id="copy-server-address">Copy server address</button></div><p class="inline-status" id="connection-check-status">Live connection checks run automatically.</p></section>
-    <section class="settings-card"><h3>Obsync Desktop apps</h3>${desktopRows}<div class="settings-actions"><button class="primary" id="open-desktop-app">Open Obsync Desktop</button><a class="secondary button-link" href="/api/v1/downloads/windows-desktop">Download or repair Desktop</a><button class="quiet" id="add-settings-computer">+ Add computer</button></div><small>Open Desktop works after v0.9.0 has been installed and Windows has registered the <code>obsync://</code> app link.</small></section>
+    <section class="settings-card"><h3>Obsync Desktop apps</h3>${desktopRows}<div class="settings-actions"><button class="primary" id="open-desktop-app">Open Obsync Desktop</button><a class="secondary button-link" href="/api/v1/downloads/windows-desktop">Download or repair Desktop</a><button class="quiet" id="add-settings-computer">+ Add computer</button></div><small>Open Desktop works after v0.9.0 or later has been installed and Windows has registered the <code>obsync://</code> app link.</small></section>
     <section class="settings-card"><h3>Application controls</h3><p>Global sync is <strong>${pipeline.enabled ? "running" : "stopped"}</strong>. Use <strong>${pipeline.enabled ? "Stop Global Sync" : "Start Global Sync"}</strong> in the top bar. Individual folder controls are under Sources.</p><div class="settings-actions"><button class="secondary" id="account-settings-link">Account settings</button><button class="quiet" id="open-help-link">Open Help</button></div></section>
   </div>`;
   $("#verify-connections").addEventListener("click", async () => {
@@ -1096,12 +1234,12 @@ async function renderHelp() {
       <section class="help-grid">
         <article class="settings-card"><h3>What each page does</h3>
           <dl class="help-list">
-            <div><dt>Overview</dt><dd>Health, totals, recent activity, and vault availability.</dd></div>
+            <div><dt>Overview</dt><dd>Health, totals, current active files, recent activity, and vault availability.</dd></div>
             <div><dt>Sources</dt><dd>Connect computers, add watched folders, compare files, and sync changes.</dd></div>
             <div><dt>Obsidian Vault</dt><dd>Choose and confirm the one vault where managed notes are written.</dd></div>
-            <div><dt>Local AI</dt><dd>Configure the model, custom instructions, and duplicate protection.</dd></div>
-            <div><dt>Documents</dt><dd>Search every indexed source and inspect tags, confidence, and sync state.</dd></div>
-            <div><dt>Review</dt><dd>Approve classifications that fall below the configured confidence threshold.</dd></div>
+            <div><dt>Local AI</dt><dd>Configure the model and watch the active file, streamed model activity, and final decision.</dd></div>
+            <div><dt>Documents</dt><dd>Search every indexed source, inspect its state, or request a new AI review.</dd></div>
+            <div><dt>Review</dt><dd>Approve, disregard, redo with feedback, or explicitly separate a possible duplicate.</dd></div>
             <div><dt>Settings</dt><dd>Verify the server and Desktop apps, open Desktop, and manage the application.</dd></div>
           </dl>
         </article>
@@ -1113,9 +1251,9 @@ async function renderHelp() {
           <div class="help-status">${comparisonBadge("source-missing")}<p>The original file disappeared. Obsync keeps the note and marks it missing.</p></div>
         </article>
         <article class="settings-card"><h3>Why Windows needs Obsync Desktop</h3><p>Docker and web browsers are intentionally isolated from arbitrary Windows files. Obsync Desktop includes the safe local bridge, native folder picker, background watcher, and start/stop controls in one app. Run it as Administrator for the one-time setup; background syncing then runs with limited permissions.</p><p>If a computer shows offline, open Obsync Desktop and choose Start this PC. Reconnecting reuses the saved pairing.</p></article>
-        <article class="settings-card"><h3>Stopping and removing</h3><p>Use <strong>Stop Global Sync</strong> to cancel all active sync and AI work. Each source folder also has independent Start, Pause, and Stop controls. Remove forgets a folder; Disconnect revokes a whole computer. Original files and existing Obsidian notes are always kept.</p></article>
+        <article class="settings-card"><h3>Stopping and removing</h3><p>Use <strong>Stop inference</strong> on Local AI to end only the active model request and move that file to Review. Use <strong>Stop Global Sync</strong> to cancel all active sync and AI work. Each source folder also has independent Start, Pause, and Stop controls. Remove forgets a folder; Disconnect revokes a whole computer. Original files and existing Obsidian notes are always kept.</p></article>
         <article class="settings-card"><h3>Server vs. desktop</h3><p>The central server always appears as one connected computer. Docker can access only folders mounted into its container. Pair the physical desktop whenever the vault or source folders live in Windows Documents, another user folder, a Mac, or a different PC.</p></article>
-        <article class="settings-card"><h3>Local AI</h3><p>AI is optional. It receives extracted source text and approved candidate titles, not Obsidian API access. Obsync performs vault comparison and duplicate protection separately before writing.</p></article>
+        <article class="settings-card"><h3>Local AI</h3><p>AI is optional. It receives extracted source text and approved candidate titles, not Obsidian API access. Obsync performs vault comparison and duplicate protection separately before writing. The live activity view is read-only and its bounded model trace is not stored as a chat history.</p></article>
         <article class="settings-card"><h3>Safety</h3><p>Obsync never edits, moves, or deletes source files. It owns only marked generated sections in Markdown and preserves text under <strong>My notes</strong>. Missing files are recorded rather than propagated as deletions.</p></article>
       </section>
       <section class="settings-card help-troubleshooting"><h3>Troubleshooting</h3>

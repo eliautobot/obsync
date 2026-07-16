@@ -172,6 +172,10 @@ Start with a test folder and vault backup. Confirm:
 - LLM confidence is calibrated appropriately
 - Editing below **My notes** survives a source update
 - Removing a source marks the note missing without deleting it
+- Overview shows the current file while processing and Local AI shows the active model session
+- Approve, Disregard, and Redo AI review produce the intended result; add review notes when correcting a title, category, or tag
+
+Use **Stop inference** on Local AI when only the active model request should end. The document moves to Review while Global Sync and unrelated folders continue. Use **Stop Global Sync** only when all synchronization and AI work should stop.
 
 For future server and desktop-agent releases, follow [Updating Obsync](UPDATING.md). It includes pre-update backups, Docker and source-based upgrade commands, verification, and rollback.
 

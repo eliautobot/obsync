@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from obsync.agent import AgentConfig, AgentRuntime, AgentState
+from obsync.llm import Analysis
 
 
 def sync_text(
@@ -19,6 +20,8 @@ def sync_text(
     *,
     mtime: int = 100,
     previous_path: str = "",
+    review_feedback: str = "",
+    force_review: bool = False,
 ):
     return client.post(
         "/api/v1/agent/documents/sync",
@@ -30,6 +33,8 @@ def sync_text(
             "source_size": str(len(content)),
             "sha256": hashlib.sha256(content).hexdigest(),
             "previous_path": previous_path,
+            "review_feedback": review_feedback,
+            "force_review": str(force_review).lower(),
         },
         files={"file": (Path(path).name, content, "text/plain")},
     )
@@ -93,6 +98,13 @@ def test_ui_includes_guided_help_and_obsync_desktop(client: TestClient) -> None:
     assert "Please choose which Obsidian Vault your files will be synced to" in app_js
     assert "Run as administrator" in app_js
     assert "setInterval(liveRefresh, 3000)" in app_js
+    assert "overviewSignature" in app_js
+    assert "Current active file" in app_js
+    assert "Stop inference" in app_js
+    assert "Redo AI review" in app_js
+    assert "Disregard" in app_js
+    assert "captureScrollState" in app_js
+    assert "document-table-panel" in app_js
     assert "Remove folder" in app_js
     assert "Keep that PowerShell window open" not in app_js
     assert ".help-tip" in styles
@@ -770,6 +782,117 @@ def test_admin_listing_review_and_event_routes(
     retry = client.post(f"/api/v1/admin/documents/{synced['id']}/retry", headers=admin_headers)
     assert retry.status_code == 200
     assert retry.json()["command"] == "resync"
+
+
+def test_complete_review_controls_store_feedback_and_queue_forced_ai_review(
+    client: TestClient,
+    admin_headers: dict[str, str],
+    agent_headers: dict[str, str],
+    registered_root: dict,
+    app,
+    monkeypatch,
+) -> None:
+    first = sync_text(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "review-controls.txt",
+        b"A permit renewal record that needs reviewer guidance.",
+    ).json()
+    document_id = first["id"]
+
+    approved = client.post(f"/api/v1/admin/documents/{document_id}/approve", headers=admin_headers)
+    assert approved.status_code == 200
+    approved_row = app.state.service.db.query_one(
+        "SELECT * FROM documents WHERE id = ?", (document_id,)
+    )
+    assert approved_row["needs_review"] == 0
+    assert approved_row["review_resolution"] == "approved"
+
+    disregarded = client.post(
+        f"/api/v1/admin/documents/{document_id}/disregard", headers=admin_headers
+    )
+    assert disregarded.status_code == 200
+    ignored_row = app.state.service.db.query_one(
+        "SELECT * FROM documents WHERE id = ?", (document_id,)
+    )
+    assert ignored_row["status"] == "ignored"
+    assert ignored_row["comparison_status"] == "ignored"
+    assert ignored_row["needs_review"] == 0
+    ignored_again = sync_text(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "review-controls.txt",
+        b"A permit renewal record that needs reviewer guidance.",
+        mtime=101,
+    )
+    assert ignored_again.status_code == 200
+    assert ignored_again.json()["result"] == "ignored"
+    assert ignored_again.json()["status"] == "ignored"
+
+    app.state.service.update_settings(
+        {
+            "llm_enabled": True,
+            "llm_provider": "ollama",
+            "llm_base_url": "http://model:11434",
+            "llm_model": "review-model",
+        }
+    )
+    feedback = "Use the permit-renewal tag and the Licenses category."
+    redone = client.post(
+        f"/api/v1/admin/documents/{document_id}/redo-review",
+        headers=admin_headers,
+        json={"feedback": feedback},
+    )
+    assert redone.status_code == 200
+    assert redone.json()["command"]["command"] == "resync"
+    queued = client.get(
+        f"/api/v1/admin/commands/{redone.json()['command']['id']}", headers=admin_headers
+    ).json()
+    assert queued["payload"]["force_review"] is True
+    assert queued["payload"]["review_feedback"] == feedback
+    review_row = app.state.service.db.query_one(
+        "SELECT * FROM documents WHERE id = ?", (document_id,)
+    )
+    assert review_row["status"] == "review-queued"
+    assert review_row["review_feedback"] == feedback
+
+    seen: dict[str, str] = {}
+
+    async def analyze_again(*_args, **kwargs):
+        seen["feedback"] = kwargs.get("review_feedback", "")
+        return Analysis(
+            title="Permit Renewal",
+            summary="Reviewed with administrator feedback.",
+            category="Licenses",
+            document_type="report",
+            tags=["permit-renewal"],
+            confidence=0.95,
+            provider="ollama",
+            model="review-model",
+        )
+
+    monkeypatch.setattr("obsync.service.LLMAnalyzer.analyze", analyze_again)
+    # A vault inventory may refresh the row to in-sync before the desktop consumes
+    # the re-review command. force_review must still bypass the unchanged shortcut.
+    app.state.service.db.execute(
+        "UPDATE documents SET comparison_status = 'in-sync' WHERE id = ?", (document_id,)
+    )
+    forced = sync_text(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "review-controls.txt",
+        b"A permit renewal record that needs reviewer guidance.",
+        review_feedback=feedback,
+        force_review=True,
+    )
+    assert forced.status_code == 200
+    assert forced.json()["result"] == "synced"
+    assert seen["feedback"] == feedback
+    assert forced.json()["category"] == "Licenses"
+    assert forced.json()["tags"] == ["permit-renewal"]
 
 
 def test_invalid_agent_and_root_are_rejected(

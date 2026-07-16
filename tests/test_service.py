@@ -147,6 +147,74 @@ async def test_stopping_pipeline_cancels_active_ai_processing(app, tmp_path, mon
     assert list(service.settings.vault_path.rglob("*.md")) == []
 
 
+@pytest.mark.asyncio
+async def test_stopping_only_active_inference_keeps_global_sync_running(
+    app, tmp_path, monkeypatch
+) -> None:
+    service = app.state.service
+    service.update_settings(
+        {
+            "llm_enabled": True,
+            "llm_provider": "ollama",
+            "llm_base_url": "http://model:11434",
+            "llm_model": "slow-model",
+        }
+    )
+    enrollment = service.create_enrollment("Inference PC")
+    registered = service.register_agent(
+        enrollment["code"],
+        {"name": "Inference PC", "hostname": "inference-pc", "os_name": "Windows"},
+    )
+    agent = service.db.query_one("SELECT * FROM agents WHERE id = ?", (registered["agent_id"],))
+    root = service.upsert_root(
+        registered["agent_id"],
+        {
+            "root_key": "inference-root",
+            "name": "Inference Files",
+            "path": str(tmp_path),
+            "destination": "Obsync",
+        },
+    )
+    staged = tmp_path / "live-inference.txt"
+    staged.write_text("Wait for the local model", encoding="utf-8")
+    started = asyncio.Event()
+
+    async def wait_forever(*_args, **_kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("obsync.service.LLMAnalyzer.analyze", wait_forever)
+    task = asyncio.create_task(
+        service.process_file(
+            agent=agent,
+            root_id=root["id"],
+            source_path="live-inference.txt",
+            source_mtime_ns=1,
+            source_size=staged.stat().st_size,
+            staged_file=staged,
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=2)
+
+    activity = service.ai_activity()
+    assert activity["active"][0]["source_name"] == "live-inference.txt"
+    assert activity["active"][0]["phase"] == "inference"
+    assert service.overview()["active_work"][0]["source_name"] == "live-inference.txt"
+    stopped = service.stop_inference(activity["active"][0]["document_id"])
+    assert stopped["stopped"] == 1
+    assert service.pipeline_enabled() is True
+
+    with pytest.raises(PipelinePausedError, match="AI inference"):
+        await task
+    document = service.db.query_one(
+        "SELECT * FROM documents WHERE source_path = 'live-inference.txt'"
+    )
+    assert document["status"] == "ai-stopped"
+    assert document["needs_review"] == 1
+    assert document["error"] == "AI inference stopped by user"
+    assert service.ai_activity()["last"]["outcome"] == "ai-stopped"
+
+
 def test_stopping_pipeline_cancels_pending_desktop_note_write(app) -> None:
     service = app.state.service
     enrollment = service.create_enrollment("Vault PC")

@@ -443,6 +443,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def start_pipeline(_token: AdminDependency) -> dict[str, Any]:
         return service.resume_pipeline()
 
+    @app.get("/api/v1/admin/ai/activity")
+    async def ai_activity(_token: AdminDependency) -> dict[str, Any]:
+        return service.ai_activity()
+
+    @app.post("/api/v1/admin/ai/stop")
+    async def stop_ai_inference(
+        _token: AdminDependency, payload: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        return service.stop_inference(str((payload or {}).get("document_id", "")))
+
     @app.get("/api/v1/admin/server")
     async def server_info(_token: AdminDependency) -> dict[str, Any]:
         return service.server_info()
@@ -570,9 +580,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     @app.post("/api/v1/admin/documents/{document_id}/approve")
-    async def approve_document(document_id: str, _token: AdminDependency) -> dict[str, bool]:
-        service.approve_document(document_id)
-        return {"ok": True}
+    async def approve_document(document_id: str, _token: AdminDependency) -> dict[str, Any]:
+        return service.approve_document(document_id)
+
+    @app.post("/api/v1/admin/documents/{document_id}/disregard")
+    async def disregard_document(document_id: str, _token: AdminDependency) -> dict[str, Any]:
+        return service.disregard_document(document_id)
+
+    @app.post("/api/v1/admin/documents/{document_id}/redo-review")
+    async def redo_ai_review(
+        document_id: str,
+        _token: AdminDependency,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return service.redo_ai_review(document_id, str((payload or {}).get("feedback", "")))
 
     @app.post("/api/v1/admin/documents/{document_id}/allow-duplicate")
     async def allow_duplicate(document_id: str, _token: AdminDependency) -> dict[str, Any]:
@@ -676,6 +697,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         previous_path: Annotated[str, Form()] = "",
         duplicate_path: Annotated[str, Form()] = "",
         duplicate_title: Annotated[str, Form()] = "",
+        review_feedback: Annotated[str, Form()] = "",
+        force_review: Annotated[bool, Form()] = False,
     ) -> dict[str, Any]:
         suffix = Path(source_path).suffix[:20]
         staged = settings.data_dir / "tmp" / f"{uuid.uuid4().hex}{suffix}"
@@ -704,6 +727,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 previous_path=previous_path,
                 duplicate_path=duplicate_path,
                 duplicate_title=duplicate_title,
+                review_feedback=review_feedback,
+                force_review=force_review,
             )
         finally:
             await file.close()

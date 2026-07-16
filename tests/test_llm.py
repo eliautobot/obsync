@@ -70,6 +70,66 @@ async def test_ollama_structured_response_is_normalized(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_ollama_stream_reports_model_activity_and_reviewer_feedback(monkeypatch) -> None:
+    captured: dict = {}
+    decision = json.dumps(
+        {
+            "title": "Permit Renewal",
+            "summary": "A permit renewal record.",
+            "category": "Licenses",
+            "document_type": "report",
+            "tags": ["permit-renewal"],
+            "confidence": 0.91,
+            "related_notes": [],
+        }
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        lines = [
+            json.dumps({"message": {"thinking": "Checking the requested category."}}),
+            json.dumps({"message": {"content": decision[:40]}}),
+            json.dumps({"message": {"content": decision[40:]}, "done": True}),
+        ]
+        return httpx.Response(200, content="\n".join(lines))
+
+    transport = httpx.MockTransport(handler)
+
+    class MockClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = transport
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", MockClient)
+    progress: list[tuple[str, str]] = []
+    analyzer = LLMAnalyzer(
+        LLMConfig(
+            enabled=True,
+            provider="ollama",
+            base_url="http://model",
+            model="review-model",
+        ),
+        progress=lambda kind, message: progress.append((kind, message)),
+    )
+    result = await analyzer.analyze(
+        source_path="permit.txt",
+        text="Permit renewal content",
+        mime_type="text/plain",
+        candidates=[],
+        review_feedback="Use the Licenses category and permit-renewal tag.",
+    )
+
+    assert captured["stream"] is True
+    assert "HUMAN REVIEWER FEEDBACK" in captured["messages"][1]["content"]
+    assert "permit-renewal tag" in captured["messages"][1]["content"]
+    assert result.title == "Permit Renewal"
+    assert result.category == "Licenses"
+    assert any(kind == "reasoning" for kind, _message in progress)
+    assert any(kind == "output" for kind, _message in progress)
+    assert any(kind == "decision" for kind, _message in progress)
+
+
+@pytest.mark.asyncio
 async def test_custom_ai_instructions_refine_but_do_not_replace_system_rules(monkeypatch) -> None:
     captured: dict = {}
 

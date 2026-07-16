@@ -2,6 +2,39 @@
 
 All notable changes to Obsync will be documented here.
 
+## 0.10.0 - 2026-07-15
+
+### Added
+
+- Added the current active source file and processing stage to Overview
+- Added a read-only live Local AI session showing the active file, provider, model, elapsed time, processing stages, streamed model reasoning/output, and final decision
+- Added an independent **Stop inference** control that cancels only the selected Local AI request, keeps Global Sync running, and moves the file to Review
+- Added complete Review actions: **Approve**, **Disregard**, and **Redo AI review** with optional one-run reviewer feedback; possible duplicates retain **Create separate note**
+
+### Changed
+
+- Replaced unconditional live-page rerenders with change-aware refreshes that preserve page and panel scroll positions
+- Made document, review, event, active-work, inventory, and AI-trace lists compact, bounded, and independently scrollable
+- Reflowed desktop document tables into mobile cards without horizontal page scrolling
+- Streamed Ollama and OpenAI-compatible model responses so supported model activity appears while inference is running
+
+### Fixed
+
+- Forced re-review commands now process unchanged files and carry reviewer feedback to the model
+- Disregarded documents remain ignored during later scans until the user explicitly requests another AI review
+
+## 0.9.0 - 2026-07-15
+
+### Added
+
+- Added dedicated **Obsidian Vault** and **Local AI** pages with explicit vault confirmation and protected custom AI instructions
+- Added conservative existing-note title matching, possible-duplicate review, per-folder Start/Pause/Stop controls, and automatic live page updates
+
+### Changed
+
+- Focused Settings on server/Desktop operation and clarified one-time Windows administrator setup
+- Renamed global controls to **Start Global Sync / Stop Global Sync** and reconciled missed work immediately after restart
+
 ## 0.8.0 - 2026-07-15
 
 ### Added

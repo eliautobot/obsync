@@ -142,12 +142,12 @@ Update Python-based desktop agents to the same release as the server, then verif
 
 ```bash
 python -m pip install --upgrade \
-  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.9.0"
+  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.10.0"
 obsync --version
 obsync agent scan
 ```
 
-Replace `v0.9.0` with the release you are installing. For Windows, use **Sources → Add another computer → Download Obsync Desktop**, right-click it, choose **Run as administrator**, and then choose **Connect and install**. Elevation is required only for setup; the watcher runs with limited permissions and no visible terminal. Command-line Windows and Linux agents remain available for advanced installations.
+Replace `v0.10.0` with the release you are installing. For Windows, use **Sources → Add another computer → Download Obsync Desktop**, right-click it, choose **Run as administrator**, and then choose **Connect and install**. Elevation is required only for setup; the watcher runs with limited permissions and no visible terminal. Command-line Windows and Linux agents remain available for advanced installations.
 
 Before any update, back up the Obsidian vault and Obsync `/data` volume. The full [Updating and rollback guide](docs/UPDATING.md) includes copy-and-paste backup commands for Linux and Windows, fixed-version installs, every agent type, verification, and safe rollback instructions.
 
@@ -236,6 +236,7 @@ If a destination collision is not already an Obsync-managed note, processing sto
 - [Supported files](docs/SUPPORTED_FILES.md)
 - [Security model](docs/SECURITY.md)
 - [Development and testing](docs/DEVELOPMENT.md)
+- [v0.10.0 release notes](docs/releases/v0.10.0.md)
 - [v0.9.0 release notes](docs/releases/v0.9.0.md)
 - [v0.8.0 release notes](docs/releases/v0.8.0.md)
 - [v0.7.0 release notes](docs/releases/v0.7.0.md)

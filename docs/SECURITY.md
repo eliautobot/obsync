@@ -14,7 +14,7 @@
 - Each device receives a distinct long random token.
 - The database stores SHA-256 token digests, not raw device tokens.
 - Device tokens can access only agent endpoints; root ownership is checked server-side. Disconnecting a computer revokes its token immediately.
-- Obsync Desktop installs per-user in Local AppData and creates a limited current-user `ONLOGON` scheduled task. It does not require elevation or install a system service.
+- Obsync Desktop uses one-time elevation to register automatic startup on Windows installations that restrict Task Scheduler. It still installs per-user in Local AppData, creates a limited current-user `ONLOGON` task, and does not install a system service.
 - Global Stop cancels queued and active processing before further vault writes; connected desktops remain authenticated only for heartbeat and safe configuration/removal operations until Start.
 - Folder removal deletes only Obsync's server/desktop tracking records for that root. It never deletes the underlying source directory, source files, or existing notes.
 
@@ -46,6 +46,8 @@ Mount source directories read-only when running an agent in Docker.
 Extracted document content is sent to the configured model endpoint. With a local Ollama/LM Studio deployment, content stays within the networks and machines you control. A generic OpenAI-compatible endpoint may be remote; its privacy policy then applies.
 
 The system prompt labels source content as untrusted and tells the model not to follow embedded instructions. Model output is parsed as a strict object, normalized, length-limited, and constrained. Related links must exactly match server-provided candidates. All model-provided path components are slugged before filesystem use.
+
+The Local AI page can display provider-emitted reasoning and streamed output for the active and most recent inference. These bounded traces stay in server memory and are not persisted as a chat transcript. Reviewer feedback for an explicit re-review is stored with that document for auditability and is sent to the configured model endpoint for that run.
 
 LLMs are not security boundaries. Keep the vault backed up and review generated notes before relying on them for high-stakes decisions.
 

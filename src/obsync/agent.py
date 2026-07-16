@@ -377,7 +377,12 @@ class AgentRuntime:
         return "", ""
 
     async def sync_file(
-        self, root: RootConfig, path: Path, *, force: bool = False
+        self,
+        root: RootConfig,
+        path: Path,
+        *,
+        force: bool = False,
+        review_feedback: str = "",
     ) -> dict[str, Any] | None:
         self._require_sync_enabled()
         if not self._root_is_running(root):
@@ -427,6 +432,8 @@ class AgentRuntime:
                     "previous_path": previous_path,
                     "duplicate_path": duplicate_path,
                     "duplicate_title": duplicate_title,
+                    "review_feedback": review_feedback[:4000],
+                    "force_review": "true" if force else "false",
                 },
                 files={"file": (resolved.name, handle, "application/octet-stream")},
             )
@@ -795,7 +802,14 @@ class AgentRuntime:
                     payload = command.get("payload", {})
                     root = next(r for r in self.config.roots if r.root_key == payload["root_key"])
                     path = Path(root.path) / payload["source_path"]
-                    result = json.dumps(await self.sync_file(root, path))
+                    result = json.dumps(
+                        await self.sync_file(
+                            root,
+                            path,
+                            force=True,
+                            review_feedback=str(payload.get("review_feedback", "")),
+                        )
+                    )
                 elif command["command"] == "write_note":
                     result = self._write_vault_note(command.get("payload", {}))
                 elif command["command"] == "set_source_status":

@@ -97,6 +97,9 @@ class ObsyncService:
             ],
         ] = {}
         self._active_processing: dict[str, tuple[str, asyncio.Task[Any]]] = {}
+        self._processing_activity: dict[str, dict[str, Any]] = {}
+        self._last_inference: dict[str, Any] | None = None
+        self._cancel_reasons: dict[str, str] = {}
         self._dummy_password_hash = hash_password("obsync-invalid-password")
         self._bootstrap_admin_from_env()
 
@@ -140,7 +143,146 @@ class ObsyncService:
             "enabled": enabled,
             "state": "running" if enabled else "stopped",
             "active_jobs": len(self._active_processing),
+            "active_files": self.active_work(),
         }
+
+    @staticmethod
+    def _elapsed_seconds(started_at: str, finished_at: str = "") -> int:
+        try:
+            ending = datetime.fromisoformat(finished_at) if finished_at else datetime.now(UTC)
+            elapsed = ending - datetime.fromisoformat(started_at)
+            return max(0, int(elapsed.total_seconds()))
+        except (TypeError, ValueError):
+            return 0
+
+    def _public_activity(self, activity: dict[str, Any]) -> dict[str, Any]:
+        result = {
+            key: value
+            for key, value in activity.items()
+            if key not in {"task", "used_ai", "ai_active"}
+        }
+        result["elapsed_seconds"] = self._elapsed_seconds(
+            str(activity.get("started_at", "")), str(activity.get("finished_at", ""))
+        )
+        result["cancellable"] = bool(activity.get("ai_active"))
+        return result
+
+    def active_work(self) -> list[dict[str, Any]]:
+        rows = [self._public_activity(item) for item in self._processing_activity.values()]
+        return sorted(rows, key=lambda item: str(item.get("started_at", "")))
+
+    def ai_activity(self) -> dict[str, Any]:
+        active = [
+            self._public_activity(item)
+            for item in self._processing_activity.values()
+            if item.get("used_ai")
+        ]
+        active.sort(key=lambda item: str(item.get("started_at", "")))
+        return {
+            "active": active,
+            "last": dict(self._last_inference) if self._last_inference else None,
+            "provider": self.db.get_setting("llm_provider", "ollama"),
+            "model": self.db.get_setting("llm_model", ""),
+            "enabled": self._llm_config().active,
+        }
+
+    def _start_activity(
+        self,
+        document_id: str,
+        *,
+        root_id: str,
+        source_path: str,
+        agent_name: str,
+        root_name: str,
+        task: asyncio.Task[Any],
+    ) -> None:
+        now = utc_now()
+        self._processing_activity[document_id] = {
+            "document_id": document_id,
+            "source_path": source_path,
+            "source_name": Path(source_path).name,
+            "agent_name": agent_name,
+            "root_name": root_name,
+            "root_id": root_id,
+            "phase": "extracting",
+            "phase_label": "Extracting readable content",
+            "started_at": now,
+            "updated_at": now,
+            "provider": "",
+            "model": "",
+            "events": [
+                {"kind": "stage", "message": "Extracting readable content.", "created_at": now}
+            ],
+            "task": task,
+            "used_ai": False,
+            "ai_active": False,
+        }
+
+    def _update_activity(
+        self,
+        document_id: str,
+        kind: str,
+        message: str,
+        *,
+        phase: str = "",
+        phase_label: str = "",
+    ) -> None:
+        activity = self._processing_activity.get(document_id)
+        if not activity:
+            return
+        now = utc_now()
+        raw = str(message)
+        clean = raw if kind in {"reasoning", "output"} else raw.strip()
+        if clean:
+            events = activity["events"]
+            if kind in {"reasoning", "output"} and events and events[-1]["kind"] == kind:
+                events[-1]["message"] = (events[-1]["message"] + clean)[-20000:]
+                events[-1]["created_at"] = now
+            else:
+                events.append({"kind": kind, "message": clean[:20000], "created_at": now})
+            activity["events"] = events[-80:]
+        if phase:
+            activity["phase"] = phase
+        if phase_label:
+            activity["phase_label"] = phase_label
+        activity["updated_at"] = now
+
+    def _finish_activity(self, document_id: str, *, outcome: str) -> None:
+        activity = self._processing_activity.get(document_id)
+        if not activity:
+            return
+        activity["ai_active"] = False
+        activity["outcome"] = outcome
+        activity["finished_at"] = utc_now()
+        if activity.get("used_ai"):
+            self._last_inference = self._public_activity(activity)
+
+    def stop_inference(self, document_id: str = "") -> dict[str, Any]:
+        stopped: list[str] = []
+        for active_document_id, (_root_id, task) in list(self._active_processing.items()):
+            activity = self._processing_activity.get(active_document_id, {})
+            if document_id and active_document_id != document_id:
+                continue
+            if not activity.get("ai_active"):
+                continue
+            self._cancel_reasons[active_document_id] = "AI inference stopped by user"
+            self._update_activity(
+                active_document_id,
+                "stage",
+                "Stop requested. Cancelling the active model request.",
+                phase="stopping",
+                phase_label="Stopping AI inference",
+            )
+            self._cancel_task(task)
+            stopped.append(active_document_id)
+        if stopped:
+            self.db.add_event(
+                "ai.inference_stop_requested",
+                f"Stop requested for {len(stopped)} active AI inference job(s)",
+                level="warning",
+                document_id=stopped[0] if len(stopped) == 1 else None,
+            )
+        return {"ok": True, "stopped": len(stopped), "document_ids": stopped}
 
     @staticmethod
     def _cancel_task(task: asyncio.Task[Any]) -> None:
@@ -155,13 +297,14 @@ class ObsyncService:
         else:
             task.get_loop().call_soon_threadsafe(task.cancel)
 
-    def _cancel_processing(self, *, root_id: str = "") -> int:
+    def _cancel_processing(self, *, root_id: str = "", reason: str = "Stopped by user") -> int:
         tasks = [
-            task
-            for active_root_id, task in self._active_processing.values()
+            (document_id, task)
+            for document_id, (active_root_id, task) in self._active_processing.items()
             if not root_id or active_root_id == root_id
         ]
-        for task in tasks:
+        for document_id, task in tasks:
+            self._cancel_reasons[document_id] = reason
             self._cancel_task(task)
         return len(tasks)
 
@@ -950,6 +1093,19 @@ class ObsyncService:
         vault_catalog: list[dict[str, str]],
     ) -> tuple[str, str, str, str, str]:
         destination = str(document.get("destination_path") or "")
+        if document.get("status") == "ignored":
+            return "ignored", destination, "", "", ""
+        if (
+            document.get("review_resolution") == "approved"
+            and document.get("comparison_status") == "possible-duplicate"
+        ):
+            return (
+                "possible-duplicate",
+                destination,
+                "",
+                str(document.get("duplicate_path") or ""),
+                str(document.get("duplicate_title") or ""),
+            )
         metadata: dict[str, str] | None = None
         if destination:
             note_exists = False
@@ -1131,7 +1287,10 @@ class ObsyncService:
                     """,
                     values,
                 )
-                if comparison == "possible-duplicate":
+                if (
+                    comparison == "possible-duplicate"
+                    and document.get("review_resolution") != "approved"
+                ):
                     self.db.execute(
                         "UPDATE documents SET status = 'duplicate-review', needs_review = 1 "
                         "WHERE id = ?",
@@ -1166,8 +1325,10 @@ class ObsyncService:
                 vault_agent = self._remote_vault_agent()
                 documents = self.db.query_all(
                     """
-                    SELECT id, source_path, observed_hash, destination_path, duplicate_dismissed
-                    FROM documents WHERE root_id = ? AND inventory_scan_id = ?
+                            SELECT id, source_path, observed_hash, destination_path,
+                                   duplicate_dismissed
+                            FROM documents WHERE root_id = ? AND inventory_scan_id = ?
+                              AND status != 'ignored'
                     ORDER BY source_path
                     """,
                     (root_id, scan_id),
@@ -1355,6 +1516,8 @@ class ObsyncService:
         previous_path: str = "",
         duplicate_path: str = "",
         duplicate_title: str = "",
+        review_feedback: str = "",
+        force_review: bool = False,
     ) -> dict[str, Any]:
         self.require_pipeline_enabled()
         source_rel = safe_relative_path(source_path).as_posix()
@@ -1402,11 +1565,25 @@ class ObsyncService:
                 existing["source_path"] = source_rel
                 existing["source_name"] = Path(source_rel).name
 
+        review_feedback = str(review_feedback).strip()[:4000]
+        if existing and existing.get("status") == "ignored" and not force_review:
+            self.db.execute(
+                """
+                UPDATE documents SET observed_hash = ?, observed_mtime_ns = ?,
+                    observed_size = ?, updated_at = ? WHERE id = ?
+                """,
+                (actual_hash, source_mtime_ns, source_size, utc_now(), existing["id"]),
+            )
+            row = self.db.query_one("SELECT * FROM documents WHERE id = ?", (existing["id"],))
+            assert row is not None
+            return {**self._decode_document(row), "result": "ignored"}
+
         if (
             existing
             and existing["source_hash"] == actual_hash
             and not existing["missing"]
             and existing["comparison_status"] == "in-sync"
+            and not force_review
         ):
             self.db.execute(
                 """
@@ -1430,6 +1607,7 @@ class ObsyncService:
             and existing.get("comparison_status") == "possible-duplicate"
             and not existing.get("duplicate_dismissed")
             and self.db.get_setting("duplicate_policy", "review") == "review"
+            and not force_review
         ):
             return {**self._decode_document(existing), "result": "possible-duplicate"}
 
@@ -1440,7 +1618,8 @@ class ObsyncService:
                 """
                 UPDATE documents SET source_mtime_ns = ?, source_size = ?, source_hash = ?,
                     observed_hash = ?, observed_mtime_ns = ?, observed_size = ?,
-                    status = 'processing', missing = 0, error = '', updated_at = ? WHERE id = ?
+                    status = 'processing', missing = 0, error = '', needs_review = 0,
+                    review_feedback = ?, review_resolution = '', updated_at = ? WHERE id = ?
                 """,
                 (
                     source_mtime_ns,
@@ -1449,6 +1628,7 @@ class ObsyncService:
                     actual_hash,
                     source_mtime_ns,
                     source_size,
+                    review_feedback,
                     now,
                     document_id,
                 ),
@@ -1459,8 +1639,9 @@ class ObsyncService:
                 INSERT INTO documents(
                     id, agent_id, root_id, source_path, source_name, source_mtime_ns,
                     source_size, source_hash, observed_hash, observed_mtime_ns, observed_size,
-                    status, comparison_status, first_seen_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', 'new', ?, ?, ?)
+                    status, comparison_status, review_feedback, first_seen_at, created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', 'new', ?, ?, ?, ?)
                 """,
                 (
                     document_id,
@@ -1474,6 +1655,7 @@ class ObsyncService:
                     actual_hash,
                     source_mtime_ns,
                     source_size,
+                    review_feedback,
                     now,
                     now,
                     now,
@@ -1485,6 +1667,7 @@ class ObsyncService:
             and self.db.get_setting("duplicate_policy", "review") == "review"
             and not (existing and existing.get("destination_path"))
             and not (existing and existing.get("duplicate_dismissed"))
+            and not force_review
         ):
             self.db.execute(
                 """
@@ -1511,16 +1694,72 @@ class ObsyncService:
         task = asyncio.current_task()
         if task is not None:
             self._active_processing[document_id] = (root_id, task)
+            self._start_activity(
+                document_id,
+                root_id=root_id,
+                source_path=source_rel,
+                agent_name=str(agent["name"]),
+                root_name=str(root["name"]),
+                task=task,
+            )
         try:
             extracted = await asyncio.to_thread(
                 extract_document, staged_file, self.settings.max_extract_chars
             )
-            analyzer = LLMAnalyzer(self._llm_config())
+            self._update_activity(
+                document_id,
+                "stage",
+                f"Extracted content with {extracted.extractor}.",
+                phase="preparing-ai",
+                phase_label="Preparing Local AI request",
+            )
+            llm_config = self._llm_config()
+            activity = self._processing_activity.get(document_id)
+            if activity:
+                activity["used_ai"] = llm_config.active
+                activity["ai_active"] = llm_config.active
+                activity["provider"] = llm_config.provider if llm_config.active else "rules"
+                activity["model"] = llm_config.model if llm_config.active else ""
+                if llm_config.active:
+                    activity["phase"] = "inference"
+                    activity["phase_label"] = "Local AI is analyzing the file"
+
+            def report_progress(kind: str, message: str) -> None:
+                phase = "inference"
+                phase_label = "Local AI is analyzing the file"
+                if kind == "decision":
+                    phase = "decision"
+                    phase_label = "AI decision received"
+                elif kind == "error":
+                    phase = "fallback"
+                    phase_label = "AI failed; applying safe fallback"
+                elif kind == "stage" and "Validating" in message:
+                    phase = "validating"
+                    phase_label = "Validating AI decision"
+                self._update_activity(
+                    document_id,
+                    kind,
+                    message,
+                    phase=phase,
+                    phase_label=phase_label,
+                )
+
+            analyzer = LLMAnalyzer(llm_config, progress=report_progress)
             analysis = await analyzer.analyze(
                 source_path=source_rel,
                 text=extracted.text,
                 mime_type=extracted.mime_type,
                 candidates=self._candidate_titles(source_rel),
+                review_feedback=review_feedback,
+            )
+            if activity:
+                activity["ai_active"] = False
+            self._update_activity(
+                document_id,
+                "stage",
+                "Checking the decision against the selected Obsidian vault.",
+                phase="checking-vault",
+                phase_label="Checking for duplicates and destination conflicts",
             )
             self.require_pipeline_enabled()
             await asyncio.sleep(0)
@@ -1607,6 +1846,15 @@ class ObsyncService:
                 analysis=analysis,
             )
             remote_vault = self._remote_vault_agent()
+            self._update_activity(
+                document_id,
+                "stage",
+                "Writing the managed note to the selected Obsidian vault."
+                if not remote_vault
+                else f"Queueing the managed note for {remote_vault['name']}.",
+                phase="writing",
+                phase_label="Writing to Obsidian",
+            )
             status = "pending-write" if remote_vault else "synced"
             processed_at = None if remote_vault else utc_now()
             if not remote_vault:
@@ -1680,19 +1928,34 @@ class ObsyncService:
                 "result": "queued" if remote_vault else "synced",
             }
         except asyncio.CancelledError as exc:
+            reason = self._cancel_reasons.pop(document_id, "Stopped by user")
+            ai_stopped = reason == "AI inference stopped by user"
             self.db.execute(
-                "UPDATE documents SET status = 'paused', error = ?, updated_at = ? WHERE id = ?",
-                ("Stopped by user", utc_now(), document_id),
+                "UPDATE documents SET status = ?, error = ?, needs_review = ?, "
+                "review_resolution = '', updated_at = ? WHERE id = ?",
+                (
+                    "ai-stopped" if ai_stopped else "paused",
+                    reason,
+                    int(ai_stopped),
+                    utc_now(),
+                    document_id,
+                ),
             )
             self.db.add_event(
                 "document.stopped",
-                f"Stopped processing {source_rel}",
+                f"Stopped AI review for {source_rel}"
+                if ai_stopped
+                else f"Stopped processing {source_rel}",
                 level="warning",
                 agent_id=agent["id"],
                 root_id=root_id,
                 document_id=document_id,
             )
-            raise PipelinePausedError("Syncing was stopped by the user") from exc
+            raise PipelinePausedError(
+                "AI inference was stopped by the user"
+                if ai_stopped
+                else "Syncing was stopped by the user"
+            ) from exc
         except PipelinePausedError:
             self.db.execute(
                 "UPDATE documents SET status = 'paused', error = ?, updated_at = ? WHERE id = ?",
@@ -1717,6 +1980,10 @@ class ObsyncService:
             active = self._active_processing.get(document_id)
             if active and active[1] is task:
                 self._active_processing.pop(document_id, None)
+            self._cancel_reasons.pop(document_id, None)
+            final = self.db.query_one("SELECT status FROM documents WHERE id = ?", (document_id,))
+            self._finish_activity(document_id, outcome=str(final["status"]) if final else "unknown")
+            self._processing_activity.pop(document_id, None)
 
     def mark_missing(self, agent_id: str, root_id: str, source_path: str) -> dict[str, Any]:
         self.require_pipeline_enabled()
@@ -1790,9 +2057,11 @@ class ObsyncService:
             clauses.append("d.root_id = ?")
             params.append(root_id)
         if search:
-            clauses.append("(d.title LIKE ? OR d.source_path LIKE ? OR d.summary LIKE ?)")
+            clauses.append(
+                "(d.title LIKE ? OR d.source_path LIKE ? OR d.summary LIKE ? OR d.tags_json LIKE ?)"
+            )
             term = f"%{search}%"
-            params.extend([term, term, term])
+            params.extend([term, term, term, term])
         if review is not None:
             clauses.append("d.needs_review = ?")
             params.append(int(review))
@@ -1824,7 +2093,8 @@ class ObsyncService:
         return self.db.query_all(
             """
             SELECT id, source_path, comparison_status FROM documents
-            WHERE root_id = ? AND comparison_status NOT IN ('in-sync', 'possible-duplicate')
+            WHERE root_id = ? AND status NOT IN ('ai-stopped', 'ignored')
+              AND comparison_status NOT IN ('in-sync', 'possible-duplicate', 'ignored')
             ORDER BY source_path
             """,
             (root_id,),
@@ -1837,11 +2107,92 @@ class ObsyncService:
         result["analysis"] = json.loads(result.pop("analysis_json", "{}") or "{}")
         return result
 
-    def approve_document(self, document_id: str) -> None:
+    def approve_document(self, document_id: str) -> dict[str, Any]:
+        document = self.db.query_one("SELECT * FROM documents WHERE id = ?", (document_id,))
+        if not document:
+            raise ValueError("Document not found")
         self.db.execute(
-            "UPDATE documents SET needs_review = 0, updated_at = ? WHERE id = ?",
+            """
+            UPDATE documents SET needs_review = 0, review_resolution = 'approved',
+                status = CASE WHEN status = 'duplicate-review' THEN 'duplicate-approved'
+                              ELSE status END,
+                error = '', updated_at = ? WHERE id = ?
+            """,
             (utc_now(), document_id),
         )
+        self.db.add_event(
+            "document.review_approved",
+            f"Approved the review result for {document['source_path']}",
+            agent_id=document["agent_id"],
+            root_id=document["root_id"],
+            document_id=document_id,
+        )
+        return {"ok": True}
+
+    def disregard_document(self, document_id: str) -> dict[str, Any]:
+        document = self.db.query_one("SELECT * FROM documents WHERE id = ?", (document_id,))
+        if not document:
+            raise ValueError("Document not found")
+        self.db.execute(
+            """
+            UPDATE documents SET status = 'ignored', comparison_status = 'ignored',
+                needs_review = 0, review_resolution = 'ignored', error = '', updated_at = ?
+            WHERE id = ?
+            """,
+            (utc_now(), document_id),
+        )
+        self.db.add_event(
+            "document.disregarded",
+            f"Disregarded {document['source_path']}; no note will be created",
+            level="warning",
+            agent_id=document["agent_id"],
+            root_id=document["root_id"],
+            document_id=document_id,
+        )
+        return {"ok": True}
+
+    def redo_ai_review(self, document_id: str, feedback: str = "") -> dict[str, Any]:
+        document = self.db.query_one("SELECT * FROM documents WHERE id = ?", (document_id,))
+        if not document:
+            raise ValueError("Document not found")
+        if not self._llm_config().active:
+            raise ValueError("Enable and configure Local AI before requesting an AI re-review")
+        root = self.db.query_one(
+            "SELECT root_key, sync_state, enabled FROM roots WHERE id = ?",
+            (document["root_id"],),
+        )
+        if not root:
+            raise ValueError("Watched folder not found")
+        if not root["enabled"] or root["sync_state"] != "running":
+            raise PipelinePausedError("Start this source folder before requesting an AI re-review")
+        clean_feedback = str(feedback).strip()[:4000]
+        self.db.execute(
+            """
+            UPDATE documents SET status = 'review-queued', comparison_status = 'new',
+                duplicate_dismissed = 0, needs_review = 0, review_feedback = ?,
+                review_resolution = '', error = '', updated_at = ? WHERE id = ?
+            """,
+            (clean_feedback, utc_now(), document_id),
+        )
+        command = self.queue_command(
+            document["agent_id"],
+            "resync",
+            {
+                "root_key": root["root_key"],
+                "source_path": document["source_path"],
+                "force_review": True,
+                "review_feedback": clean_feedback,
+            },
+        )
+        self.db.add_event(
+            "document.review_redo_queued",
+            f"Queued a new AI review for {document['source_path']}",
+            agent_id=document["agent_id"],
+            root_id=document["root_id"],
+            document_id=document_id,
+            details={"has_feedback": bool(clean_feedback)},
+        )
+        return {"ok": True, "command": command}
 
     def allow_duplicate(self, document_id: str) -> dict[str, Any]:
         document = self.db.query_one("SELECT * FROM documents WHERE id = ?", (document_id,))
@@ -2009,7 +2360,10 @@ class ObsyncService:
                     """,
                     values,
                 )
-                if comparison == "possible-duplicate":
+                if (
+                    comparison == "possible-duplicate"
+                    and document.get("review_resolution") != "approved"
+                ):
                     self.db.execute(
                         "UPDATE documents SET status = 'duplicate-review', needs_review = 1 "
                         "WHERE id = ?",
@@ -2035,6 +2389,7 @@ class ObsyncService:
             "vault": self.vault_status(),
             "server": self.server_info(),
             "pipeline": self.pipeline_status(),
+            "active_work": self.active_work(),
         }
 
     def settings_for_ui(self) -> dict[str, Any]:

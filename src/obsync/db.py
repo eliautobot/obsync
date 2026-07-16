@@ -130,6 +130,8 @@ CREATE TABLE IF NOT EXISTS documents (
     duplicate_path TEXT NOT NULL DEFAULT '',
     duplicate_title TEXT NOT NULL DEFAULT '',
     duplicate_dismissed INTEGER NOT NULL DEFAULT 0,
+    review_feedback TEXT NOT NULL DEFAULT '',
+    review_resolution TEXT NOT NULL DEFAULT '',
     llm_status TEXT NOT NULL DEFAULT 'pending',
     confidence REAL NOT NULL DEFAULT 0,
     needs_review INTEGER NOT NULL DEFAULT 0,
@@ -214,6 +216,8 @@ class Database:
                 "duplicate_path": "TEXT NOT NULL DEFAULT ''",
                 "duplicate_title": "TEXT NOT NULL DEFAULT ''",
                 "duplicate_dismissed": "INTEGER NOT NULL DEFAULT 0",
+                "review_feedback": "TEXT NOT NULL DEFAULT ''",
+                "review_resolution": "TEXT NOT NULL DEFAULT ''",
             }.items():
                 if name not in document_columns:
                     connection.execute(f"ALTER TABLE documents ADD COLUMN {name} {declaration}")
@@ -252,9 +256,9 @@ class Database:
                 connection.execute("ALTER TABLE enrollments ADD COLUMN agent_id TEXT")
             row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
-                connection.execute("INSERT INTO schema_meta(version) VALUES (5)")
-            elif int(row["version"]) < 5:
-                connection.execute("UPDATE schema_meta SET version = 5")
+                connection.execute("INSERT INTO schema_meta(version) VALUES (6)")
+            elif int(row["version"]) < 6:
+                connection.execute("UPDATE schema_meta SET version = 6")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

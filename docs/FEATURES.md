@@ -30,6 +30,9 @@ Obsync is a one-way, continuously reconciled knowledge pipeline from arbitrary f
 - Strict structured response schema and normalization
 - Rules-only fallback so model downtime never stops synchronization
 - Review threshold based on classification confidence
+- Live, read-only visibility into the active AI file, processing stages, model-emitted reasoning/output, and final decision
+- Independent inference cancellation that leaves Global Sync and other folders running
+- Feedback-driven AI re-review with one-run reviewer instructions
 - Related-note candidate selection and exact-title validation before creating `[[wikilinks]]`
 
 ## Obsidian output
@@ -56,19 +59,19 @@ Generated notes are grouped by destination prefix, source device, watched folder
 - Persistent unsecured-account warning and remote setup lockout until registration
 - First-run username/password registration with safe v0.1.0 token migration
 - Expiring browser sessions, sign-out, CSRF protection, and login throttling
-- Dashboard counts and event stream
+- Dashboard counts, current active-file panel, and bounded event stream
 - Device and watched-root status
 - Native **Add folder**, per-folder **Scan**, **View files**, and **Sync changes** controls
 - Global **Start Global Sync / Stop Global Sync** control with active sync and AI cancellation
 - Independent **Start / Pause / Stop** controls for every watched folder
-- Live status updates without manual page refreshes
+- Change-aware live status updates that preserve page and panel scroll positions
 - Per-folder **Remove** action that preserves originals and existing notes
 - Green/orange/red comparison indicators and aggregate folder counts
 - One-time device enrollment codes
 - Remote scan command
-- Searchable document table
+- Searchable, compact document table with bounded panel scrolling and responsive mobile cards
 - Error retry commands
-- Review approval workflow
+- Complete review workflow with Approve, Disregard, feedback-driven Redo AI review, and explicit separate-note creation for possible duplicates
 - LLM configuration and connection test
 - Fast model discovery that does not start inference
 - Automatic server computer plus optional paired desktops
@@ -91,6 +94,8 @@ Generated notes are grouped by destination prefix, source device, watched folder
 - Manual note content below the generated boundary is preserved
 - Source deletion is represented as status, never propagated as note deletion
 - Stopping work never disconnects computers, deletes source files, or deletes existing notes
+- Stopping one AI inference moves only that file to Review and leaves Global Sync running
+- Disregarded documents create no new note, never delete an existing note, and stay ignored until an explicit re-review
 - Removing a watched folder deletes only Obsync's connection and ledger for that root
 - API secrets are never returned to the UI after storage
 - Administrator passwords and browser session credentials are never stored in plaintext
