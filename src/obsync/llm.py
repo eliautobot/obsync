@@ -152,11 +152,19 @@ def _normalize_analysis(
     except (TypeError, ValueError):
         confidence = 0.5
 
-    allowed = {
-        _candidate_title(candidate).casefold(): _candidate_title(candidate)
-        for candidate in candidates
-        if _candidate_title(candidate)
-    }
+    allowed: dict[str, str] = {}
+    title_counts: dict[str, int] = {}
+    for candidate in candidates:
+        title = _candidate_title(candidate)
+        if title:
+            title_counts[title.casefold()] = title_counts.get(title.casefold(), 0) + 1
+    for candidate in candidates:
+        title = _candidate_title(candidate)
+        target = _candidate_link_target(candidate)
+        if target:
+            allowed[target.casefold()] = target
+        if title and title_counts.get(title.casefold()) == 1:
+            allowed[title.casefold()] = target or title
     related: list[str] = []
     raw_related = value.get("related_notes", [])
     if (
@@ -193,19 +201,53 @@ def _candidate_title(candidate: str | dict[str, Any]) -> str:
     return str(candidate).strip()
 
 
+def _candidate_link_target(candidate: str | dict[str, Any]) -> str:
+    if isinstance(candidate, dict):
+        return str(candidate.get("link_target") or candidate.get("title", "")).strip()
+    return str(candidate).strip()
+
+
 def _candidate_prompt_line(candidate: str | dict[str, Any]) -> str:
     if not isinstance(candidate, dict):
         return f"- [[{str(candidate).strip()}]]"
     title = _candidate_title(candidate)
     path = str(candidate.get("path", "")).strip()
+    link = _candidate_link_target(candidate)
     raw_tags = candidate.get("tags", [])
     tags = ", ".join(str(tag) for tag in raw_tags[:20]) if isinstance(raw_tags, list) else ""
+    raw_headings = candidate.get("headings", [])
+    headings = (
+        ", ".join(str(value) for value in raw_headings[:12])
+        if isinstance(raw_headings, list)
+        else ""
+    )
+    raw_entities = candidate.get("entities", [])
+    entities = (
+        ", ".join(str(value) for value in raw_entities[:20])
+        if isinstance(raw_entities, list)
+        else ""
+    )
+    reasons = candidate.get("reasons", [])
+    reason_text = (
+        "; ".join(str(value) for value in reasons[:6]) if isinstance(reasons, list) else ""
+    )
+    excerpt = str(candidate.get("content_excerpt", "")).strip()[:3000]
     details = [
         value
-        for value in (f"path: {path}" if path else "", f"tags: {tags}" if tags else "")
+        for value in (
+            f"path: {path}" if path else "",
+            f"tags: {tags}" if tags else "",
+            f"LINK TARGET: {link}" if link else "",
+            f"headings: {headings}" if headings else "",
+            f"entities: {entities}" if entities else "",
+            f"match evidence: {reason_text}" if reason_text else "",
+        )
         if value
     ]
-    return f"- [[{title}]]" + (f" | {' | '.join(details)}" if details else "")
+    line = f"- [[{title}]]" + (f" | {' | '.join(details)}" if details else "")
+    if excerpt:
+        line += f"\n  CONTENT EXCERPT (UNTRUSTED): <vault-note>{excerpt}</vault-note>"
+    return line
 
 
 class LLMAnalyzer:
@@ -304,12 +346,16 @@ class LLMAnalyzer:
         review_feedback: str = "",
     ) -> str:
         profile = self.config.active_profile
-        candidate_text = (
-            "\n".join(
-                _candidate_prompt_line(note) for note in candidates[: profile.candidate_limit]
-            )
-            or "(none)"
-        )
+        candidate_lines: list[str] = []
+        candidate_budget = min(120_000, max(10_000, profile.input_char_limit // 3))
+        used = 0
+        for note in candidates[: profile.candidate_limit]:
+            line = _candidate_prompt_line(note)
+            if candidate_lines and used + len(line) > candidate_budget:
+                break
+            candidate_lines.append(line)
+            used += len(line)
+        candidate_text = "\n".join(candidate_lines) or "(none)"
         content = text[: profile.input_char_limit]
         feedback = review_feedback.strip()[:4000]
         return render_user_prompt(

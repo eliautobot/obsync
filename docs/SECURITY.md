@@ -33,11 +33,14 @@ Do not publish Ollama or LM Studio directly to the Internet. The Obsync server s
 - Upload paths must be relative and cannot contain `..`.
 - Destination paths are resolved and verified to remain below the mounted or selected desktop vault.
 - UUID suffixes prevent common filename collisions.
-- Existing files without Obsync ownership markers are not overwritten.
+- Existing files without Obsync ownership markers are not overwritten unless source/content identity proves an exact match or an administrator explicitly approves adoption. Adoption preserves the complete original content below the managed region.
 - Atomic sibling writes reduce partial-file risk.
 - Missing sources do not delete generated notes.
 - Disconnecting a computer removes only the server-side device ledger. Source files and existing Obsidian notes are retained.
-- Desktop vault writers accept only server-authenticated commands, use atomic writes, and refuse non-Obsync collisions.
+- Desktop vault writers accept only server-authenticated commands, use atomic writes, validate expected content hashes, and refuse unapproved non-Obsync collisions.
+- Whole-vault sweeps skip symlinks and `.obsidian`, reject unsafe paths, allow only one active sweep, and cooperatively stop between notes.
+- Maintenance changes retain complete before/after content, evidence, confidence, and an audit state. Undo refuses to overwrite a note changed after the original sweep.
+- Automatic maintenance never permanently deletes or automatically merges notes.
 
 Mount source directories read-only when running an agent in Docker.
 
@@ -45,7 +48,7 @@ Mount source directories read-only when running an agent in Docker.
 
 Extracted document content is sent to the configured model endpoint. With a local Ollama/LM Studio deployment, content stays within the networks and machines you control. A generic OpenAI-compatible endpoint may be remote; its privacy policy then applies.
 
-The protected system prompt labels source content as untrusted and tells the model not to follow embedded instructions. Administrators can inspect it but cannot modify it through an AI profile. Editable role prompts and prompt templates remain below that boundary. Model output is parsed as a strict object, normalized, length-limited, and constrained. Related links must exactly match bounded candidates selected from the configured vault catalog. All model-provided path components are slugged before filesystem use.
+The protected system prompt labels source and indexed vault excerpts as untrusted and tells the model not to follow embedded instructions. Administrators can inspect it but cannot modify it through an AI profile. Editable role prompts and prompt templates remain below that boundary. Model output is parsed as a strict object, normalized, length-limited, and constrained. The deterministic index searches the full vault, but only bounded excerpts from top-ranked notes enter a model request. Related links must exactly match path-qualified candidates selected from the configured vault index. All model-provided path components are slugged before filesystem use.
 
 Profiles can enable or disable vault context, links, tags, YAML properties, category folders, and source details. Obsync does not grant the model arbitrary filesystem or Obsidian access: it supplies bounded source/candidate data and applies validated output itself. Full document transfer writes the already extracted source text directly; it does not trust the model to reproduce the document.
 

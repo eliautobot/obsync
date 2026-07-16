@@ -186,6 +186,18 @@ def merge_preserving_manual(existing: str, generated: str) -> str:
     return generated
 
 
+def adopt_preserving_original(existing: str, generated: str) -> str:
+    """Adopt an ordinary note while preserving every original byte in the manual section."""
+    if not existing.strip() or is_managed_note(existing):
+        return merge_preserving_manual(existing, generated) if existing.strip() else generated
+    generated_prefix = generated.split(MANUAL_HEADING, 1)[0]
+    return (
+        f"{generated_prefix}{MANUAL_HEADING}\n\n"
+        "_The original vault note below is preserved outside Obsync's managed section._\n\n"
+        f"{existing.rstrip()}\n"
+    )
+
+
 def is_managed_note(content: str) -> bool:
     return GENERATED_START in content and GENERATED_END in content
 

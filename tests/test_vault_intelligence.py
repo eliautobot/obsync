@@ -1,0 +1,478 @@
+from __future__ import annotations
+
+import asyncio
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+from obsync.config import Settings
+from obsync.service import ObsyncService, utc_now
+from obsync.vault_intelligence import (
+    MAINTENANCE_END,
+    MAINTENANCE_START,
+    add_backlinks,
+    existing_note_match,
+    maintenance_content,
+    parse_note,
+    rank_notes,
+)
+
+
+def write_note(vault: Path, relative: str, content: str) -> Path:
+    path = vault / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def test_whole_vault_note_parser_captures_obsidian_knowledge_graph(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    company = write_note(
+        vault,
+        "Companies/Pro Quality Plumbing.md",
+        """---
+aliases: [PQP, Pro Quality]
+tags: [company, plumbing]
+account: PQP-4419
+---
+# Pro Quality Plumbing
+## Accounts
+Permit account PQP-4419 belongs to Pro Quality Plumbing Inc.
+See [[Clients/Acme Holdings|Acme Holdings]]. #florida
+""",
+    )
+    client = write_note(vault, "Clients/Acme Holdings.md", "# Acme Holdings\n\nClient record.")
+    notes = [
+        parse_note(company, vault=vault).as_dict(),
+        parse_note(client, vault=vault).as_dict(),
+    ]
+    add_backlinks(notes)
+
+    parsed = notes[0]
+    assert parsed["title"] == "Pro Quality Plumbing"
+    assert parsed["aliases"] == ["PQP", "Pro Quality"]
+    assert set(parsed["tags"]) >= {"company", "plumbing", "florida"}
+    assert "Accounts" in parsed["headings"]
+    assert parsed["links"] == ["Clients/Acme Holdings"]
+    assert "account:pqp-4419" in parsed["entities"]
+    assert "Pro Quality Plumbing Inc" in parsed["entities"]
+    assert notes[1]["backlinks"] == ["Companies/Pro Quality Plumbing.md"]
+    assert parsed["content"] == company.read_text(encoding="utf-8")
+
+
+def test_entity_ranking_links_company_client_account_and_application(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    paths = [
+        write_note(vault, "Companies/Pro Quality Plumbing.md", "# Pro Quality Plumbing\n"),
+        write_note(
+            vault,
+            "Clients/Acme Holdings.md",
+            "# Acme Holdings\nClient account ACME-7788.",
+        ),
+        write_note(
+            vault,
+            "Accounts/ACME-7788.md",
+            "# ACME-7788\nAccount number ACME-7788 for Acme Holdings.",
+        ),
+        write_note(vault, "Unrelated/Grocery List.md", "# Grocery List\nMilk and bread."),
+    ]
+    notes = [parse_note(path, vault=vault).as_dict() for path in paths]
+    source = (
+        "Pro Quality Plumbing submitted an account application for Acme Holdings. "
+        "Account number ACME-7788 must be approved by Friday."
+    )
+    ranked = rank_notes("Applications/Acme account application.pdf", source, notes, limit=20)
+    targets = [item["link_target"] for item in ranked if item["score"] >= 24]
+
+    assert "Companies/Pro Quality Plumbing" in targets
+    assert "Clients/Acme Holdings" in targets
+    assert "Accounts/ACME-7788" in targets
+    assert all("Grocery" not in target for target in targets)
+    assert any("shared record identifier" in item["reasons"] for item in ranked)
+
+
+def test_existing_note_match_distinguishes_exact_strong_and_ambiguous(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    exact_path = write_note(vault, "Accounts/Water Account.md", "Account number WTR-9911 active.")
+    exact = parse_note(exact_path, vault=vault).as_dict()
+    match = existing_note_match(
+        "Water Account.txt",
+        "Account number WTR-9911 active.",
+        "not-managed",
+        [exact],
+    )
+    assert match and match["strength"] == "exact"
+
+    strong_path = write_note(
+        vault,
+        "Applications/Water Account.md",
+        "# Water Account\nAccount number WTR-9911 has an older mailing address.",
+    )
+    strong = parse_note(strong_path, vault=vault).as_dict()
+    match = existing_note_match(
+        "Water Account.pdf",
+        "Water Account update. Account number WTR-9911 now uses a new mailing address.",
+        "new-hash",
+        [strong],
+    )
+    assert match and match["strength"] == "strong"
+    assert "same stable record identifier" in match["evidence"]
+
+    duplicate = {**strong, "path": "Archive/Water Account.md"}
+    ambiguous = existing_note_match(
+        "Water Account.pdf",
+        "Water Account update. Account number WTR-9911 now uses a new mailing address.",
+        "new-hash",
+        [strong, duplicate],
+    )
+    assert ambiguous and ambiguous["strength"] == "ambiguous"
+
+
+def test_maintenance_relationship_block_is_bounded_and_idempotent(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    related = [
+        parse_note(
+            write_note(
+                vault,
+                "Companies/Pro Quality Plumbing.md",
+                "---\ntags: [company]\n---\n# Pro Quality Plumbing",
+            ),
+            vault=vault,
+        ).as_dict(),
+        parse_note(
+            write_note(vault, "Clients/Acme.md", "---\ntags: [client]\n---\n# Acme"),
+            vault=vault,
+        ).as_dict(),
+    ]
+    original = "# Account Application\n\nOriginal user-authored content.\n"
+    first = maintenance_content(original, related)
+    second = maintenance_content(first, related)
+
+    assert first == second
+    assert first.count(MAINTENANCE_START) == 1
+    assert first.count(MAINTENANCE_END) == 1
+    assert "[[Companies/Pro Quality Plumbing]]" in first
+    assert "[[Clients/Acme]]" in first
+    assert "Original user-authored content." in first
+    assert "#company" in first and "#client" in first
+
+
+@pytest.mark.asyncio
+async def test_index_and_maintenance_sweeps_apply_review_and_undo(tmp_path: Path) -> None:
+    settings = Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    service = ObsyncService(settings)
+    service.db.set_settings({"vault_confirmed": ("true", False)})
+    original = "# Pro Quality Plumbing Account\n\nClient Acme Holdings account ACME-7788.\n"
+    account = write_note(settings.vault_path, "Accounts/PQP Account.md", original)
+    write_note(
+        settings.vault_path,
+        "Companies/Pro Quality Plumbing.md",
+        "# Pro Quality Plumbing\n\nCompany serving Acme Holdings.",
+    )
+    write_note(
+        settings.vault_path,
+        "Clients/Acme Holdings.md",
+        "# Acme Holdings\n\nClient account ACME-7788.",
+    )
+
+    index = service.start_vault_sweep("index", change_mode="index-only", full_rebuild=True)
+    assert service._sweep_task is not None
+    await service._sweep_task
+    assert service.vault_sweep(index["id"])["status"] == "completed"
+    assert service.vault_sweep_status()["indexed_notes"] == 3
+
+    maintenance = service.start_vault_sweep("maintenance", change_mode="review")
+    assert service._sweep_task is not None
+    await service._sweep_task
+    completed = service.vault_sweep(maintenance["id"])
+    assert completed["status"] == "completed"
+    changes = service.list_vault_changes(status="pending")["items"]
+    assert changes
+    account_change = next(
+        change for change in changes if change["path"] == "Accounts/PQP Account.md"
+    )
+    diff = service.vault_change_diff(account_change["id"])
+    assert "Pro Quality Plumbing" in diff["after_content"]
+    assert diff["before_content"] == original
+
+    await service.approve_vault_change(account_change["id"])
+    assert MAINTENANCE_START in account.read_text(encoding="utf-8")
+    undo = await service.undo_vault_sweep(maintenance["id"])
+    assert undo["reverted"] >= 1
+    assert account.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
+async def test_completed_empty_index_clears_stale_notes_and_records_completion(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    service = ObsyncService(settings)
+    service.db.set_settings({"vault_confirmed": ("true", False)})
+    note = write_note(settings.vault_path, "Old.md", "# Old")
+
+    first = service.start_vault_sweep("index", change_mode="index-only", full_rebuild=True)
+    assert service._sweep_task is not None
+    await service._sweep_task
+    assert service.vault_sweep(first["id"])["status"] == "completed"
+    assert service.vault_sweep_status()["indexed_notes"] == 1
+
+    note.unlink()
+    second = service.start_vault_sweep("index", change_mode="index-only")
+    assert service._sweep_task is not None
+    await service._sweep_task
+
+    status = service.vault_sweep_status()
+    assert service.vault_sweep(second["id"])["status"] == "completed"
+    assert status["indexed_notes"] == 0
+    assert status["last_indexed_at"] == service.vault_sweep(second["id"])["finished_at"]
+
+
+@pytest.mark.asyncio
+async def test_sweep_rejects_concurrent_note_edit_and_preserves_user_change(tmp_path: Path) -> None:
+    settings = Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    service = ObsyncService(settings)
+    service.db.set_settings({"vault_confirmed": ("true", False)})
+    target = write_note(
+        settings.vault_path, "Projects/Project Alpha.md", "# Project Alpha\nClient Acme."
+    )
+    write_note(settings.vault_path, "Clients/Acme.md", "# Acme\nProject Alpha client.")
+    service.start_vault_sweep("maintenance", change_mode="review")
+    assert service._sweep_task is not None
+    await service._sweep_task
+    change = next(
+        item
+        for item in service.list_vault_changes(status="pending")["items"]
+        if item["path"] == "Projects/Project Alpha.md"
+    )
+    target.write_text("# Project Alpha\nClient Acme.\nHuman edit after review.", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="changed after"):
+        await service.approve_vault_change(change["id"])
+    assert "Human edit after review" in target.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_automatic_maintenance_applies_changes_and_retains_rollback(tmp_path: Path) -> None:
+    settings = Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    service = ObsyncService(settings)
+    service.db.set_settings({"vault_confirmed": ("true", False)})
+    target = write_note(
+        settings.vault_path,
+        "Accounts/Acme Account.md",
+        "# Acme Account\nPro Quality Plumbing account ACME-1000.",
+    )
+    original = target.read_text(encoding="utf-8")
+    write_note(
+        settings.vault_path,
+        "Companies/Pro Quality Plumbing.md",
+        "# Pro Quality Plumbing\nAcme account ACME-1000.",
+    )
+
+    sweep = service.start_vault_sweep("maintenance", change_mode="auto")
+    assert service._sweep_task is not None
+    await service._sweep_task
+
+    finished = service.vault_sweep(sweep["id"])
+    assert finished["status"] == "completed"
+    assert finished["applied_changes"] >= 1
+    assert MAINTENANCE_START in target.read_text(encoding="utf-8")
+    assert service.list_vault_changes(status="applied")["total"] >= 1
+    result = await service.undo_vault_sweep(sweep["id"])
+    assert result["ok"] is True
+    assert target.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
+async def test_sweep_validation_stop_and_agent_progress_guards(tmp_path: Path) -> None:
+    settings = Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    service = ObsyncService(settings)
+    with pytest.raises(ValueError, match="available Obsidian vault"):
+        service.start_vault_sweep("index")
+    service.db.set_settings({"vault_confirmed": ("true", False)})
+    write_note(settings.vault_path, "One.md", "# One")
+    with pytest.raises(ValueError, match="Sweep type"):
+        service.start_vault_sweep("invalid")
+    with pytest.raises(ValueError, match="change handling"):
+        service.start_vault_sweep("maintenance", change_mode="index-only")
+
+    sweep = service.start_vault_sweep("index", change_mode="index-only")
+    with pytest.raises(ValueError, match="already running"):
+        service.start_vault_sweep("index")
+    stopped = service.stop_vault_sweep(sweep["id"])
+    assert stopped["stopped"] is True
+    assert service._sweep_task is not None
+    await service._sweep_task
+    assert service.stop_vault_sweep()["stopped"] is False
+    with pytest.raises(ValueError, match="not found"):
+        service.vault_sweep("missing")
+    with pytest.raises(ValueError, match="not found"):
+        service.vault_change_diff("missing")
+    with pytest.raises(ValueError, match="not found"):
+        service.reject_vault_change("missing")
+    with pytest.raises(ValueError, match="not found for this computer"):
+        service.agent_sweep_progress(
+            "wrong-agent", sweep["id"], processed=1, total=1, current_note="One.md"
+        )
+
+
+@pytest.mark.asyncio
+async def test_custom_interval_scheduler_starts_due_sweep(tmp_path: Path) -> None:
+    settings = Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    service = ObsyncService(settings)
+    service.update_settings(
+        {
+            "vault_mode": "local",
+            "vault_index_schedule_enabled": True,
+            "vault_index_schedule_frequency": "custom",
+            "vault_index_schedule_interval_hours": 1,
+        }
+    )
+    write_note(settings.vault_path, "Scheduled.md", "# Scheduled")
+    await service.scheduler_tick(datetime(2026, 7, 16, 12, 0, tzinfo=UTC))
+    assert service._sweep_task is not None
+    await service._sweep_task
+    recent = service.vault_sweep_status()["recent"][0]
+    assert recent["scheduled"] == 1
+    assert recent["status"] == "completed"
+    assert service.vault_sweep_status()["indexed_notes"] == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_stop_interrupts_large_index_without_erasing_previous_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    service = ObsyncService(settings)
+    service.db.set_settings({"vault_confirmed": ("true", False)})
+    for index in range(250):
+        write_note(
+            settings.vault_path, f"Bulk/Note {index:04d}.md", f"# Note {index}\nShared data."
+        )
+    service.start_vault_sweep("index", change_mode="index-only", full_rebuild=True)
+    assert service._sweep_task is not None
+    await service._sweep_task
+    assert service.vault_sweep_status()["indexed_notes"] == 250
+
+    real_parse = parse_note
+
+    def slow_parse(*args, **kwargs):
+        time.sleep(0.001)
+        return real_parse(*args, **kwargs)
+
+    monkeypatch.setattr("obsync.service.parse_note", slow_parse)
+    second = service.start_vault_sweep("index", change_mode="index-only")
+    while service.vault_sweep(second["id"])["processed_notes"] < 5:
+        await asyncio.sleep(0.005)
+    stopped = service.stop_vault_sweep(second["id"])
+    assert stopped["stopped"] is True
+    assert service._sweep_task is not None
+    await service._sweep_task
+    assert service.vault_sweep(second["id"])["status"] == "stopped"
+    assert service.vault_sweep_status()["indexed_notes"] == 250
+
+
+def test_schedule_due_respects_timezone_frequency_and_last_run(tmp_path: Path) -> None:
+    service = ObsyncService(
+        Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    )
+    service.update_settings(
+        {
+            "vault_mode": "local",
+            "vault_index_schedule_enabled": True,
+            "vault_index_schedule_frequency": "daily",
+            "vault_index_schedule_time": "02:00",
+            "vault_schedule_timezone": "America/New_York",
+        }
+    )
+    now = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
+    assert service._schedule_due("index", now) is True
+    service.db.execute(
+        """
+        INSERT INTO vault_sweeps(
+            id, sweep_type, vault_key, status, change_mode, scheduled, created_at, updated_at
+        ) VALUES ('scheduled-today', 'index', 'local', 'completed', 'index-only', 1, ?, ?)
+        """,
+        (now.isoformat(), now.isoformat()),
+    )
+    assert service._schedule_due("index", now) is False
+
+
+def test_ranker_stress_finds_relevant_notes_in_five_thousand_note_vault() -> None:
+    notes = []
+    for index in range(5000):
+        company = "Pro Quality Plumbing" if index == 4321 else f"Reference Company {index}"
+        account = "ACME-7788" if index in {4321, 4444} else f"REF-{index:05d}"
+        notes.append(
+            {
+                "path": f"Knowledge/{company}.md",
+                "title": company,
+                "tags": ["company"],
+                "aliases": [],
+                "headings": ["Accounts"],
+                "properties": {},
+                "entities": [f"account:{account.casefold()}", company],
+                "content": f"# {company}\nAccount number {account}.",
+            }
+        )
+    started = time.perf_counter()
+    ranked = rank_notes(
+        "Applications/Acme Account.pdf",
+        "Pro Quality Plumbing application for account number ACME-7788.",
+        notes,
+        limit=100,
+    )
+    elapsed = time.perf_counter() - started
+
+    assert ranked[0]["title"] == "Pro Quality Plumbing"
+    assert any("shared record identifier" in item["reasons"] for item in ranked[:3])
+    assert elapsed < 5
+
+
+def test_streamed_desktop_index_replaces_stale_notes_and_counts_real_changes(
+    tmp_path: Path,
+) -> None:
+    service = ObsyncService(
+        Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    )
+    agent_id = "desktop-agent"
+    old_notes = [
+        parse_note(Path("Keep.md"), content="# Keep\nStable content.").as_dict(),
+        parse_note(Path("Stale.md"), content="# Stale\nRemove me.").as_dict(),
+    ]
+    service._store_vault_index(agent_id, old_notes, full_rebuild=True)
+    sweep_id = "streamed-index"
+    now = utc_now()
+    service.db.execute(
+        """
+        INSERT INTO vault_sweeps(
+            id, sweep_type, vault_key, status, change_mode, full_rebuild,
+            created_at, updated_at
+        ) VALUES (?, 'index', ?, 'running', 'index-only', 1, ?, ?)
+        """,
+        (sweep_id, agent_id, now, now),
+    )
+
+    batch = [
+        parse_note(Path("Keep.md"), content="# Keep\nStable content.").as_dict(),
+        parse_note(Path("New.md"), content="# New\nFresh content.").as_dict(),
+    ]
+    accepted = service.agent_sweep_notes(agent_id, sweep_id, batch)
+    assert accepted == {"ok": True, "accepted": 2, "stop_requested": False}
+    assert service.vault_sweep(sweep_id)["changed_notes"] == 1
+
+    finalized = service._finalize_remote_index(agent_id, sweep_id)
+    assert finalized == {"notes": 2, "removed": 1}
+    assert [note["path"] for note in service._indexed_vault_notes(agent_id)] == [
+        "Keep.md",
+        "New.md",
+    ]
+
+    with pytest.raises(ValueError, match="limited to 50"):
+        service.agent_sweep_notes(agent_id, sweep_id, batch * 26)
+    service.db.execute("UPDATE vault_sweeps SET status = 'stopping' WHERE id = ?", (sweep_id,))
+    assert service.agent_sweep_notes(agent_id, sweep_id, batch)["stop_requested"] is True
+    with pytest.raises(ValueError, match="not found for this computer"):
+        service.agent_sweep_notes("different-agent", sweep_id, batch)

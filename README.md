@@ -22,6 +22,10 @@ The source stays untouched. Obsync is not a copy-for-copy file mirror; it is a l
 - Organizes documents with Ollama, LM Studio, or another OpenAI-compatible local model
 - Provides immutable Full transfer and Brief summary AI profiles plus editable, copyable custom profiles
 - Exposes the role prompt, prompt template, inference parameters, content behavior, and Obsidian organization controls
+- Indexes the complete Markdown vault—content, folders, headings, aliases, properties, tags, links, backlinks, entities, and stable record identifiers—for whole-vault matching
+- Updates a matching existing note in place instead of creating a duplicate, while preserving the original note and later manual additions
+- Adds every validated, materially relevant relationship link rather than limiting documents to one or two links
+- Runs manual or scheduled Index and Maintenance Sweeps with live progress, safe Stop, Review/automatic modes, complete diffs, and Undo Sweep
 - Falls back to deterministic rules whenever the LLM is unavailable
 - Generates Obsidian properties, summaries, tags, categories, and `[[wikilinks]]`
 - Preserves everything written below the generated note's **My notes** heading
@@ -143,12 +147,12 @@ Update Python-based desktop agents to the same release as the server, then verif
 
 ```bash
 python -m pip install --upgrade \
-  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.12.1"
+  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.13.0"
 obsync --version
 obsync agent scan
 ```
 
-Replace `v0.12.1` with the release you are installing. For Windows, use **Sources → Add another computer → Download Obsync Desktop**, right-click it, choose **Run as administrator**, and then choose **Connect and install**. Elevation is required only for setup; the watcher runs with limited permissions and no visible terminal. Command-line Windows and Linux agents remain available for advanced installations.
+Replace `v0.13.0` with the release you are installing. For Windows, use **Sources → Add another computer → Download Obsync Desktop**, right-click it, choose **Run as administrator**, and then choose **Connect and install**. Elevation is required only for setup; the watcher runs with limited permissions and no visible terminal. Command-line Windows and Linux agents remain available for advanced installations.
 
 Before any update, back up the Obsidian vault and Obsync `/data` volume. The full [Updating and rollback guide](docs/UPDATING.md) includes copy-and-paste backup commands for Linux and Windows, fixed-version installs, every agent type, verification, and safe rollback instructions.
 
@@ -171,7 +175,7 @@ Each watched folder shows a file comparison before syncing:
 
 Use **View files** to inspect the inventory, **Scan** to compare again without writing, and **Sync changes** to extract, classify, tag, and write only the new or changed items. Matching managed notes already in the vault are adopted instead of duplicated.
 
-Before a new note is written, the default duplicate policy compares its title with every Markdown note in the selected vault. Strong title matches are held as **Possible duplicate** for a person to inspect. This is intentionally conservative; it is not a claim that two differently titled documents contain identical information.
+Before a new note is written, Obsync searches the whole-vault index using source identity, hashes, normalized content, titles, aliases, stable record identifiers, named entities, tags, paths, headings, and full text. Exact matches update the existing note automatically. Strong ordinary-note matches are held as **Possible duplicate** for first-time adoption unless automatic adoption is explicitly enabled. Ambiguous matches always require review. Once adopted, later source changes update the same note in place and preserve the original ordinary-note content outside Obsync's managed region.
 
 The equivalent manual commands are:
 
@@ -217,7 +221,16 @@ Choose an active AI profile before syncing:
 
 Every custom profile exposes its role prompt, user-prompt template, content mode, input/output limits, temperature, Top P, candidate/tag/link limits, and controls for vault context, `[[wikilinks]]`, tags, YAML properties, category folders, and source details. The protected output schema and prompt-injection boundary are visible but read-only.
 
-Obsidian has no remote core API for this workflow. Obsync integrates through Obsidian's native vault formats: the server mount or Desktop app catalogs Markdown notes and their tags, passes selected candidates to the model, validates returned links, and writes YAML properties, tags, folders, and `[[wikilinks]]` directly into managed Markdown.
+Obsidian has no remote core API for this workflow. Obsync integrates through Obsidian's native vault formats. Its scheduled or manual whole-vault index records note content, headings, aliases, properties, tags, paths, folders, links, backlinks, entities, hashes, and modification times. Every source document is ranked against that complete index; bounded content from the most relevant notes reaches the model, returned path-qualified links are validated, and Obsync performs the actual Markdown writes.
+
+## Whole-vault sweeps and maintenance
+
+Open **Obsidian Vault** to run or schedule two independent operations:
+
+- **Index Sweep** refreshes the agent's whole-vault knowledge. It can index only, send resulting recommendations to Review, or automatically apply them.
+- **Maintenance Sweep** finds and refreshes materially related links and tags while checking properties, folder placement, possible duplicates, and managed-source freshness.
+
+Both sweeps support **Start**, **Stop**, daily/weekly/monthly/custom schedules, live note-level progress, and no-overlap protection. Review mode is the safe default. Automatic mode carries a prominent warning because it can change existing entries without human approval. Every applied sweep change stores expected hashes, evidence, confidence, and complete before/after content. Concurrent user edits stop the affected recommendation, and **Undo Sweep** restores changes that are still current. Sweeps never automatically delete or merge notes.
 
 ## Generated-note safety
 
@@ -232,7 +245,7 @@ Obsync owns the frontmatter and the content between these markers:
 Anything here is preserved.
 ```
 
-If a destination collision is not already an Obsync-managed note, processing stops instead of overwriting it. Missing source files are marked in their notes and kept; deletion is never propagated automatically.
+If an ordinary destination is not a verified exact match or an explicitly approved adoption, processing stops instead of overwriting it. Approved adoption preserves the entire original note below the managed section. Missing source files are marked in their notes and kept; deletion is never propagated automatically.
 
 ## Documentation
 
@@ -245,6 +258,7 @@ If a destination collision is not already an Obsync-managed note, processing sto
 - [Supported files](docs/SUPPORTED_FILES.md)
 - [Security model](docs/SECURITY.md)
 - [Development and testing](docs/DEVELOPMENT.md)
+- [v0.13.0 release notes](docs/releases/v0.13.0.md)
 - [v0.12.1 release notes](docs/releases/v0.12.1.md)
 - [v0.12.0 release notes](docs/releases/v0.12.0.md)
 - [v0.11.0 release notes](docs/releases/v0.11.0.md)

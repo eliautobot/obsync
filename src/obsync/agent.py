@@ -23,6 +23,7 @@ from watchfiles import Change, awatch
 from . import __version__
 from .desktop import choose_directory
 from .markdown import (
+    adopt_preserving_original,
     is_managed_note,
     likely_same_note_title,
     managed_note_metadata,
@@ -33,6 +34,7 @@ from .markdown import (
     set_source_status,
 )
 from .security import new_token, safe_vault_path
+from .vault_intelligence import content_hash, parse_note
 
 
 def default_config_path() -> Path:
@@ -636,11 +638,82 @@ class AgentRuntime:
         if destination.exists():
             current = destination.read_text(encoding="utf-8")
             if not is_managed_note(current):
-                raise ValueError(
-                    f"Destination already exists and is not managed: {payload['destination_path']}"
-                )
-            content = merge_preserving_manual(current, content)
+                if payload.get("allow_adopt"):
+                    content = adopt_preserving_original(current, content)
+                else:
+                    raise ValueError(
+                        "Destination already exists and is not managed: "
+                        f"{payload['destination_path']}"
+                    )
+            else:
+                content = merge_preserving_manual(current, content)
         self._atomic_write(destination, content)
+        return str(destination)
+
+    async def _index_vault(self, payload: dict[str, Any], command_id: str) -> str:
+        if not self.config.vault_path:
+            raise ValueError("No Obsidian vault is selected on this computer")
+        vault = Path(self.config.vault_path).expanduser().resolve()
+        sweep_id = str(payload.get("sweep_id", ""))
+        paths = sorted(
+            path
+            for path in vault.rglob("*.md")
+            if path.is_file() and not path.is_symlink() and ".obsidian" not in path.parts
+        )
+        batch: list[dict[str, Any]] = []
+        indexed = 0
+        for index, path in enumerate(paths, start=1):
+            try:
+                batch.append(parse_note(path, vault=vault).as_dict())
+            except (OSError, UnicodeError, ValueError):
+                continue
+            if sweep_id and (len(batch) >= 25 or index == len(paths)):
+                response = await self._request(
+                    "POST",
+                    f"/api/v1/agent/sweeps/{sweep_id}/notes",
+                    json={"notes": batch},
+                )
+                result = response.json()
+                indexed += int(result.get("accepted", 0))
+                batch = []
+                if result.get("stop_requested"):
+                    raise SyncPausedError("Vault sweep stopped by user")
+            if sweep_id and (index == 1 or index % 20 == 0 or index == len(paths)):
+                response = await self._request(
+                    "POST",
+                    f"/api/v1/agent/sweeps/{sweep_id}/progress",
+                    json={
+                        "command_id": command_id,
+                        "processed": index,
+                        "total": len(paths),
+                        "current_note": path.relative_to(vault).as_posix(),
+                    },
+                )
+                if response.json().get("stop_requested"):
+                    raise SyncPausedError("Vault sweep stopped by user")
+            await asyncio.sleep(0)
+        return json.dumps(
+            {
+                "sweep_id": sweep_id,
+                "full_rebuild": bool(payload.get("full_rebuild")),
+                "indexed": indexed,
+            },
+            ensure_ascii=False,
+        )
+
+    def _apply_vault_change(self, payload: dict[str, Any]) -> str:
+        if not self.config.vault_path:
+            raise ValueError("No Obsidian vault is selected on this computer")
+        destination = safe_vault_path(Path(self.config.vault_path), str(payload.get("path", "")))
+        if not destination.is_file():
+            raise ValueError(f"Vault note is missing: {payload.get('path', '')}")
+        current = destination.read_text(encoding="utf-8")
+        if content_hash(current) != str(payload.get("expected_hash", "")):
+            raise ValueError("The note changed after this recommendation was created")
+        replacement = str(payload.get("content", ""))
+        if not replacement:
+            raise ValueError("Vault change contains no Markdown content")
+        self._atomic_write(destination, replacement)
         return str(destination)
 
     def _set_remote_source_status(self, payload: dict[str, Any]) -> str:
@@ -825,6 +898,12 @@ class AgentRuntime:
                     result = self._set_remote_source_status(command.get("payload", {}))
                 elif command["command"] == "audit_vault":
                     result = self._audit_vault(command.get("payload", {}))
+                elif command["command"] == "index_vault":
+                    result = await self._index_vault(
+                        command.get("payload", {}), str(command.get("id", ""))
+                    )
+                elif command["command"] == "apply_vault_change":
+                    result = self._apply_vault_change(command.get("payload", {}))
                 elif command["command"] == "select_vault":
                     selected = choose_directory(
                         "Choose your Obsidian vault", self.config.vault_path

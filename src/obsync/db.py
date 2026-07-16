@@ -39,12 +39,81 @@ CREATE TABLE IF NOT EXISTS vault_notes (
     path TEXT NOT NULL,
     title TEXT NOT NULL,
     tags_json TEXT NOT NULL DEFAULT '[]',
+    aliases_json TEXT NOT NULL DEFAULT '[]',
+    headings_json TEXT NOT NULL DEFAULT '[]',
+    links_json TEXT NOT NULL DEFAULT '[]',
+    backlinks_json TEXT NOT NULL DEFAULT '[]',
+    properties_json TEXT NOT NULL DEFAULT '{}',
+    entities_json TEXT NOT NULL DEFAULT '[]',
+    content TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL DEFAULT '',
+    modified_ns INTEGER NOT NULL DEFAULT 0,
+    size INTEGER NOT NULL DEFAULT 0,
+    managed INTEGER NOT NULL DEFAULT 0,
+    indexed_at TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL,
     PRIMARY KEY(vault_key, path)
 );
 
 CREATE INDEX IF NOT EXISTS idx_vault_notes_title
 ON vault_notes(vault_key, title COLLATE NOCASE);
+
+CREATE TABLE IF NOT EXISTS vault_sweeps (
+    id TEXT PRIMARY KEY,
+    sweep_type TEXT NOT NULL,
+    vault_key TEXT NOT NULL,
+    status TEXT NOT NULL,
+    change_mode TEXT NOT NULL,
+    full_rebuild INTEGER NOT NULL DEFAULT 0,
+    scheduled INTEGER NOT NULL DEFAULT 0,
+    total_notes INTEGER NOT NULL DEFAULT 0,
+    processed_notes INTEGER NOT NULL DEFAULT 0,
+    changed_notes INTEGER NOT NULL DEFAULT 0,
+    recommendations INTEGER NOT NULL DEFAULT 0,
+    applied_changes INTEGER NOT NULL DEFAULT 0,
+    current_note TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    started_at TEXT,
+    finished_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_sweeps_status
+ON vault_sweeps(status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS vault_sweep_paths (
+    sweep_id TEXT NOT NULL REFERENCES vault_sweeps(id) ON DELETE CASCADE,
+    vault_key TEXT NOT NULL,
+    path TEXT NOT NULL,
+    PRIMARY KEY(sweep_id, vault_key, path)
+);
+
+CREATE TABLE IF NOT EXISTS vault_changes (
+    id TEXT PRIMARY KEY,
+    sweep_id TEXT NOT NULL REFERENCES vault_sweeps(id) ON DELETE CASCADE,
+    vault_key TEXT NOT NULL,
+    path TEXT NOT NULL,
+    change_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    before_hash TEXT NOT NULL,
+    after_hash TEXT NOT NULL,
+    before_content TEXT NOT NULL,
+    after_content TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    confidence REAL NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    applied_at TEXT,
+    reviewed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_changes_review
+ON vault_changes(status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_vault_changes_sweep
+ON vault_changes(sweep_id, status);
 
 CREATE TABLE IF NOT EXISTS admin_users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -239,6 +308,8 @@ class Database:
                 "duplicate_dismissed": "INTEGER NOT NULL DEFAULT 0",
                 "review_feedback": "TEXT NOT NULL DEFAULT ''",
                 "review_resolution": "TEXT NOT NULL DEFAULT ''",
+                "vault_adopted": "INTEGER NOT NULL DEFAULT 0",
+                "match_evidence_json": "TEXT NOT NULL DEFAULT '[]'",
             }.items():
                 if name not in document_columns:
                     connection.execute(f"ALTER TABLE documents ADD COLUMN {name} {declaration}")
@@ -257,6 +328,30 @@ class Database:
                 connection.execute(
                     "ALTER TABLE roots ADD COLUMN sync_state TEXT NOT NULL DEFAULT 'running'"
                 )
+            vault_note_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(vault_notes)").fetchall()
+            }
+            for name, declaration in {
+                "aliases_json": "TEXT NOT NULL DEFAULT '[]'",
+                "headings_json": "TEXT NOT NULL DEFAULT '[]'",
+                "links_json": "TEXT NOT NULL DEFAULT '[]'",
+                "backlinks_json": "TEXT NOT NULL DEFAULT '[]'",
+                "properties_json": "TEXT NOT NULL DEFAULT '{}'",
+                "entities_json": "TEXT NOT NULL DEFAULT '[]'",
+                "content": "TEXT NOT NULL DEFAULT ''",
+                "content_hash": "TEXT NOT NULL DEFAULT ''",
+                "modified_ns": "INTEGER NOT NULL DEFAULT 0",
+                "size": "INTEGER NOT NULL DEFAULT 0",
+                "managed": "INTEGER NOT NULL DEFAULT 0",
+                "indexed_at": "TEXT NOT NULL DEFAULT ''",
+            }.items():
+                if name not in vault_note_columns:
+                    connection.execute(f"ALTER TABLE vault_notes ADD COLUMN {name} {declaration}")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_vault_notes_hash "
+                "ON vault_notes(vault_key, content_hash)"
+            )
             connection.execute(
                 """
                 UPDATE documents
@@ -277,9 +372,9 @@ class Database:
                 connection.execute("ALTER TABLE enrollments ADD COLUMN agent_id TEXT")
             row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
-                connection.execute("INSERT INTO schema_meta(version) VALUES (7)")
-            elif int(row["version"]) < 7:
-                connection.execute("UPDATE schema_meta SET version = 7")
+                connection.execute("INSERT INTO schema_meta(version) VALUES (8)")
+            elif int(row["version"]) < 8:
+                connection.execute("UPDATE schema_meta SET version = 8")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

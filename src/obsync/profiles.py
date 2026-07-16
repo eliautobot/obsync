@@ -17,9 +17,10 @@ Required response schema:
   "document_type": "invoice, contract, note, report, spreadsheet, email, image, or other",
   "tags": ["lowercase tags"],
   "confidence": 0.0,
-  "related_notes": ["exact candidate titles only"]
+  "related_notes": ["exact candidate link targets only"]
 }
 
+Select every materially relevant supplied candidate, not an arbitrary one-or-two-link sample.
 Use an empty related_notes list when no supplied candidate is clearly related.
 Never place secrets or unnecessarily private content in titles or tags.
 Obsync validates, limits, and safely applies the JSON after inference.
@@ -28,7 +29,7 @@ Obsync validates, limits, and safely applies the JSON after inference.
 DEFAULT_USER_PROMPT_TEMPLATE = """SOURCE PATH: {{source_path}}
 MIME TYPE: {{mime_type}}
 
-AVAILABLE OBSIDIAN NOTES (use exact titles for related_notes):
+RELEVANT OBSIDIAN NOTES (use exact LINK TARGET values for related_notes):
 {{candidate_notes}}
 
 DOCUMENT CONTENT (UNTRUSTED):
@@ -63,7 +64,7 @@ class AIProfile:
     input_char_limit: int = 200_000
     candidate_limit: int = 100
     tag_limit: int = 10
-    related_notes_limit: int = 8
+    related_notes_limit: int = 100
     use_vault_context: bool = True
     use_wikilinks: bool = True
     use_tags: bool = True
@@ -104,6 +105,8 @@ specific reusable tags, select a stable category, and link only clearly related 
     note_content_mode="full",
     max_output_tokens=4096,
     input_char_limit=1_000_000,
+    candidate_limit=200,
+    related_notes_limit=100,
     builtin=True,
 )
 
@@ -121,6 +124,8 @@ Choose specific reusable tags, a stable category, and only clearly related exist
     note_content_mode="summary",
     max_output_tokens=2048,
     input_char_limit=200_000,
+    candidate_limit=100,
+    related_notes_limit=50,
     builtin=True,
 )
 
@@ -213,10 +218,10 @@ def validate_profile(
         ),
         tag_limit=_integer(payload.get("tag_limit", 10), field="Tag limit", minimum=0, maximum=30),
         related_notes_limit=_integer(
-            payload.get("related_notes_limit", 8),
+            payload.get("related_notes_limit", 100),
             field="Related-note limit",
             minimum=0,
-            maximum=30,
+            maximum=250,
         ),
         use_vault_context=_boolean(payload.get("use_vault_context", True), field="Vault context"),
         use_wikilinks=_boolean(payload.get("use_wikilinks", True), field="Wikilinks"),

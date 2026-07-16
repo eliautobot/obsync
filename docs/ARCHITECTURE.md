@@ -55,7 +55,11 @@ The server—not each agent—connects to the configured model endpoint. Support
 
 The active AI profile controls the role prompt, user-prompt template, provider parameters, input/output bounds, note content mode, and Obsidian organization features. The immutable Full document transfer profile makes the complete extracted source the note body; model output supplies metadata and a separate search-oriented summary. The immutable Brief summary profile produces a compact summary-only body. Custom profiles can be copied from either built-in and edited independently. The protected JSON schema and untrusted-document boundary remain visible but read-only.
 
-When vault context is enabled, Obsync catalogs Markdown titles, relative paths, and frontmatter tags from the server-mounted vault or a selected Desktop vault. It ranks that real vault catalog for the source document and sends only the bounded candidates to the model. Returned links must exactly match those candidates. Obsidian does not expose a remote core API for these operations, so Obsync uses its native filesystem contract: Markdown, YAML properties, tags, folders, and `[[wikilinks]]`.
+When vault context is enabled, Obsync searches a persistent whole-vault index built from full Markdown content, relative paths, folders, titles, aliases, headings, YAML properties, YAML/inline tags, outgoing links, backlinks, named entities, stable record identifiers, hashes, and modification times. It searches every indexed note, ranks relationships deterministically, and sends bounded content excerpts from only the most relevant candidates to the model. Returned path-qualified links must exactly match that allowlist. Obsidian does not expose a remote core API for these operations, so Obsync uses its native filesystem contract: Markdown, YAML properties, tags, folders, and `[[wikilinks]]`.
+
+Index and maintenance work is separate from ordinary source reconciliation. A manual or scheduled Index Sweep refreshes the full catalog incrementally or as a rebuild. A Maintenance Sweep uses that catalog to propose or apply validated relationship blocks and shared tags. Existing-document matching, source freshness, generated properties, and first folder placement stay in the ordinary source-reconciliation path, where Obsync has the source identity and complete extracted document needed to make those decisions safely. Server-mounted sweeps process notes cooperatively in the server; Desktop-vault sweeps stream bounded index batches, report progress, and honor stop requests through authenticated agent endpoints. Only one sweep can run at a time.
+
+Every maintenance write uses the indexed content hash as an optimistic concurrency check. The database stores complete before/after content, reason, evidence, confidence, review state, and sweep identity. Review mode requires an administrator decision. Automatic mode applies the same validated changes without per-note approval. Undo reverses only notes whose current hash still matches the applied result. Sweeps never automatically delete or merge notes.
 
 Classification requests use streaming responses when the provider supports them. Each model activity update is pushed to authenticated browsers over a server-sent event stream instead of waiting for the general dashboard refresh interval. The Local AI page updates stable session elements in place and keeps independent follow/manual-scroll state for every document trace. The trace is bounded in memory and is not persisted as a chat transcript. Browser disconnects remove their bounded subscriber queue in a `finally` cleanup path. An administrator can cancel an individual inference without stopping the global pipeline; the source file remains untouched and the document moves to Review.
 
@@ -65,17 +69,20 @@ Classification requests use streaming responses when the provider supports them.
 1. User adds a folder, an OS event occurs, or periodic reconciliation starts
 2. Agent inventories stable files with relative paths, size, modification time, and SHA-256
 3. Server compares the manifest with its ledger and the active Obsidian vault writer
-4. Existing managed notes are adopted by source identity instead of duplicated
-5. Strong title matches against any Markdown note are held for duplicate review
-6. UI reports in-sync, modified, new, possible-duplicate, vault-missing, and source-missing states
-7. Sync uploads only pending source files
-8. Server checks agent token, root ownership, size, hash, and safe path
-9. Extractor produces plain text bounded by the active AI profile
-10. LLM activity is pushed live to subscribed browsers and returns structured organization metadata, or rules provide fallback
-11. Server chooses/stabilizes destination and renders the configured full-text or summary-only Markdown body
-12. Server merges the preserved manual section
-13. Server writes atomically under `/vault`, or queues the managed note for the selected desktop vault writer
-14. SQLite ledger, comparison state, and event stream are updated
+4. Existing managed notes are matched by source identity and updated instead of duplicated
+5. The extracted source is compared with the whole-vault index using hashes, normalized content, titles, aliases, record identifiers, entities, and full-text relevance
+6. Exact ordinary-note matches are safely adopted; strong matches enter Review; ambiguous matches never auto-merge
+7. UI reports in-sync, modified, new, possible-duplicate, vault-missing, and source-missing states
+8. Sync uploads only pending source files
+9. Server checks agent token, root ownership, size, hash, and safe path
+10. Extractor produces plain text bounded by the active AI profile
+11. Whole-vault ranking supplies validated related notes, entity evidence, content excerpts, and an existing-folder candidate
+12. LLM activity is pushed live to subscribed browsers and returns structured organization metadata, or rules provide fallback
+13. Deterministic and model-selected relationships are combined, deduplicated, and validated against real vault paths
+14. Server chooses/stabilizes the existing or new destination and renders the configured full-text or summary-only Markdown body
+15. Server preserves the managed manual section or the complete pre-adoption ordinary note
+16. Server writes atomically under `/vault`, or queues the managed note for the selected desktop vault writer
+17. SQLite document ledger and whole-vault index are updated before the next source document is processed
 ```
 
 At any processing boundary, the global Stop control can cancel the operation before a vault write. Cancelled documents remain pending/paused and are eligible for reconciliation after Start. The narrower **Stop inference** action cancels only one active model request and routes that document to Review while Global Sync remains enabled.
@@ -86,11 +93,11 @@ Review decisions are explicit. Approve accepts the current classification or exi
 
 A source document is identified by `(agent_id, root_id, relative_path)`. Each gets an immutable UUID. Content SHA-256 makes repeated events idempotent. Device registration is transactional and accepts a client-generated credential so a lost response can be retried without creating another computer. Rename hints let the server update the existing row and note rather than creating a new identity. If the processing database is rebuilt, a vault audit matches managed notes by source computer, watched-root name, and relative path before creating anything new.
 
-The server keeps the first safe destination path after classification. Later content changes update that path in place. A future explicit reorganization feature may move notes with backlink-aware review, but routine synchronization does not.
+The server keeps the adopted or first safe destination path after classification. Later content changes update that path in place. New notes can reuse the folder of a high-confidence related note; otherwise they fall back to the configured destination/device/root/category path. Routine source updates never move an established note.
 
 ## Generated-content boundary
 
-Obsync replaces the properties and generated region. Text following `## My notes` is merged back byte-for-byte. If a destination exists without Obsync markers, the server stops with an error rather than assuming ownership.
+Obsync replaces the properties and generated region. Text following `## My notes` is merged back byte-for-byte. If a destination exists without Obsync markers, the server stops unless the whole-vault matcher proves an exact content/source match or an administrator explicitly approves first-time adoption. Adoption preserves the complete original note below the generated region.
 
 ## Failure and recovery
 

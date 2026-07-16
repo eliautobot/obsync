@@ -102,6 +102,15 @@ def test_ui_includes_guided_help_and_obsync_desktop(client: TestClient) -> None:
     assert "Protected inference prompt" in app_js
     assert "Full document transfer" in app_js
     assert "Obsidian behaviors" in app_js
+    assert "Start Index Sweep" in app_js
+    assert "Start Maintenance Sweep" in app_js
+    assert "Schedule Index Sweep" in app_js
+    assert "Schedule Maintenance Sweep" in app_js
+    assert "Allow AI Agent to apply all recommended changes" in app_js
+    assert "Vault maintenance recommendations" in app_js
+    assert "/api/v1/admin/vault/sweeps" in app_js
+    assert "/api/v1/admin/vault/changes" in app_js
+    assert "whole-vault index" in app_js
     assert "Please choose which Obsidian Vault your files will be synced to" in app_js
     assert "Run as administrator" in app_js
     assert "setInterval(liveRefresh, 3000)" in app_js
@@ -125,6 +134,54 @@ def test_ui_includes_guided_help_and_obsync_desktop(client: TestClient) -> None:
     assert ".ai-jump-latest" in styles
     assert "overflow-anchor: none" in styles
     assert "backdrop-filter: blur(3px)" not in styles
+    assert ".sweep-progress" in styles
+    assert ".diff-grid" in styles
+
+
+def test_vault_sweep_settings_are_validated_and_saved(
+    client: TestClient, admin_headers: dict[str, str]
+) -> None:
+    response = client.put(
+        "/api/v1/admin/settings",
+        headers=admin_headers,
+        json={
+            "vault_index_schedule_enabled": True,
+            "vault_index_schedule_frequency": "weekly",
+            "vault_index_schedule_time": "01:30",
+            "vault_index_schedule_weekday": 5,
+            "vault_index_schedule_interval_hours": 72,
+            "vault_index_change_mode": "review",
+            "vault_maintenance_schedule_enabled": True,
+            "vault_maintenance_schedule_frequency": "monthly",
+            "vault_maintenance_schedule_time": "03:15",
+            "vault_maintenance_schedule_month_day": 12,
+            "vault_maintenance_change_mode": "auto",
+            "vault_schedule_timezone": "America/New_York",
+            "vault_maintenance_categories": ["links", "tags"],
+            "vault_link_minimum_score": 28,
+            "vault_link_limit": 140,
+            "existing_note_policy": "review",
+        },
+    )
+    assert response.status_code == 200, response.text
+    saved = response.json()
+    assert saved["vault_index_schedule_enabled"] == "true"
+    assert saved["vault_maintenance_change_mode"] == "auto"
+    assert saved["vault_maintenance_categories"] == '["links", "tags"]'
+    assert saved["vault_link_limit"] == "140"
+
+    invalid = client.put(
+        "/api/v1/admin/settings",
+        headers=admin_headers,
+        json={"vault_index_schedule_time": "25:99"},
+    )
+    assert invalid.status_code == 400
+    invalid = client.put(
+        "/api/v1/admin/settings",
+        headers=admin_headers,
+        json={"vault_maintenance_categories": ["delete-everything"]},
+    )
+    assert invalid.status_code == 400
 
 
 def test_ai_profiles_are_copyable_editable_activatable_and_protected(
@@ -211,6 +268,58 @@ def test_ai_profiles_are_copyable_editable_activatable_and_protected(
         "/api/v1/admin/ai/profiles/builtin-brief-summary", headers=admin_headers
     )
     assert builtin_delete.status_code == 400
+
+
+def test_exact_existing_note_is_adopted_then_updated_in_place(
+    client: TestClient,
+    admin_headers: dict[str, str],
+    agent_headers: dict[str, str],
+    registered_root: dict,
+    app_settings,
+) -> None:
+    existing = app_settings.vault_path / "Accounts" / "Water Account.md"
+    existing.parent.mkdir(parents=True)
+    original = "Account number WTR-9911 active."
+    existing.write_text(original, encoding="utf-8")
+
+    first = sync_text(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "Water Account.txt",
+        original.encode(),
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["result"] == "synced"
+    assert first.json()["destination_path"] == "Accounts/Water Account.md"
+    assert len(list(app_settings.vault_path.rglob("*.md"))) == 1
+    adopted = existing.read_text(encoding="utf-8")
+    assert "obsync_id:" in adopted
+    assert "## Document content\n\nAccount number WTR-9911 active." in adopted
+    assert "The original vault note below is preserved" in adopted
+    assert adopted.rstrip().endswith(original)
+
+    updated_source = b"Account number WTR-9911 active. Mailing address changed to 22 Bay Street."
+    second = sync_text(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "Water Account.txt",
+        updated_source,
+        mtime=200,
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["result"] == "synced"
+    assert second.json()["destination_path"] == "Accounts/Water Account.md"
+    final = existing.read_text(encoding="utf-8")
+    assert "Mailing address changed to 22 Bay Street." in final
+    assert final.rstrip().endswith(original)
+    assert len(list(app_settings.vault_path.rglob("*.md"))) == 1
+
+    documents = client.get("/api/v1/admin/documents", headers=admin_headers).json()["items"]
+    assert len(documents) == 1
+    assert documents[0]["vault_adopted"] == 1
+    assert documents[0]["comparison_status"] == "in-sync"
 
 
 def test_ai_activity_event_stream_formats_events_and_closes_gateway_subscription(

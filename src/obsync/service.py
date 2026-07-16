@@ -14,18 +14,18 @@ from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import Settings
 from .db import Database, utc_now
 from .extractors import extract_document
 from .llm import Analysis, LLMAnalyzer, LLMConfig
 from .markdown import (
+    adopt_preserving_original,
     is_managed_note,
     likely_same_note_title,
     managed_note_metadata,
     merge_preserving_manual,
-    note_tags,
-    note_title,
     note_title_from_path,
     render_markdown,
     set_source_status,
@@ -52,6 +52,18 @@ from .security import (
     verify_password,
     verify_token,
 )
+from .vault_intelligence import (
+    VaultSearchIndex,
+    add_backlinks,
+    content_hash,
+    decode_db_note,
+    existing_note_match,
+    maintenance_content,
+    parse_note,
+    rank_notes,
+    related_notes_for_maintenance,
+    serialize_note_for_db,
+)
 
 DEFAULT_SETTINGS: dict[str, tuple[str, bool]] = {
     "sync_enabled": ("false", False),
@@ -69,6 +81,25 @@ DEFAULT_SETTINGS: dict[str, tuple[str, bool]] = {
     "ai_active_profile_id": ("", False),
     "duplicate_policy": ("review", False),
     "review_threshold": ("0.65", False),
+    "existing_note_policy": ("review", False),
+    "vault_index_schedule_enabled": ("false", False),
+    "vault_index_schedule_frequency": ("weekly", False),
+    "vault_index_schedule_time": ("02:00", False),
+    "vault_index_schedule_weekday": ("6", False),
+    "vault_index_schedule_month_day": ("1", False),
+    "vault_index_schedule_interval_hours": ("24", False),
+    "vault_index_change_mode": ("index-only", False),
+    "vault_maintenance_schedule_enabled": ("false", False),
+    "vault_maintenance_schedule_frequency": ("weekly", False),
+    "vault_maintenance_schedule_time": ("03:00", False),
+    "vault_maintenance_schedule_weekday": ("6", False),
+    "vault_maintenance_schedule_month_day": ("1", False),
+    "vault_maintenance_schedule_interval_hours": ("168", False),
+    "vault_maintenance_change_mode": ("review", False),
+    "vault_schedule_timezone": ("America/New_York", False),
+    "vault_maintenance_categories": ('["links", "tags"]', False),
+    "vault_link_minimum_score": ("24", False),
+    "vault_link_limit": ("100", False),
 }
 
 PIPELINE_COMMANDS = frozenset(
@@ -116,6 +147,9 @@ class ObsyncService:
         self._ai_activity_revision = 0
         self._ai_activity_subscribers: set[asyncio.Queue[int]] = set()
         self._cancel_reasons: dict[str, str] = {}
+        self._sweep_task: asyncio.Task[Any] | None = None
+        self._sweep_stop = asyncio.Event()
+        self._scheduler_task: asyncio.Task[Any] | None = None
         self._dummy_password_hash = hash_password("obsync-invalid-password")
         self._bootstrap_admin_from_env()
 
@@ -209,9 +243,10 @@ class ObsyncService:
             "protected_system_prompt": PROTECTED_SYSTEM_PROMPT,
             "prompt_placeholders": list(PROMPT_PLACEHOLDERS),
             "implementation": (
-                "Obsync uses the vault's Markdown, YAML properties, tags, folders, and "
-                "[[wikilinks]] through the server mount or Obsync Desktop. Obsidian does not "
-                "provide a remote core API, so no plugin or cloud access is required."
+                "Obsync maintains a whole-vault index of Markdown content, headings, aliases, "
+                "properties, tags, links, backlinks, folders, and record entities through the "
+                "server mount or Obsync Desktop. The model proposes organization; Obsync "
+                "validates paths, links, hashes, and writes. No Obsidian plugin is required."
             ),
         }
 
@@ -298,6 +333,820 @@ class ObsyncService:
             self.db.set_settings({"ai_active_profile_id": (FULL_TRANSFER_PROFILE.id, False)})
         self.db.add_event("ai.profile_deleted", f"Deleted AI profile {row['name']}")
         return self.ai_profiles_for_ui()
+
+    def _vault_key(self) -> str:
+        if self.db.get_setting("vault_mode", "local") == "agent":
+            return self.db.get_setting("vault_agent_id", "")
+        return "local"
+
+    def _indexed_vault_notes(self, vault_key: str | None = None) -> list[dict[str, Any]]:
+        key = vault_key if vault_key is not None else self._vault_key()
+        return [
+            decode_db_note(row)
+            for row in self.db.query_all(
+                "SELECT * FROM vault_notes WHERE vault_key = ? ORDER BY path COLLATE NOCASE",
+                (key,),
+            )
+        ]
+
+    def _store_vault_index(
+        self,
+        vault_key: str,
+        notes: list[dict[str, Any]],
+        *,
+        full_rebuild: bool,
+        delete_missing: bool = True,
+    ) -> dict[str, int]:
+        add_backlinks(notes)
+        now = utc_now()
+        before_rows = {
+            str(row["path"]): str(row["content_hash"])
+            for row in self.db.query_all(
+                "SELECT path, content_hash FROM vault_notes WHERE vault_key = ?", (vault_key,)
+            )
+        }
+        with self.db.transaction() as connection:
+            if full_rebuild:
+                connection.execute("DELETE FROM vault_notes WHERE vault_key = ?", (vault_key,))
+            elif notes and delete_missing:
+                current_paths = {str(note.get("path", "")) for note in notes if note.get("path")}
+                missing_paths = [path for path in before_rows if path not in current_paths]
+                connection.executemany(
+                    "DELETE FROM vault_notes WHERE vault_key = ? AND path = ?",
+                    [(vault_key, path) for path in missing_paths],
+                )
+            elif not full_rebuild and delete_missing:
+                connection.execute("DELETE FROM vault_notes WHERE vault_key = ?", (vault_key,))
+            connection.executemany(
+                """
+                INSERT INTO vault_notes(
+                    vault_key, path, title, tags_json, aliases_json, headings_json, links_json,
+                    backlinks_json, properties_json, entities_json, content, content_hash,
+                    modified_ns, size, managed, indexed_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(vault_key, path) DO UPDATE SET
+                    title = excluded.title, tags_json = excluded.tags_json,
+                    aliases_json = excluded.aliases_json, headings_json = excluded.headings_json,
+                    links_json = excluded.links_json, backlinks_json = excluded.backlinks_json,
+                    properties_json = excluded.properties_json,
+                    entities_json = excluded.entities_json, content = excluded.content,
+                    content_hash = excluded.content_hash, modified_ns = excluded.modified_ns,
+                    size = excluded.size, managed = excluded.managed,
+                    indexed_at = excluded.indexed_at, updated_at = excluded.updated_at
+                """,
+                [
+                    (vault_key, *serialize_note_for_db(note), now, now)
+                    for note in notes
+                    if str(note.get("path", "")).strip()
+                ],
+            )
+        previous = len(before_rows)
+        after_hashes = {
+            str(note.get("path", "")): str(note.get("content_hash", "")) for note in notes
+        }
+        changed = sum(1 for path, sha256 in after_hashes.items() if before_rows.get(path) != sha256)
+        if delete_missing:
+            changed += sum(1 for path in before_rows if path not in after_hashes)
+        return {"notes": len(notes), "previous": previous, "changed": changed}
+
+    def _upsert_indexed_note(self, vault_key: str, note: dict[str, Any]) -> None:
+        now = utc_now()
+        self.db.execute(
+            """
+            INSERT INTO vault_notes(
+                vault_key, path, title, tags_json, aliases_json, headings_json, links_json,
+                backlinks_json, properties_json, entities_json, content, content_hash,
+                modified_ns, size, managed, indexed_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(vault_key, path) DO UPDATE SET
+                title = excluded.title, tags_json = excluded.tags_json,
+                aliases_json = excluded.aliases_json, headings_json = excluded.headings_json,
+                links_json = excluded.links_json, properties_json = excluded.properties_json,
+                entities_json = excluded.entities_json, content = excluded.content,
+                content_hash = excluded.content_hash, modified_ns = excluded.modified_ns,
+                size = excluded.size, managed = excluded.managed,
+                indexed_at = excluded.indexed_at, updated_at = excluded.updated_at
+            """,
+            (vault_key, *serialize_note_for_db(note), now, now),
+        )
+        notes = self._indexed_vault_notes(vault_key)
+        add_backlinks(notes)
+        with self.db.transaction() as connection:
+            connection.executemany(
+                "UPDATE vault_notes SET backlinks_json = ? WHERE vault_key = ? AND path = ?",
+                [
+                    (
+                        json.dumps(item.get("backlinks", []), ensure_ascii=False),
+                        vault_key,
+                        item["path"],
+                    )
+                    for item in notes
+                ],
+            )
+
+    async def _scan_local_vault(self, sweep_id: str, *, full_rebuild: bool) -> bool:
+        vault = self.settings.vault_path
+        paths = sorted(
+            path
+            for path in vault.rglob("*.md")
+            if path.is_file() and not path.is_symlink() and ".obsidian" not in path.parts
+        )
+        self.db.execute(
+            "UPDATE vault_sweeps SET total_notes = ?, updated_at = ? WHERE id = ?",
+            (len(paths), utc_now(), sweep_id),
+        )
+        notes: list[dict[str, Any]] = []
+        for index, path in enumerate(paths, start=1):
+            if self._sweep_stop.is_set():
+                break
+            try:
+                note = await asyncio.to_thread(parse_note, path, vault=vault)
+            except (OSError, UnicodeError, ValueError) as exc:
+                self.db.add_event(
+                    "vault.index_note_error",
+                    f"Could not index {path.name}: {exc}",
+                    level="warning",
+                )
+                continue
+            notes.append(note.as_dict())
+            if index == 1 or index % 10 == 0 or index == len(paths):
+                self.db.execute(
+                    """
+                    UPDATE vault_sweeps SET processed_notes = ?, current_note = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (index, note.path, utc_now(), sweep_id),
+                )
+            await asyncio.sleep(0)
+        stopped = self._sweep_stop.is_set()
+        if not stopped or (notes and not full_rebuild):
+            result = self._store_vault_index(
+                "local",
+                notes,
+                full_rebuild=full_rebuild and not stopped,
+                delete_missing=not stopped,
+            )
+            self.db.execute(
+                "UPDATE vault_sweeps SET changed_notes = ?, updated_at = ? WHERE id = ?",
+                (result["changed"], utc_now(), sweep_id),
+            )
+        return not stopped
+
+    async def _wait_for_command(self, command_id: str, sweep_id: str) -> bool:
+        while True:
+            command = self.db.query_one(
+                "SELECT status, result FROM commands WHERE id = ?", (command_id,)
+            )
+            if not command:
+                raise ValueError("Vault sweep command disappeared")
+            if command["status"] == "completed":
+                return True
+            if command["status"] in {"failed", "cancelled"}:
+                if self._sweep_stop.is_set() or command["status"] == "cancelled":
+                    return False
+                raise ValueError(str(command.get("result") or "Desktop vault sweep failed"))
+            if self._sweep_stop.is_set():
+                self.db.execute(
+                    "UPDATE commands SET status = 'cancelled', result = ?, completed_at = ? "
+                    "WHERE id = ? AND status = 'pending'",
+                    ("Vault sweep stopped by user", utc_now(), command_id),
+                )
+            await asyncio.sleep(0.25)
+            sweep = self.db.query_one("SELECT status FROM vault_sweeps WHERE id = ?", (sweep_id,))
+            if not sweep or sweep["status"] == "stopped":
+                return False
+
+    async def _scan_remote_vault(self, sweep_id: str, *, full_rebuild: bool) -> bool:
+        agent = self._remote_vault_agent()
+        if not agent:
+            raise ValueError("The selected desktop vault is unavailable")
+        command = self.queue_command(
+            agent["id"],
+            "index_vault",
+            {"sweep_id": sweep_id, "full_rebuild": full_rebuild},
+        )
+        return await self._wait_for_command(command["id"], sweep_id)
+
+    def _create_vault_change(
+        self,
+        *,
+        sweep_id: str,
+        note: dict[str, Any],
+        after_content: str,
+        reason: str,
+        evidence: list[str],
+        confidence: float,
+    ) -> str:
+        change_id = str(uuid.uuid4())
+        before_content = str(note.get("content", ""))
+        self.db.execute(
+            """
+            INSERT INTO vault_changes(
+                id, sweep_id, vault_key, path, change_type, status, before_hash, after_hash,
+                before_content, after_content, reason, evidence_json, confidence, created_at
+            ) VALUES (?, ?, ?, ?, 'organize-note', 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                change_id,
+                sweep_id,
+                self._vault_key(),
+                note["path"],
+                str(note.get("content_hash") or content_hash(before_content)),
+                content_hash(after_content),
+                before_content,
+                after_content,
+                reason[:1000],
+                json.dumps(evidence[:30], ensure_ascii=False),
+                max(0.0, min(float(confidence), 1.0)),
+                utc_now(),
+            ),
+        )
+        return change_id
+
+    async def _generate_maintenance_changes(self, sweep_id: str) -> list[str]:
+        notes = self._indexed_vault_notes()
+        try:
+            maximum = max(1, min(int(self.db.get_setting("vault_link_limit", "100")), 250))
+            minimum = max(
+                5.0, min(float(self.db.get_setting("vault_link_minimum_score", "24")), 200.0)
+            )
+        except ValueError:
+            maximum, minimum = 100, 24.0
+        categories_raw = self.db.get_setting("vault_maintenance_categories", "[]")
+        try:
+            categories = set(json.loads(categories_raw))
+        except (TypeError, json.JSONDecodeError):
+            categories = {"links", "tags"}
+        change_ids: list[str] = []
+        total = len(notes)
+        search_index = await asyncio.to_thread(VaultSearchIndex, notes)
+        for index, note in enumerate(notes, start=1):
+            if self._sweep_stop.is_set():
+                break
+            self.db.execute(
+                "UPDATE vault_sweeps SET total_notes = ?, processed_notes = ?, current_note = ?, "
+                "updated_at = ? WHERE id = ?",
+                (total, index, note["path"], utc_now(), sweep_id),
+            )
+            if not ({"links", "tags"} & categories):
+                continue
+            related = await asyncio.to_thread(
+                related_notes_for_maintenance,
+                note,
+                notes,
+                maximum=maximum,
+                minimum_score=minimum,
+                search_index=search_index,
+            )
+            if not related:
+                continue
+            after = maintenance_content(
+                str(note.get("content", "")),
+                related,
+                include_tags="tags" in categories,
+            )
+            if after == note.get("content"):
+                continue
+            evidence: list[str] = []
+            for related_note in related[:20]:
+                evidence.append(
+                    f"{related_note.get('title')}: "
+                    + "; ".join(str(item) for item in related_note.get("reasons", [])[:3])
+                )
+            confidence = min(0.99, 0.55 + float(related[0].get("score", 0)) / 200)
+            change_ids.append(
+                self._create_vault_change(
+                    sweep_id=sweep_id,
+                    note=note,
+                    after_content=after,
+                    reason=(
+                        f"Add or refresh {len(related)} validated relationship link(s)"
+                        " using the whole-vault index."
+                    ),
+                    evidence=evidence,
+                    confidence=confidence,
+                )
+            )
+            await asyncio.sleep(0)
+        self.db.execute(
+            "UPDATE vault_sweeps SET recommendations = ?, updated_at = ? WHERE id = ?",
+            (len(change_ids), utc_now(), sweep_id),
+        )
+        return change_ids
+
+    async def _apply_change_content(
+        self,
+        change: dict[str, Any],
+        *,
+        reverse: bool = False,
+    ) -> None:
+        expected_hash = str(change["after_hash"] if reverse else change["before_hash"])
+        new_content = str(change["before_content"] if reverse else change["after_content"])
+        vault_key = str(change["vault_key"])
+        if vault_key == "local":
+            path = safe_vault_path(self.settings.vault_path, str(change["path"]))
+            if not path.is_file():
+                raise ValueError(f"Vault note is missing: {change['path']}")
+            current = path.read_text(encoding="utf-8")
+            if content_hash(current) != expected_hash:
+                raise ValueError("The note changed after this recommendation was created")
+            self._atomic_write(path, new_content)
+            indexed = parse_note(path, vault=self.settings.vault_path).as_dict()
+            self._upsert_indexed_note("local", indexed)
+            return
+        command = self.queue_command(
+            vault_key,
+            "apply_vault_change",
+            {
+                "sweep_id": change["sweep_id"],
+                "change_id": change["id"],
+                "path": change["path"],
+                "expected_hash": expected_hash,
+                "content": new_content,
+            },
+        )
+        if not await self._wait_for_command(command["id"], str(change["sweep_id"])):
+            raise ValueError("Vault change was stopped")
+
+    async def approve_vault_change(self, change_id: str) -> dict[str, Any]:
+        change = self.db.query_one("SELECT * FROM vault_changes WHERE id = ?", (change_id,))
+        if not change:
+            raise ValueError("Vault recommendation not found")
+        if change["status"] != "pending":
+            raise ValueError("Vault recommendation has already been reviewed")
+        try:
+            await self._apply_change_content(change)
+        except Exception as exc:
+            self.db.execute(
+                "UPDATE vault_changes SET status = 'failed', error = ?, reviewed_at = ? "
+                "WHERE id = ?",
+                (str(exc)[:2000], utc_now(), change_id),
+            )
+            raise
+        now = utc_now()
+        self.db.execute(
+            "UPDATE vault_changes SET status = 'applied', error = '', applied_at = ?, "
+            "reviewed_at = ? WHERE id = ?",
+            (now, now, change_id),
+        )
+        self.db.execute(
+            "UPDATE vault_sweeps SET applied_changes = applied_changes + 1, updated_at = ? "
+            "WHERE id = ?",
+            (now, change["sweep_id"]),
+        )
+        self.db.add_event(
+            "vault.change_applied",
+            f"Applied vault recommendation to {change['path']}",
+            details={"change_id": change_id, "sweep_id": change["sweep_id"]},
+        )
+        return {"ok": True, "id": change_id, "status": "applied"}
+
+    def reject_vault_change(self, change_id: str) -> dict[str, Any]:
+        changed = self.db.execute(
+            "UPDATE vault_changes SET status = 'rejected', reviewed_at = ? "
+            "WHERE id = ? AND status = 'pending'",
+            (utc_now(), change_id),
+        )
+        if not changed:
+            raise ValueError("Pending vault recommendation not found")
+        return {"ok": True, "id": change_id, "status": "rejected"}
+
+    async def undo_vault_sweep(self, sweep_id: str) -> dict[str, Any]:
+        changes = self.db.query_all(
+            "SELECT * FROM vault_changes WHERE sweep_id = ? AND status = 'applied' "
+            "ORDER BY applied_at DESC",
+            (sweep_id,),
+        )
+        reverted = 0
+        errors: list[str] = []
+        for change in changes:
+            try:
+                await self._apply_change_content(change, reverse=True)
+            except Exception as exc:
+                errors.append(f"{change['path']}: {exc}")
+                continue
+            self.db.execute(
+                "UPDATE vault_changes SET status = 'reverted', reviewed_at = ? WHERE id = ?",
+                (utc_now(), change["id"]),
+            )
+            reverted += 1
+        self.db.add_event(
+            "vault.sweep_undone",
+            f"Reverted {reverted} change(s) from vault sweep",
+            level="warning" if errors else "info",
+            details={"sweep_id": sweep_id, "errors": errors[:20]},
+        )
+        return {"ok": not errors, "reverted": reverted, "errors": errors}
+
+    async def _run_vault_sweep(self, sweep_id: str) -> None:
+        sweep = self.db.query_one("SELECT * FROM vault_sweeps WHERE id = ?", (sweep_id,))
+        if not sweep:
+            return
+        self._sweep_stop.clear()
+        now = utc_now()
+        self.db.execute(
+            "UPDATE vault_sweeps SET status = 'running', started_at = ?, updated_at = ? "
+            "WHERE id = ?",
+            (now, now, sweep_id),
+        )
+        try:
+            if self.db.get_setting("vault_mode", "local") == "local":
+                completed = await self._scan_local_vault(
+                    sweep_id, full_rebuild=bool(sweep["full_rebuild"])
+                )
+            else:
+                completed = await self._scan_remote_vault(
+                    sweep_id, full_rebuild=bool(sweep["full_rebuild"])
+                )
+            if not completed or self._sweep_stop.is_set():
+                self.db.execute(
+                    "UPDATE vault_sweeps SET status = 'stopped', current_note = '', "
+                    "finished_at = ?, updated_at = ? WHERE id = ?",
+                    (utc_now(), utc_now(), sweep_id),
+                )
+                return
+            change_mode = str(sweep["change_mode"])
+            if sweep["sweep_type"] == "maintenance" or change_mode != "index-only":
+                change_ids = await self._generate_maintenance_changes(sweep_id)
+                if change_mode == "auto":
+                    for change_id in change_ids:
+                        if self._sweep_stop.is_set():
+                            break
+                        try:
+                            await self.approve_vault_change(change_id)
+                        except (OSError, UnicodeError, ValueError) as exc:
+                            self.db.add_event(
+                                "vault.change_failed",
+                                f"Could not apply a sweep recommendation: {exc}",
+                                level="error",
+                                details={"change_id": change_id, "sweep_id": sweep_id},
+                            )
+            status = "stopped" if self._sweep_stop.is_set() else "completed"
+            self.db.execute(
+                "UPDATE vault_sweeps SET status = ?, current_note = '', finished_at = ?, "
+                "updated_at = ? WHERE id = ?",
+                (status, utc_now(), utc_now(), sweep_id),
+            )
+            self.db.add_event(
+                f"vault.{sweep['sweep_type']}_sweep_{status}",
+                f"Vault {sweep['sweep_type']} sweep {status}",
+                details={"sweep_id": sweep_id},
+            )
+        except Exception as exc:
+            self.db.execute(
+                "UPDATE vault_sweeps SET status = 'failed', error = ?, current_note = '', "
+                "finished_at = ?, updated_at = ? WHERE id = ?",
+                (str(exc)[:2000], utc_now(), utc_now(), sweep_id),
+            )
+            self.db.add_event(
+                "vault.sweep_failed",
+                f"Vault sweep failed: {exc}",
+                level="error",
+                details={"sweep_id": sweep_id},
+            )
+        finally:
+            if self._sweep_task is asyncio.current_task():
+                self._sweep_task = None
+
+    def start_vault_sweep(
+        self,
+        sweep_type: str,
+        *,
+        change_mode: str = "",
+        full_rebuild: bool = False,
+        scheduled: bool = False,
+    ) -> dict[str, Any]:
+        if sweep_type not in {"index", "maintenance"}:
+            raise ValueError("Sweep type must be index or maintenance")
+        active = self.db.query_one(
+            "SELECT * FROM vault_sweeps WHERE status IN ('queued', 'running', 'stopping') "
+            "ORDER BY created_at DESC LIMIT 1"
+        )
+        if active:
+            raise ValueError("Another vault sweep is already running")
+        if not self.vault_status()["configured"] or not self.vault_status()["writable"]:
+            raise ValueError("Choose an available Obsidian vault before starting a sweep")
+        default_mode = self.db.get_setting(
+            "vault_index_change_mode" if sweep_type == "index" else "vault_maintenance_change_mode",
+            "index-only" if sweep_type == "index" else "review",
+        )
+        mode = change_mode or default_mode
+        allowed = {"index-only", "review", "auto"} if sweep_type == "index" else {"review", "auto"}
+        if mode not in allowed:
+            raise ValueError("Sweep change handling is invalid")
+        sweep_id = str(uuid.uuid4())
+        now = utc_now()
+        self.db.execute(
+            """
+            INSERT INTO vault_sweeps(
+                id, sweep_type, vault_key, status, change_mode, full_rebuild, scheduled,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?)
+            """,
+            (
+                sweep_id,
+                sweep_type,
+                self._vault_key(),
+                mode,
+                int(full_rebuild),
+                int(scheduled),
+                now,
+                now,
+            ),
+        )
+        self._sweep_stop.clear()
+        self._sweep_task = asyncio.create_task(self._run_vault_sweep(sweep_id))
+        return self.vault_sweep(sweep_id)
+
+    def stop_vault_sweep(self, sweep_id: str = "") -> dict[str, Any]:
+        sweep = self.db.query_one(
+            "SELECT * FROM vault_sweeps WHERE "
+            + ("id = ? AND " if sweep_id else "")
+            + "status IN ('queued', 'running', 'stopping') ORDER BY created_at DESC LIMIT 1",
+            (sweep_id,) if sweep_id else (),
+        )
+        if not sweep:
+            return {"ok": True, "stopped": False}
+        self._sweep_stop.set()
+        now = utc_now()
+        self.db.execute(
+            "UPDATE vault_sweeps SET status = 'stopping', updated_at = ? WHERE id = ?",
+            (now, sweep["id"]),
+        )
+        self.db.execute(
+            "UPDATE commands SET status = 'cancelled', result = ?, completed_at = ? "
+            "WHERE status = 'pending' AND payload_json LIKE ?",
+            ("Vault sweep stopped by user", now, f'%"sweep_id": "{sweep["id"]}"%'),
+        )
+        return {"ok": True, "stopped": True, "id": sweep["id"]}
+
+    def vault_sweep(self, sweep_id: str) -> dict[str, Any]:
+        sweep = self.db.query_one("SELECT * FROM vault_sweeps WHERE id = ?", (sweep_id,))
+        if not sweep:
+            raise ValueError("Vault sweep not found")
+        return sweep
+
+    def vault_sweep_status(self) -> dict[str, Any]:
+        vault_key = self._vault_key()
+        active = self.db.query_one(
+            "SELECT * FROM vault_sweeps WHERE status IN ('queued', 'running', 'stopping') "
+            "ORDER BY created_at DESC LIMIT 1"
+        )
+        recent = self.db.query_all("SELECT * FROM vault_sweeps ORDER BY created_at DESC LIMIT 20")
+        indexed = self.db.query_one(
+            "SELECT count(*) AS count, max(indexed_at) AS last_indexed_at FROM vault_notes "
+            "WHERE vault_key = ?",
+            (vault_key,),
+        )
+        completed_index = self.db.query_one(
+            "SELECT finished_at FROM vault_sweeps WHERE vault_key = ? AND sweep_type = 'index' "
+            "AND status = 'completed' ORDER BY finished_at DESC LIMIT 1",
+            (vault_key,),
+        )
+        last_indexed_at = (
+            str(completed_index.get("finished_at") or "") if completed_index else ""
+        ) or (str(indexed.get("last_indexed_at") or "") if indexed else "")
+        return {
+            "active": active,
+            "recent": recent,
+            "indexed_notes": int(indexed["count"] if indexed else 0),
+            "last_indexed_at": last_indexed_at,
+        }
+
+    def list_vault_changes(
+        self, *, status: str = "pending", limit: int = 200, offset: int = 0
+    ) -> dict[str, Any]:
+        where = "WHERE c.status = ?" if status else ""
+        params: list[Any] = [status] if status else []
+        count = self.db.query_one(f"SELECT count(*) AS count FROM vault_changes c {where}", params)
+        rows = self.db.query_all(
+            f"""
+            SELECT c.*, s.sweep_type, s.change_mode
+            FROM vault_changes c JOIN vault_sweeps s ON s.id = c.sweep_id
+            {where} ORDER BY c.created_at DESC LIMIT ? OFFSET ?
+            """,
+            [*params, max(1, min(limit, 500)), max(0, offset)],
+        )
+        for row in rows:
+            try:
+                row["evidence"] = json.loads(row.pop("evidence_json") or "[]")
+            except (TypeError, json.JSONDecodeError):
+                row["evidence"] = []
+            row.pop("before_content", None)
+            row.pop("after_content", None)
+        return {"items": rows, "total": int(count["count"] if count else 0)}
+
+    def vault_change_diff(self, change_id: str) -> dict[str, Any]:
+        change = self.db.query_one("SELECT * FROM vault_changes WHERE id = ?", (change_id,))
+        if not change:
+            raise ValueError("Vault recommendation not found")
+        try:
+            change["evidence"] = json.loads(change.pop("evidence_json") or "[]")
+        except (TypeError, json.JSONDecodeError):
+            change["evidence"] = []
+        return change
+
+    def agent_sweep_progress(
+        self,
+        agent_id: str,
+        sweep_id: str,
+        *,
+        processed: int,
+        total: int,
+        current_note: str,
+    ) -> dict[str, Any]:
+        sweep = self.db.query_one(
+            "SELECT * FROM vault_sweeps WHERE id = ? AND vault_key = ?", (sweep_id, agent_id)
+        )
+        if not sweep:
+            raise ValueError("Vault sweep not found for this computer")
+        self.db.execute(
+            "UPDATE vault_sweeps SET processed_notes = ?, total_notes = ?, current_note = ?, "
+            "updated_at = ? WHERE id = ?",
+            (max(0, processed), max(0, total), current_note[:2000], utc_now(), sweep_id),
+        )
+        return {"ok": True, "stop_requested": sweep["status"] in {"stopping", "stopped"}}
+
+    @staticmethod
+    def _sanitize_indexed_note(raw_note: dict[str, Any]) -> dict[str, Any]:
+        path = safe_relative_path(str(raw_note.get("path", ""))).as_posix()
+        content = str(raw_note.get("content", ""))[:2_000_000]
+        parsed = parse_note(
+            Path(path), content=content, modified_ns=int(raw_note.get("modified_ns", 0))
+        ).as_dict()
+        parsed["content_hash"] = str(raw_note.get("content_hash") or content_hash(content))
+        parsed["size"] = max(0, int(raw_note.get("size", len(content.encode("utf-8")))))
+        return parsed
+
+    def agent_sweep_notes(
+        self, agent_id: str, sweep_id: str, notes: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        sweep = self.db.query_one(
+            "SELECT * FROM vault_sweeps WHERE id = ? AND vault_key = ?", (sweep_id, agent_id)
+        )
+        if not sweep:
+            raise ValueError("Vault sweep not found for this computer")
+        if sweep["status"] in {"stopping", "stopped"}:
+            return {"ok": True, "accepted": 0, "stop_requested": True}
+        if len(notes) > 50:
+            raise ValueError("Vault index batches are limited to 50 notes")
+        sanitized = [self._sanitize_indexed_note(note) for note in notes if isinstance(note, dict)]
+        stored = self._store_vault_index(
+            agent_id, sanitized, full_rebuild=False, delete_missing=False
+        )
+        with self.db.transaction() as connection:
+            connection.executemany(
+                "INSERT OR IGNORE INTO vault_sweep_paths(sweep_id, vault_key, path) "
+                "VALUES (?, ?, ?)",
+                [(sweep_id, agent_id, note["path"]) for note in sanitized],
+            )
+            connection.execute(
+                "UPDATE vault_sweeps SET changed_notes = changed_notes + ?, updated_at = ? "
+                "WHERE id = ?",
+                (stored["changed"], utc_now(), sweep_id),
+            )
+        return {"ok": True, "accepted": len(sanitized), "stop_requested": False}
+
+    def _finalize_remote_index(self, agent_id: str, sweep_id: str) -> dict[str, int]:
+        before = self.db.query_one(
+            "SELECT count(*) AS count FROM vault_notes WHERE vault_key = ?", (agent_id,)
+        )
+        self.db.execute(
+            """
+            DELETE FROM vault_notes
+            WHERE vault_key = ? AND NOT EXISTS (
+                SELECT 1 FROM vault_sweep_paths p
+                WHERE p.sweep_id = ? AND p.vault_key = vault_notes.vault_key
+                  AND p.path = vault_notes.path
+            )
+            """,
+            (agent_id, sweep_id),
+        )
+        notes = self._indexed_vault_notes(agent_id)
+        add_backlinks(notes)
+        with self.db.transaction() as connection:
+            connection.executemany(
+                "UPDATE vault_notes SET backlinks_json = ? WHERE vault_key = ? AND path = ?",
+                [
+                    (
+                        json.dumps(note.get("backlinks", []), ensure_ascii=False),
+                        agent_id,
+                        note["path"],
+                    )
+                    for note in notes
+                ],
+            )
+        previous = int(before["count"] if before else 0)
+        return {"notes": len(notes), "removed": max(0, previous - len(notes))}
+
+    @staticmethod
+    def _parse_schedule_time(value: str) -> tuple[int, int]:
+        match = re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)", value)
+        if not match:
+            raise ValueError("Sweep schedule time must use HH:MM")
+        return int(match.group(1)), int(match.group(2))
+
+    def _schedule_due(self, sweep_type: str, now_utc: datetime) -> bool:
+        prefix = "vault_index" if sweep_type == "index" else "vault_maintenance"
+        if self.db.get_setting(f"{prefix}_schedule_enabled", "false") != "true":
+            return False
+        timezone_name = self.db.get_setting("vault_schedule_timezone", "America/New_York")
+        try:
+            timezone = ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError:
+            timezone = UTC
+        local_now = now_utc.astimezone(timezone)
+        frequency = self.db.get_setting(f"{prefix}_schedule_frequency", "weekly")
+        last = self.db.query_one(
+            "SELECT created_at FROM vault_sweeps WHERE sweep_type = ? AND scheduled = 1 "
+            "ORDER BY created_at DESC LIMIT 1",
+            (sweep_type,),
+        )
+        last_at = datetime.fromisoformat(last["created_at"]) if last else None
+        if frequency == "custom":
+            try:
+                hours = max(
+                    1,
+                    min(int(self.db.get_setting(f"{prefix}_schedule_interval_hours", "24")), 8760),
+                )
+            except ValueError:
+                hours = 24
+            return last_at is None or now_utc - last_at >= timedelta(hours=hours)
+        hour, minute = self._parse_schedule_time(
+            self.db.get_setting(f"{prefix}_schedule_time", "02:00")
+        )
+        due = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if frequency == "weekly":
+            weekday = max(
+                0,
+                min(int(self.db.get_setting(f"{prefix}_schedule_weekday", "6")), 6),
+            )
+            due -= timedelta(days=(due.weekday() - weekday) % 7)
+        elif frequency == "monthly":
+            day = max(
+                1,
+                min(int(self.db.get_setting(f"{prefix}_schedule_month_day", "1")), 28),
+            )
+            due = due.replace(day=day)
+            if due > local_now:
+                previous_month = due.replace(day=1) - timedelta(days=1)
+                due = due.replace(year=previous_month.year, month=previous_month.month, day=day)
+        elif frequency != "daily":
+            raise ValueError("Sweep schedule frequency is invalid")
+        if due > local_now:
+            if frequency == "daily":
+                due -= timedelta(days=1)
+            elif frequency == "weekly":
+                due -= timedelta(days=7)
+        due_utc = due.astimezone(UTC)
+        return due_utc <= now_utc and (last_at is None or last_at < due_utc)
+
+    async def scheduler_tick(self, now: datetime | None = None) -> None:
+        if self._sweep_task and not self._sweep_task.done():
+            return
+        active = self.db.query_one(
+            "SELECT id FROM vault_sweeps WHERE status IN ('queued', 'running', 'stopping') LIMIT 1"
+        )
+        if active:
+            return
+        vault = self.vault_status()
+        if not vault["configured"] or not vault["writable"]:
+            # A scheduled run is postponed while a desktop or mounted vault is
+            # unavailable. Nothing is queued, so missed runs cannot stack up.
+            return
+        now_utc = (now or datetime.now(UTC)).astimezone(UTC)
+        for sweep_type in ("index", "maintenance"):
+            if self._schedule_due(sweep_type, now_utc):
+                self.start_vault_sweep(sweep_type, scheduled=True)
+                return
+
+    async def _scheduler_loop(self) -> None:
+        while True:
+            try:
+                await self.scheduler_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.db.add_event(
+                    "vault.scheduler_error",
+                    f"Vault sweep scheduler failed: {exc}",
+                    level="error",
+                )
+            await asyncio.sleep(30)
+
+    def start_background_tasks(self) -> None:
+        if not self._scheduler_task or self._scheduler_task.done():
+            self._scheduler_task = asyncio.create_task(self._scheduler_loop())
+
+    async def stop_background_tasks(self) -> None:
+        self._sweep_stop.set()
+        tasks = [task for task in (self._scheduler_task, self._sweep_task) if task]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._scheduler_task = None
+        self._sweep_task = None
 
     def _bootstrap_admin_from_env(self) -> None:
         if self.has_admin_account():
@@ -1269,25 +2118,45 @@ class ObsyncService:
         self,
     ) -> tuple[dict[tuple[str, str, str], dict[str, str]], list[dict[str, Any]]]:
         index: dict[tuple[str, str, str], dict[str, str]] = {}
-        catalog: list[dict[str, Any]] = []
+        catalog = self._indexed_vault_notes("local")
+        if catalog:
+            for note in catalog:
+                properties = note.get("properties", {})
+                if not isinstance(properties, dict) or not properties.get("obsync_id"):
+                    continue
+                metadata = {
+                    key: str(properties.get(key, ""))
+                    for key in (
+                        "obsync_id",
+                        "obsync_status",
+                        "obsync_source",
+                        "obsync_machine",
+                        "obsync_root",
+                        "obsync_hash",
+                    )
+                }
+                metadata["destination_path"] = str(note["path"])
+                key = (
+                    metadata["obsync_machine"].casefold(),
+                    metadata["obsync_root"].casefold(),
+                    metadata["obsync_source"],
+                )
+                index.setdefault(key, metadata)
+            return index, catalog
+        catalog = []
         if not self.settings.vault_path.is_dir():
             return index, catalog
         for path in self.settings.vault_path.rglob("*.md"):
             if path.is_symlink() or not path.is_file() or ".obsidian" in path.parts:
                 continue
             try:
-                content = path.read_text(encoding="utf-8")
+                parsed = parse_note(path, vault=self.settings.vault_path).as_dict()
+                content = str(parsed["content"])
                 metadata = managed_note_metadata(content)
-            except (OSError, UnicodeError):
+            except (OSError, UnicodeError, ValueError):
                 continue
-            relative = path.relative_to(self.settings.vault_path).as_posix()
-            catalog.append(
-                {
-                    "path": relative,
-                    "title": note_title(content, path),
-                    "tags": note_tags(content),
-                }
-            )
+            relative = str(parsed["path"])
+            catalog.append(parsed)
             if not metadata:
                 continue
             key = (
@@ -1297,6 +2166,8 @@ class ObsyncService:
             )
             metadata["destination_path"] = relative
             index.setdefault(key, metadata)
+        add_backlinks(catalog)
+        self._store_vault_index("local", catalog, full_rebuild=True)
         return index, catalog
 
     @staticmethod
@@ -1386,6 +2257,56 @@ class ObsyncService:
         state = "in-sync" if note_hash and note_hash == observed_hash else "modified"
         return state, destination, note_hash, "", ""
 
+    def _compare_indexed_document(
+        self,
+        document: dict[str, Any],
+        *,
+        agent_name: str,
+        root_name: str,
+        vault_index: dict[tuple[str, str, str], dict[str, str]],
+        vault_catalog: list[dict[str, Any]],
+    ) -> tuple[str, str, str, str, str]:
+        destination = str(document.get("destination_path") or "")
+        if document.get("status") == "ignored":
+            return "ignored", destination, "", "", ""
+        by_path = {str(note.get("path", "")): note for note in vault_catalog}
+        metadata: dict[str, str] | None = None
+        if destination:
+            note = by_path.get(destination)
+            if not note:
+                return "vault-missing", destination, "", "", ""
+            properties = note.get("properties", {})
+            if isinstance(properties, dict) and properties.get("obsync_id"):
+                metadata = {key: str(value) for key, value in properties.items()}
+            else:
+                return "modified", destination, "", "", ""
+        else:
+            metadata = vault_index.get(
+                self._identity_key(agent_name, root_name, str(document["source_path"]))
+            )
+            if not metadata:
+                duplicate = None
+                if self.db.get_setting(
+                    "duplicate_policy", "review"
+                ) == "review" and not document.get("duplicate_dismissed"):
+                    duplicate = self._possible_duplicate(
+                        note_title_from_path(Path(str(document["source_path"]))), vault_catalog
+                    )
+                if duplicate:
+                    return (
+                        "possible-duplicate",
+                        "",
+                        "",
+                        str(duplicate["path"]),
+                        str(duplicate["title"]),
+                    )
+                return "new", "", "", "", ""
+            destination = str(metadata["destination_path"])
+        note_hash = str(metadata.get("obsync_hash", ""))
+        observed_hash = str(document.get("observed_hash") or document.get("source_hash") or "")
+        state = "in-sync" if note_hash and note_hash == observed_hash else "modified"
+        return state, destination, note_hash, "", ""
+
     def inventory_files(
         self,
         *,
@@ -1414,8 +2335,20 @@ class ObsyncService:
                 self._inventory_vault_indexes[scan_id] = self._local_vault_snapshot()
             vault_index, vault_catalog = self._inventory_vault_indexes[scan_id]
         else:
+            vault_catalog = self._indexed_vault_notes(self.db.get_setting("vault_agent_id", ""))
             vault_index = {}
-            vault_catalog = []
+            for note in vault_catalog:
+                properties = note.get("properties", {})
+                if not isinstance(properties, dict) or not properties.get("obsync_id"):
+                    continue
+                metadata = {key: str(value) for key, value in properties.items()}
+                metadata["destination_path"] = str(note["path"])
+                key = self._identity_key(
+                    metadata.get("obsync_machine", ""),
+                    metadata.get("obsync_root", ""),
+                    metadata.get("obsync_source", ""),
+                )
+                vault_index.setdefault(key, metadata)
 
         for item in items:
             source_path = safe_relative_path(str(item.get("source_path", ""))).as_posix()
@@ -1489,17 +2422,18 @@ class ObsyncService:
                     ),
                 )
 
-            if local_mode:
+            if local_mode or vault_catalog:
                 document = self.db.query_one("SELECT * FROM documents WHERE id = ?", (document_id,))
                 assert document is not None
-                comparison, destination, note_hash, duplicate_path, duplicate_title = (
-                    self._compare_local_document(
-                        document,
-                        agent_name=str(agent["name"]),
-                        root_name=str(root["name"]),
-                        vault_index=vault_index,
-                        vault_catalog=vault_catalog,
-                    )
+                compare = (
+                    self._compare_local_document if local_mode else self._compare_indexed_document
+                )
+                comparison, destination, note_hash, duplicate_path, duplicate_title = compare(
+                    document,
+                    agent_name=str(agent["name"]),
+                    root_name=str(root["name"]),
+                    vault_index=vault_index,
+                    vault_catalog=vault_catalog,
                 )
                 values: list[Any] = [
                     comparison,
@@ -1555,7 +2489,7 @@ class ObsyncService:
                     root_id,
                 ),
             )
-            if not local_mode:
+            if not local_mode and not vault_catalog:
                 vault_agent = self._remote_vault_agent()
                 documents = self.db.query_all(
                     """
@@ -1709,44 +2643,27 @@ class ObsyncService:
     ) -> list[dict[str, Any]]:
         if not profile.use_vault_context or not profile.candidate_limit:
             return []
-        catalog: list[dict[str, Any]] = []
-        if self.db.get_setting("vault_mode", "local") == "local":
+        catalog = self._indexed_vault_notes()
+        if not catalog and self.db.get_setting("vault_mode", "local") == "local":
             _index, catalog = self._local_vault_snapshot()
-        else:
-            vault_key = self.db.get_setting("vault_agent_id", "")
-            for row in self.db.query_all(
-                "SELECT path, title, tags_json FROM vault_notes WHERE vault_key = ? "
-                "ORDER BY title COLLATE NOCASE LIMIT 5000",
-                (vault_key,),
-            ):
-                with suppress(TypeError, json.JSONDecodeError):
-                    row["tags"] = json.loads(row.pop("tags_json") or "[]")
-                catalog.append(row)
         if not catalog:
             catalog = [
-                {"path": row["destination_path"], "title": row["title"], "tags": []}
+                {
+                    "path": row["destination_path"],
+                    "title": row["title"],
+                    "tags": [],
+                    "aliases": [],
+                    "headings": [],
+                    "entities": [],
+                    "content": row["summary"],
+                    "properties": {},
+                }
                 for row in self.db.query_all(
-                    "SELECT DISTINCT destination_path, title FROM documents "
+                    "SELECT DISTINCT destination_path, title, summary FROM documents "
                     "WHERE status = 'synced' AND title != '' ORDER BY updated_at DESC LIMIT 1000"
                 )
             ]
-        terms = self._candidate_terms(source_path, text)
-        scored: list[tuple[int, str, dict[str, Any]]] = []
-        seen: set[str] = set()
-        for note in catalog:
-            title = str(note.get("title", "")).strip()
-            if not title or title.casefold() in seen:
-                continue
-            seen.add(title.casefold())
-            tags = note.get("tags", [])
-            haystack = " ".join(
-                [title, str(note.get("path", "")), *(str(tag) for tag in tags)]
-            ).lower()
-            note_terms = set(re.findall(r"[a-z0-9][a-z0-9-]{3,}", haystack))
-            score = len(terms & note_terms)
-            scored.append((score, title.casefold(), note))
-        scored.sort(key=lambda item: (-item[0], item[1]))
-        return [note for _score, _title, note in scored[: profile.candidate_limit]]
+        return rank_notes(source_path, text, catalog, limit=profile.candidate_limit)
 
     def _new_destination(
         self,
@@ -1756,14 +2673,23 @@ class ObsyncService:
         root: dict[str, Any],
         analysis: Analysis,
         profile: AIProfile,
+        candidates: list[dict[str, Any]] | None = None,
     ) -> str:
-        segments = [
-            str(root["destination"]),
-            slugify(agent_name, "device"),
-            slugify(str(root["name"]), "folder"),
-        ]
-        if profile.organize_folders:
-            segments.append(slugify(analysis.category, "documents"))
+        segments: list[str]
+        best = (candidates or [None])[0]
+        best_path = str(best.get("path", "")) if isinstance(best, dict) else ""
+        best_score = float(best.get("score", 0)) if isinstance(best, dict) else 0
+        existing_folder = Path(best_path).parent if best_path else Path()
+        if profile.organize_folders and best_score >= 30 and str(existing_folder) not in {"", "."}:
+            segments = list(existing_folder.parts)
+        else:
+            segments = [
+                str(root["destination"]),
+                slugify(agent_name, "device"),
+                slugify(str(root["name"]), "folder"),
+            ]
+            if profile.organize_folders:
+                segments.append(slugify(analysis.category, "documents"))
         filename = f"{slugify(analysis.title, 'document')}-{document_id[:8]}.md"
         relative = Path(*segments) / filename
         safe_relative_path(str(relative))
@@ -1996,6 +2922,74 @@ class ObsyncService:
             extracted = await asyncio.to_thread(
                 extract_document, staged_file, active_profile.input_char_limit
             )
+            vault_candidates = self._candidate_notes(source_rel, extracted.text, active_profile)
+            match = None
+            if not (existing and existing.get("destination_path")) and not (
+                existing and existing.get("duplicate_dismissed")
+            ):
+                match = existing_note_match(
+                    source_rel,
+                    extracted.text,
+                    actual_hash,
+                    self._indexed_vault_notes(),
+                )
+            if match:
+                match_path = safe_relative_path(str(match.get("path", ""))).as_posix()
+                evidence = [str(item)[:500] for item in match.get("evidence", [])[:20]]
+                auto_adopt = match.get("strength") == "exact" or (
+                    match.get("strength") == "strong"
+                    and self.db.get_setting("existing_note_policy", "review") == "auto"
+                )
+                if auto_adopt:
+                    self.db.execute(
+                        """
+                        UPDATE documents SET destination_path = ?, vault_adopted = ?,
+                            match_evidence_json = ?, duplicate_path = '', duplicate_title = '',
+                            updated_at = ? WHERE id = ?
+                        """,
+                        (
+                            match_path,
+                            int(not bool(match.get("managed"))),
+                            json.dumps(evidence, ensure_ascii=False),
+                            utc_now(),
+                            document_id,
+                        ),
+                    )
+                    existing = self.db.query_one(
+                        "SELECT * FROM documents WHERE id = ?", (document_id,)
+                    )
+                else:
+                    self.db.execute(
+                        """
+                        UPDATE documents SET status = 'duplicate-review',
+                            comparison_status = 'possible-duplicate', needs_review = 1,
+                            duplicate_path = ?, duplicate_title = ?, match_evidence_json = ?,
+                            error = '', updated_at = ? WHERE id = ?
+                        """,
+                        (
+                            match_path,
+                            str(match.get("title", ""))[:200],
+                            json.dumps(evidence, ensure_ascii=False),
+                            utc_now(),
+                            document_id,
+                        ),
+                    )
+                    self.db.add_event(
+                        "document.existing_note_review",
+                        f"Held {source_rel}; it may update {match.get('title', match_path)}",
+                        level="warning",
+                        agent_id=agent["id"],
+                        root_id=root_id,
+                        document_id=document_id,
+                        details={
+                            "duplicate_path": match_path,
+                            "strength": match.get("strength"),
+                            "evidence": evidence,
+                        },
+                    )
+                    row = self.db.query_one("SELECT * FROM documents WHERE id = ?", (document_id,))
+                    assert row is not None
+                    return {**self._decode_document(row), "result": "possible-duplicate"}
             self._update_activity(
                 document_id,
                 "stage",
@@ -2041,9 +3035,24 @@ class ObsyncService:
                 source_path=source_rel,
                 text=extracted.text,
                 mime_type=extracted.mime_type,
-                candidates=self._candidate_notes(source_rel, extracted.text, active_profile),
+                candidates=vault_candidates,
                 review_feedback=review_feedback,
             )
+            validated_links = list(analysis.related_notes)
+            minimum_link_score = float(self.db.get_setting("vault_link_minimum_score", "24"))
+            maximum_links = min(
+                active_profile.related_notes_limit,
+                int(self.db.get_setting("vault_link_limit", "100")),
+            )
+            for candidate in vault_candidates:
+                if float(candidate.get("score", 0)) < minimum_link_score:
+                    continue
+                target = str(candidate.get("link_target", "")).strip()
+                if target and target not in validated_links:
+                    validated_links.append(target)
+                if len(validated_links) >= maximum_links:
+                    break
+            analysis.related_notes = validated_links[:maximum_links]
             if activity:
                 activity["ai_active"] = False
             self._update_activity(
@@ -2065,6 +3074,7 @@ class ObsyncService:
                 self.db.get_setting("duplicate_policy", "review") == "review"
                 and not (existing and existing.get("duplicate_dismissed"))
                 and self.db.get_setting("vault_mode", "local") == "local"
+                and not match
             ):
                 _managed_index, vault_catalog = self._local_vault_snapshot()
                 duplicate = self._possible_duplicate(
@@ -2120,6 +3130,7 @@ class ObsyncService:
                     root=root,
                     analysis=analysis,
                     profile=active_profile,
+                    candidates=vault_candidates,
                 )
             )
             generated = render_markdown(
@@ -2156,11 +3167,19 @@ class ObsyncService:
                 if destination_path.exists():
                     current = destination_path.read_text(encoding="utf-8")
                     if not is_managed_note(current):
-                        raise ValueError(
-                            f"Destination already exists and is not managed: {destination}"
-                        )
-                    generated = merge_preserving_manual(current, generated)
+                        if existing and existing.get("vault_adopted"):
+                            generated = adopt_preserving_original(current, generated)
+                        else:
+                            raise ValueError(
+                                f"Destination already exists and is not managed: {destination}"
+                            )
+                    else:
+                        generated = merge_preserving_manual(current, generated)
                 self._atomic_write(destination_path, generated)
+                self._upsert_indexed_note(
+                    "local",
+                    parse_note(destination_path, vault=self.settings.vault_path).as_dict(),
+                )
 
             updated_at = utc_now()
             self.db.execute(
@@ -2201,6 +3220,7 @@ class ObsyncService:
                         "document_id": document_id,
                         "destination_path": destination,
                         "content": generated,
+                        "allow_adopt": bool(existing and existing.get("vault_adopted")),
                     },
                 )
             self.db.add_event(
@@ -2402,20 +3422,32 @@ class ObsyncService:
         result = dict(row)
         result["tags"] = json.loads(result.pop("tags_json", "[]") or "[]")
         result["analysis"] = json.loads(result.pop("analysis_json", "{}") or "{}")
+        result["match_evidence"] = json.loads(result.pop("match_evidence_json", "[]") or "[]")
         return result
 
     def approve_document(self, document_id: str) -> dict[str, Any]:
         document = self.db.query_one("SELECT * FROM documents WHERE id = ?", (document_id,))
         if not document:
             raise ValueError("Document not found")
+        adopt_path = str(document.get("duplicate_path") or "")
+        adopted = 0
+        if adopt_path:
+            indexed = self.db.query_one(
+                "SELECT managed FROM vault_notes WHERE vault_key = ? AND path = ?",
+                (self._vault_key(), adopt_path),
+            )
+            adopted = int(not bool(indexed and indexed["managed"]))
         self.db.execute(
             """
             UPDATE documents SET needs_review = 0, review_resolution = 'approved',
                 status = CASE WHEN status = 'duplicate-review' THEN 'duplicate-approved'
                               ELSE status END,
+                destination_path = CASE WHEN duplicate_path != '' THEN duplicate_path
+                                        ELSE destination_path END,
+                vault_adopted = CASE WHEN duplicate_path != '' THEN ? ELSE vault_adopted END,
                 error = '', updated_at = ? WHERE id = ?
             """,
-            (utc_now(), document_id),
+            (adopted, utc_now(), document_id),
         )
         self.db.add_event(
             "document.review_approved",
@@ -2424,7 +3456,23 @@ class ObsyncService:
             root_id=document["root_id"],
             document_id=document_id,
         )
-        return {"ok": True}
+        command = None
+        root = self.db.query_one(
+            "SELECT root_key, enabled, sync_state FROM roots WHERE id = ?", (document["root_id"],)
+        )
+        if (
+            adopt_path
+            and root
+            and root["enabled"]
+            and root["sync_state"] == "running"
+            and self.pipeline_enabled()
+        ):
+            command = self.queue_command(
+                document["agent_id"],
+                "resync",
+                {"root_key": root["root_key"], "source_path": document["source_path"]},
+            )
+        return {"ok": True, "command": command, "adopted_path": adopt_path}
 
     def disregard_document(self, document_id: str) -> dict[str, Any]:
         document = self.db.query_one("SELECT * FROM documents WHERE id = ?", (document_id,))
@@ -2602,6 +3650,53 @@ class ObsyncService:
                 agent_id=agent_id,
                 document_id=document_id,
             )
+            if ok:
+                content = str(payload.get("content", ""))
+                destination = str(payload.get("destination_path", ""))
+                if content and destination:
+                    cached = self.db.query_one(
+                        "SELECT content FROM vault_notes WHERE vault_key = ? AND path = ?",
+                        (agent_id, destination),
+                    )
+                    if cached and str(cached.get("content", "")).strip():
+                        current = str(cached["content"])
+                        if is_managed_note(current):
+                            content = merge_preserving_manual(current, content)
+                        elif payload.get("allow_adopt"):
+                            content = adopt_preserving_original(current, content)
+                    parsed = parse_note(Path(destination), content=content, modified_ns=0).as_dict()
+                    self._upsert_indexed_note(agent_id, parsed)
+        elif command["command"] == "index_vault" and ok:
+            try:
+                index_payload = json.loads(result)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("Desktop vault index returned invalid data") from exc
+            if not isinstance(index_payload, dict):
+                raise ValueError("Desktop vault index returned invalid data")
+            sweep_id = str(index_payload.get("sweep_id", ""))
+            indexed = max(0, int(index_payload.get("indexed", 0)))
+            if not sweep_id:
+                raise ValueError("Desktop vault index did not identify its sweep")
+            stored = self._finalize_remote_index(agent_id, sweep_id)
+            self.db.execute(
+                "UPDATE vault_sweeps SET total_notes = ?, processed_notes = ?, "
+                "changed_notes = changed_notes + ?, current_note = '', updated_at = ? "
+                "WHERE id = ?",
+                (indexed, indexed, stored["removed"], utc_now(), sweep_id),
+            )
+            self.db.execute("DELETE FROM vault_sweep_paths WHERE sweep_id = ?", (sweep_id,))
+            self.db.add_event(
+                "vault.indexed",
+                f"Indexed {stored['notes']} notes from the desktop Obsidian vault",
+                agent_id=agent_id,
+                details={"sweep_id": sweep_id},
+            )
+        elif command["command"] == "apply_vault_change" and ok:
+            content = str(payload.get("content", ""))
+            path = safe_relative_path(str(payload.get("path", ""))).as_posix()
+            if content and path:
+                parsed = parse_note(Path(path), content=content, modified_ns=0).as_dict()
+                self._upsert_indexed_note(agent_id, parsed)
         elif command["command"] == "audit_vault" and ok:
             try:
                 audit_payload = json.loads(result)
@@ -2690,11 +3785,14 @@ class ObsyncService:
                             (agent_id, path, title, json.dumps(tags, ensure_ascii=False), now)
                         )
                 with self.db.transaction() as connection:
-                    connection.execute("DELETE FROM vault_notes WHERE vault_key = ?", (agent_id,))
                     connection.executemany(
                         """
                         INSERT INTO vault_notes(vault_key, path, title, tags_json, updated_at)
                         VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(vault_key, path) DO UPDATE SET
+                            title = excluded.title,
+                            tags_json = excluded.tags_json,
+                            updated_at = excluded.updated_at
                         """,
                         sanitized_notes,
                     )
@@ -2706,6 +3804,12 @@ class ObsyncService:
 
     def overview(self) -> dict[str, Any]:
         stats = self.db.dashboard_stats()
+        pending_vault_changes = self.db.query_one(
+            "SELECT count(*) AS count FROM vault_changes WHERE status = 'pending'"
+        )
+        stats["document_review"] = stats["review"]
+        stats["vault_review"] = int(pending_vault_changes["count"] if pending_vault_changes else 0)
+        stats["review"] += stats["vault_review"]
         stats["online_agents"] = sum(1 for row in self.list_agents() if row["status"] == "online")
         stats["computers"] = stats["agents"] + 1
         stats["online_computers"] = stats["online_agents"] + 1
@@ -2719,6 +3823,7 @@ class ObsyncService:
             "server": self.server_info(),
             "pipeline": self.pipeline_status(),
             "active_work": self.active_work(),
+            "vault_sweep": self.vault_sweep_status()["active"],
         }
 
     def settings_for_ui(self) -> dict[str, Any]:
@@ -2754,6 +3859,25 @@ class ObsyncService:
             "llm_vault_context": False,
             "duplicate_policy": False,
             "review_threshold": False,
+            "existing_note_policy": False,
+            "vault_index_schedule_enabled": False,
+            "vault_index_schedule_frequency": False,
+            "vault_index_schedule_time": False,
+            "vault_index_schedule_weekday": False,
+            "vault_index_schedule_month_day": False,
+            "vault_index_schedule_interval_hours": False,
+            "vault_index_change_mode": False,
+            "vault_maintenance_schedule_enabled": False,
+            "vault_maintenance_schedule_frequency": False,
+            "vault_maintenance_schedule_time": False,
+            "vault_maintenance_schedule_weekday": False,
+            "vault_maintenance_schedule_month_day": False,
+            "vault_maintenance_schedule_interval_hours": False,
+            "vault_maintenance_change_mode": False,
+            "vault_schedule_timezone": False,
+            "vault_maintenance_categories": False,
+            "vault_link_minimum_score": False,
+            "vault_link_limit": False,
         }
         values: dict[str, tuple[str, bool]] = {}
         requested_mode = str(payload.get("vault_mode", "")).strip()
@@ -2777,6 +3901,69 @@ class ObsyncService:
         duplicate_policy = str(payload.get("duplicate_policy", "")).strip()
         if duplicate_policy and duplicate_policy not in {"review", "allow"}:
             raise ValueError("Duplicate policy must be review or allow")
+        existing_policy = str(payload.get("existing_note_policy", "")).strip()
+        if existing_policy and existing_policy not in {"review", "auto"}:
+            raise ValueError("Existing-note handling must be review or auto")
+        for key in ("vault_index_change_mode", "vault_maintenance_change_mode"):
+            if key not in payload:
+                continue
+            mode = str(payload[key]).strip()
+            allowed_modes = (
+                {"index-only", "review", "auto"} if "index" in key else {"review", "auto"}
+            )
+            if mode not in allowed_modes:
+                raise ValueError("Sweep change handling is invalid")
+        for key in ("vault_index_schedule_frequency", "vault_maintenance_schedule_frequency"):
+            if key in payload and str(payload[key]).strip() not in {
+                "daily",
+                "weekly",
+                "monthly",
+                "custom",
+            }:
+                raise ValueError("Sweep frequency must be daily, weekly, monthly, or custom")
+        for key in ("vault_index_schedule_time", "vault_maintenance_schedule_time"):
+            if key in payload:
+                self._parse_schedule_time(str(payload[key]).strip())
+        if "vault_schedule_timezone" in payload:
+            try:
+                ZoneInfo(str(payload["vault_schedule_timezone"]).strip())
+            except ZoneInfoNotFoundError:
+                raise ValueError("Sweep timezone is invalid") from None
+        numeric_ranges = {
+            "vault_index_schedule_weekday": (0, 6),
+            "vault_maintenance_schedule_weekday": (0, 6),
+            "vault_index_schedule_month_day": (1, 28),
+            "vault_maintenance_schedule_month_day": (1, 28),
+            "vault_index_schedule_interval_hours": (1, 8760),
+            "vault_maintenance_schedule_interval_hours": (1, 8760),
+            "vault_link_limit": (1, 250),
+        }
+        for key, (minimum, maximum) in numeric_ranges.items():
+            if key in payload:
+                try:
+                    number = int(payload[key])
+                except (TypeError, ValueError):
+                    raise ValueError(f"{key} must be a whole number") from None
+                if not minimum <= number <= maximum:
+                    raise ValueError(f"{key} must be between {minimum} and {maximum}")
+        if "vault_link_minimum_score" in payload:
+            try:
+                score = float(payload["vault_link_minimum_score"])
+            except (TypeError, ValueError):
+                raise ValueError("Link relevance score must be a number") from None
+            if not 5 <= score <= 200:
+                raise ValueError("Link relevance score must be between 5 and 200")
+        if "vault_maintenance_categories" in payload:
+            categories = payload["vault_maintenance_categories"]
+            if isinstance(categories, str):
+                try:
+                    categories = json.loads(categories)
+                except json.JSONDecodeError:
+                    raise ValueError("Maintenance categories are invalid") from None
+            allowed_categories = {"links", "tags"}
+            if not isinstance(categories, list) or not set(categories) <= allowed_categories:
+                raise ValueError("Maintenance categories are invalid")
+            payload = {**payload, "vault_maintenance_categories": json.dumps(categories)}
         if "llm_instructions" in payload and len(str(payload["llm_instructions"])) > 8000:
             raise ValueError("AI instructions must be 8,000 characters or fewer")
         for key, secret in allowed.items():

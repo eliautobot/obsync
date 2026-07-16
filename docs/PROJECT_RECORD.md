@@ -9,7 +9,7 @@ Obsync is a self-hosted ingestion layer that keeps an Obsidian vault aligned wit
 - Source: <https://github.com/eliautobot/obsync>
 - License: MIT
 - Initial release: `v0.1.0`
-- Current development version: `v0.12.1`
+- Current development version: `v0.13.0`
 
 ## Product decisions
 
@@ -48,6 +48,8 @@ Version 0.11.0 replaces tick-based Local AI repainting with authenticated server
 Version 0.12.0 makes complete source transfer the default, fixes the stale UI version label, adds immutable Full transfer and Brief summary profiles, adds fully editable custom AI profiles, exposes inference prompts and parameters, and catalogs real vault titles, paths, and tags for profile-controlled Obsidian properties, folders, tags, and validated `[[wikilinks]]`.
 
 Version 0.12.1 removes the Global Sync resume race by refreshing authoritative pipeline state in the same Desktop command response before reconciliation begins, and shortens command pickup to one second.
+
+Version 0.13.0 turns Obsync into a whole-vault record keeper. It indexes complete Markdown notes plus headings, aliases, properties, tags, folders, links, backlinks, entities, record identifiers, hashes, and modification times; performs content- and entity-aware adoption/update/link decisions; reuses validated existing folders for new notes; adds manual and scheduled Index/Maintenance Sweeps with live Stop; and adds review/automatic change modes, evidence, diffs, audit history, concurrent-edit protection, and reversible sweep writes.
 
 ## Initial validation
 

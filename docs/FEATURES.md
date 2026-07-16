@@ -18,7 +18,8 @@ Obsync is a one-way, continuously reconciled knowledge pipeline from arbitrary f
 - Agent-local SQLite state for restart and offline recovery
 - Explicit inventory pass before processing
 - Per-file vault comparison: in-sync, modified, new, vault-missing, or source-missing
-- Existing managed-note adoption to prevent overlaps and duplicate output
+- Existing-note matching across managed and ordinary vault notes using identity, hashes, normalized content, titles, aliases, stable record identifiers, entities, and full text
+- Exact-match automatic adoption, review-first strong ordinary-note adoption, ambiguous-match holds, and in-place updates after adoption
 
 ## Knowledge processing
 
@@ -38,7 +39,9 @@ Obsync is a one-way, continuously reconciled knowledge pipeline from arbitrary f
 - Copyable, editable, activatable, and deletable custom AI profiles
 - Visible profile prompts, prompt template, provider parameters, context limits, and output behavior
 - Per-profile Obsidian controls for vault context, `[[wikilinks]]`, tags, properties, folders, and source details
-- Real vault title/path/tag cataloging with related-note candidate selection and exact-title validation
+- Persistent whole-vault indexing of full note content, headings, aliases, properties, tags, folders, links, backlinks, named entities, stable identifiers, hashes, and modification times
+- Whole-vault relevance ranking with bounded full-content context and exact path-qualified link validation
+- Entity-driven links to every materially relevant validated note, with configurable relevance and link limits up to 250
 
 ## Obsidian output
 
@@ -51,7 +54,9 @@ Each document receives:
 - Optional category, tags, related-note wikilinks, YAML properties, and source details according to the profile
 - A manual section that Obsync preserves across updates
 
-Generated notes are grouped by destination prefix, source device, watched folder, and initial category. Their destination remains stable on later edits, preventing routine reclassification from breaking backlinks.
+New notes reuse a strongly related existing vault folder when the index supplies a validated high-confidence context; otherwise they use the configured destination/device/root/category fallback. Their destination remains stable on later edits, preventing routine reclassification from breaking backlinks.
+
+Ordinary existing notes may be adopted after an exact match or explicit review. Adoption stores the latest complete source in the managed region and preserves the entire pre-adoption note below it. Future versions of the same source update that one note rather than creating another entry.
 
 ## Central control panel
 
@@ -74,6 +79,8 @@ Generated notes are grouped by destination prefix, source device, watched folder
 - Searchable, compact document table with bounded panel scrolling and responsive mobile cards
 - Error retry commands
 - Complete review workflow with Approve, Disregard, feedback-driven Redo AI review, and explicit separate-note creation for possible duplicates
+- Combined Review queue for document decisions and whole-vault recommendations, with evidence, confidence, before/after diffs, and individual or bulk approval
+- Manual and scheduled Index and Maintenance Sweeps with live progress, safe Stop, daily/weekly/monthly/custom timing, review/automatic modes, audit history, concurrent-edit protection, and Undo Sweep
 - Complete Local AI connection, profile, prompt, parameter, and Obsidian behavior configuration
 - Fast model discovery that does not start inference
 - Automatic server computer plus optional paired desktops
@@ -91,9 +98,12 @@ Generated notes are grouped by destination prefix, source device, watched folder
 - Source folders are read-only from Obsync's perspective
 - The active writer writes only below the configured mounted or desktop vault path
 - Path traversal is rejected
-- Non-Obsync note collisions are never overwritten
+- Non-Obsync note collisions are never overwritten unless an exact match is safely adopted or a person explicitly approves adoption
 - Writes use a temporary sibling file followed by an atomic replace
 - Manual note content below the generated boundary is preserved
+- Original ordinary-note content is preserved during first-time adoption
+- Maintenance changes are hash-checked, atomically written, fully logged with before/after content, and reversible while current
+- Sweep automation never permanently deletes or automatically merges notes
 - Source deletion is represented as status, never propagated as note deletion
 - Stopping work never disconnects computers, deletes source files, or deletes existing notes
 - Stopping one AI inference moves only that file to Review and leaves Global Sync running

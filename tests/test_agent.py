@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from pathlib import Path
@@ -8,6 +9,67 @@ import httpx
 import pytest
 
 from obsync.agent import AgentConfig, AgentRuntime, AgentState, RootConfig, SyncPausedError
+from obsync.vault_intelligence import MAINTENANCE_START
+
+
+@pytest.mark.asyncio
+async def test_desktop_whole_vault_index_and_reviewed_maintenance_write(
+    app,
+    enrolled_agent,
+    tmp_path: Path,
+) -> None:
+    service = app.state.service
+    vault = tmp_path / "desktop-vault"
+    (vault / "Companies").mkdir(parents=True)
+    (vault / "Clients").mkdir()
+    target = vault / "Companies" / "Pro Quality Plumbing.md"
+    target.write_text(
+        "# Pro Quality Plumbing\n\nAccount ACME-7788 for Acme Holdings.", encoding="utf-8"
+    )
+    (vault / "Clients" / "Acme Holdings.md").write_text(
+        "# Acme Holdings\n\nPro Quality Plumbing account ACME-7788.", encoding="utf-8"
+    )
+    service.heartbeat(
+        enrolled_agent["agent_id"],
+        vault_path=str(vault),
+        vault_ready=True,
+        vault_error="",
+    )
+    service.update_settings({"vault_mode": "agent", "vault_agent_id": enrolled_agent["agent_id"]})
+    config = AgentConfig(
+        server_url="http://testserver",
+        agent_id=enrolled_agent["agent_id"],
+        agent_token=enrolled_agent["agent_token"],
+        name="Test PC",
+        vault_path=str(vault),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+        headers={"Authorization": f"Bearer {enrolled_agent['agent_token']}"},
+    ) as async_client:
+        runtime = AgentRuntime(config, client=async_client)
+        sweep = service.start_vault_sweep("maintenance", change_mode="review")
+        await asyncio.sleep(0)
+        await runtime.process_commands_once()
+        assert service._sweep_task is not None
+        await service._sweep_task
+        assert service.vault_sweep(sweep["id"])["status"] == "completed"
+        assert service.vault_sweep_status()["indexed_notes"] == 2
+        change = next(
+            item
+            for item in service.list_vault_changes(status="pending")["items"]
+            if item["path"] == "Companies/Pro Quality Plumbing.md"
+        )
+        apply_task = asyncio.create_task(service.approve_vault_change(change["id"]))
+        await asyncio.sleep(0)
+        await runtime.process_commands_once()
+        applied = await apply_task
+
+    assert applied["status"] == "applied"
+    assert MAINTENANCE_START in target.read_text(encoding="utf-8")
+    assert "[[Clients/Acme Holdings]]" in target.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio

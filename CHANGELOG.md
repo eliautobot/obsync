@@ -2,6 +2,36 @@
 
 All notable changes to Obsync will be documented here.
 
+## 0.13.0 - 2026-07-16
+
+### Added
+
+- Added a persistent whole-vault knowledge index containing full Markdown content, paths, folders, titles, aliases, headings, properties, YAML/inline tags, links, backlinks, named entities, stable record identifiers, hashes, and modification times
+- Added layered existing-note detection using Obsync identity, source hashes, normalized content, titles, aliases, identifiers, entities, and relevance evidence
+- Added safe first-time adoption of exact or approved ordinary notes, with complete original-content preservation and future in-place source updates
+- Added entity-aware, path-qualified linking to every materially relevant validated note, with configurable score and limits up to 250
+- Added manual and scheduled Index and Maintenance Sweeps with daily, weekly, monthly, and custom-interval timing
+- Added live sweep progress, cooperative Stop, no-overlap enforcement, review/automatic change modes, evidence, confidence, before/after diffs, bulk review, audit history, and Undo Sweep
+- Added optimistic hash checks that reject maintenance writes when a note changed after the recommendation was created
+
+### Changed
+
+- New notes can reuse a high-confidence related existing folder instead of always being forced under the watched-root destination tree
+- Full document transfer now considers up to 200 ranked vault candidates and supports up to 100 validated related links by default
+- Vault context sent to the model now includes bounded content excerpts, headings, entities, paths, tags, and relationship evidence instead of metadata-only titles
+- Ordinary source reconciliation reuses the persistent index after bootstrap, so expensive whole-vault reads are controlled by explicit/scheduled sweeps
+- Review now combines source-document decisions with whole-vault maintenance recommendations
+
+### Fixed
+
+- Completed empty-vault rebuilds now clear stale indexed notes and record a visible completion time instead of leaving the previous index in place
+
+### Safety
+
+- Sweeps skip symlinks and `.obsidian`, never automatically delete or merge notes, preserve source files, and write atomically
+- Automatic change mode requires an explicit setting and shows a warning; Review remains the maintenance default and Index-only remains the index default
+- Desktop-vault sweeps and writes remain outbound-only authenticated operations and honor server stop requests
+
 ## 0.11.0 - 2026-07-15
 
 ### Added

@@ -349,6 +349,7 @@ function overviewSignature(data) {
     active: (data.active_work || []).map((item) => [
       item.document_id, item.phase, item.updated_at, item.outcome,
     ]),
+    sweep: data.vault_sweep ? [data.vault_sweep.id, data.vault_sweep.status, data.vault_sweep.processed_notes, data.vault_sweep.current_note] : null,
   });
 }
 
@@ -363,7 +364,7 @@ async function liveRefresh() {
     const changed = signature !== state.liveSignature;
     state.liveSignature = signature;
     updateShellStatus(overview);
-    if (changed && ["overview", "sources", "documents", "review", "settings"].includes(state.view)) {
+    if (changed && ["overview", "sources", "vault", "documents", "review", "settings"].includes(state.view)) {
       await navigate(state.view, { silent: true });
     }
   } catch (_error) {
@@ -943,12 +944,59 @@ function openRedoReview(documentItem, onComplete) {
   });
 }
 
+async function openVaultChangeDiff(changeId) {
+  const change = await api(`/api/v1/admin/vault/changes/${changeId}`);
+  const modal = $("#modal");
+  $("#modal-title").textContent = `Proposed vault change · ${change.path}`;
+  $("#modal-body").innerHTML = `<p class="modal-note"><strong>Reason:</strong> ${escapeHtml(change.reason)}</p><ul class="plain-list">${(change.evidence || []).map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul><div class="diff-grid"><section><h3>Before</h3><pre>${escapeHtml(change.before_content)}</pre></section><section><h3>After</h3><pre>${escapeHtml(change.after_content)}</pre></section></div><div class="modal-actions"><button class="secondary" id="diff-close" type="button">Close</button></div>`;
+  if (!modal.open) modal.showModal();
+  $("#diff-close").addEventListener("click", () => modal.close());
+}
+
+async function renderVaultRecommendations() {
+  const host = $("#vault-review-results");
+  if (!host) return;
+  const data = await api("/api/v1/admin/vault/changes?status=pending&limit=200");
+  if (!data.items.length) {
+    host.innerHTML = '<section class="panel empty"><div class="empty-icon">✓</div><p>No vault-maintenance recommendations need review.</p></section>';
+    return;
+  }
+  host.innerHTML = `<div class="section-head"><div><h2>Vault maintenance recommendations</h2><p>${data.total} proposed whole-vault change(s), each with evidence and a before/after diff.</p></div><div class="settings-actions compact"><button class="secondary" id="apply-all-vault-changes" type="button">Apply all</button><button class="danger" id="reject-all-vault-changes" type="button">Disregard all</button></div></div><div class="vault-review-grid">${data.items.map((change) => `<article class="settings-card vault-change-card"><div><span class="eyebrow">${escapeHtml(change.sweep_type)} SWEEP</span><h3>${escapeHtml(change.path)}</h3><p>${escapeHtml(change.reason)}</p></div><div class="confidence-meter"><span style="width:${Math.round(change.confidence * 100)}%"></span></div><small>${Math.round(change.confidence * 100)}% confidence · ${(change.evidence || []).length} evidence item(s)</small><div class="document-actions"><button class="quiet view-vault-change" data-id="${change.id}" type="button">View diff</button><button class="secondary approve-vault-change" data-id="${change.id}" type="button">Apply</button><button class="danger reject-vault-change" data-id="${change.id}" type="button">Disregard</button></div></article>`).join("")}</div>`;
+  const reload = async () => { await Promise.all([renderVaultRecommendations(), refreshReviewBadge()]); };
+  $$(".view-vault-change", host).forEach((button) => button.addEventListener("click", () => openVaultChangeDiff(button.dataset.id).catch((error) => toast(error.message, true))));
+  $$(".approve-vault-change", host).forEach((button) => button.addEventListener("click", async () => {
+    button.disabled = true; button.textContent = "Applying…";
+    try { await api(`/api/v1/admin/vault/changes/${button.dataset.id}/approve`, { method: "POST" }); toast("Vault change applied."); await reload(); }
+    catch (error) { toast(error.message, true); button.disabled = false; button.textContent = "Apply"; }
+  }));
+  $$(".reject-vault-change", host).forEach((button) => button.addEventListener("click", async () => {
+    button.disabled = true;
+    try { await api(`/api/v1/admin/vault/changes/${button.dataset.id}/reject`, { method: "POST" }); toast("Vault recommendation disregarded."); await reload(); }
+    catch (error) { toast(error.message, true); button.disabled = false; }
+  }));
+  $("#apply-all-vault-changes").addEventListener("click", async (event) => {
+    if (!window.confirm(`Apply all ${data.items.length} currently displayed vault recommendations?`)) return;
+    event.currentTarget.disabled = true;
+    for (const change of data.items) {
+      try { await api(`/api/v1/admin/vault/changes/${change.id}/approve`, { method: "POST" }); }
+      catch (error) { toast(`${change.path}: ${error.message}`, true); break; }
+    }
+    await reload();
+  });
+  $("#reject-all-vault-changes").addEventListener("click", async (event) => {
+    if (!window.confirm(`Disregard all ${data.items.length} currently displayed recommendations?`)) return;
+    event.currentTarget.disabled = true;
+    await Promise.all(data.items.map((change) => api(`/api/v1/admin/vault/changes/${change.id}/reject`, { method: "POST" })));
+    await reload();
+  });
+}
+
 async function renderDocuments(reviewOnly) {
   const title = reviewOnly ? "Review queue" : "Knowledge documents";
   const titleHelp = reviewOnly
     ? "Low-confidence classifications wait here until you approve them. Approval confirms the current category and tags."
     : "A searchable record of every scanned source file, its generated note, tags, and source-to-vault state.";
-  $("#content").innerHTML = `<div class="section-head"><div><h2>${headingWithHelp(title, titleHelp)}</h2><p>${reviewOnly ? "Review low-confidence organization and possible duplicate warnings." : "Every source file and how it compares with Obsidian. This page updates live."}</p></div></div><div class="toolbar"><div class="search field">${labelWithHelp("doc-search", "Search documents", "Searches generated titles, source paths, extracted summaries, and tags.")}<input id="doc-search" value="${escapeHtml(state.documentsQuery.search)}" placeholder="Search title, source, or summary…"></div><div class="field status-filter">${labelWithHelp("doc-status", "Comparison status", "Filters files by whether they match Obsidian, changed, are new, duplicated, or missing.")}<select id="doc-status"><option value="">All comparisons</option><option value="in-sync">In Obsidian</option><option value="modified">Modified</option><option value="new">New</option><option value="possible-duplicate">Possible duplicate</option><option value="vault-missing">Missing from Obsidian</option><option value="source-missing">Source missing</option></select></div></div><div id="doc-results"><div class="skeleton"></div></div>`;
+  $("#content").innerHTML = `<div class="section-head"><div><h2>${headingWithHelp(title, titleHelp)}</h2><p>${reviewOnly ? "Review document decisions and whole-vault maintenance recommendations." : "Every source file and how it compares with Obsidian. This page updates live."}</p></div></div><div class="toolbar"><div class="search field">${labelWithHelp("doc-search", "Search documents", "Searches generated titles, source paths, extracted summaries, and tags.")}<input id="doc-search" value="${escapeHtml(state.documentsQuery.search)}" placeholder="Search title, source, or summary…"></div><div class="field status-filter">${labelWithHelp("doc-status", "Comparison status", "Filters files by whether they match Obsidian, changed, are new, duplicated, or missing.")}<select id="doc-status"><option value="">All comparisons</option><option value="in-sync">In Obsidian</option><option value="modified">Modified</option><option value="new">New</option><option value="possible-duplicate">Possible duplicate</option><option value="vault-missing">Missing from Obsidian</option><option value="source-missing">Source missing</option></select></div></div><div id="doc-results"><div class="skeleton"></div></div>${reviewOnly ? '<div id="vault-review-results"><div class="skeleton"></div></div>' : ""}`;
   $("#doc-status").value = state.documentsQuery.comparison;
   const load = async () => {
     state.documentsQuery = { search: $("#doc-search").value, comparison: $("#doc-status").value };
@@ -957,11 +1005,11 @@ async function renderDocuments(reviewOnly) {
     const data = await api(`/api/v1/admin/documents?${query}`);
     const byId = new Map(data.items.map((item) => [item.id, item]));
     const rows = data.items.map((doc) => {
-      const reviewActions = reviewOnly ? `<div class="document-actions">${doc.status === "ai-stopped" ? "" : `<button class="secondary approve" data-id="${doc.id}" title="${doc.comparison_status === "possible-duplicate" ? "Accept the possible duplicate match and create no separate note" : "Accept the current AI organization"}">Approve</button>`}<button class="quiet redo-review" data-id="${doc.id}">Redo AI review</button><button class="danger disregard-review" data-id="${doc.id}">Disregard</button>${doc.comparison_status === "possible-duplicate" ? `<button class="quiet allow-duplicate" data-id="${doc.id}">Create separate note</button>` : ""}</div>` : "";
+      const reviewActions = reviewOnly ? `<div class="document-actions">${doc.status === "ai-stopped" ? "" : `<button class="secondary approve" data-id="${doc.id}" title="${doc.comparison_status === "possible-duplicate" ? "Adopt and update the matched existing note" : "Accept the current AI organization"}">Approve</button>`}<button class="quiet redo-review" data-id="${doc.id}">Redo AI review</button><button class="danger disregard-review" data-id="${doc.id}">Disregard</button>${doc.comparison_status === "possible-duplicate" ? `<button class="quiet allow-duplicate" data-id="${doc.id}">Create separate note</button>` : ""}</div>` : "";
       return `<tr>
         <td data-label="Document"><div class="doc-title">${escapeHtml(doc.title || doc.source_name)}</div><div class="doc-path" title="${escapeHtml(doc.source_path)}">${escapeHtml(doc.source_path)}</div>${doc.summary ? `<div class="doc-summary">${escapeHtml(doc.summary)}</div>` : ""}</td>
         <td data-label="Source"><strong>${escapeHtml(doc.agent_name)}</strong><small>${escapeHtml(doc.root_name)}</small><div class="doc-tags">${(doc.tags || []).slice(0, 4).map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join("")}</div></td>
-        <td data-label="State">${comparisonBadge(doc.comparison_status)}<small>${escapeHtml(doc.status)} · ${Math.round((doc.confidence || 0) * 100)}% confidence</small>${doc.duplicate_path ? `<small class="duplicate-match">Possible match: ${escapeHtml(doc.duplicate_title || doc.duplicate_path)}</small>` : ""}</td>
+        <td data-label="State">${comparisonBadge(doc.comparison_status)}<small>${escapeHtml(doc.status)} · ${Math.round((doc.confidence || 0) * 100)}% confidence</small>${doc.duplicate_path ? `<small class="duplicate-match">Possible match: ${escapeHtml(doc.duplicate_title || doc.duplicate_path)}</small>` : ""}${(doc.match_evidence || []).length ? `<small>${escapeHtml(doc.match_evidence.slice(0, 3).join(" · "))}</small>` : ""}</td>
         <td data-label="Actions">${reviewActions}${doc.status === "error" ? `<button class="quiet retry" data-id="${doc.id}">Retry sync</button>` : ""}${doc.status === "ignored" && !reviewOnly ? `<button class="quiet redo-review" data-id="${doc.id}">Redo AI review</button>` : ""}</td>
       </tr>`;
     }).join("");
@@ -981,6 +1029,7 @@ async function renderDocuments(reviewOnly) {
       toast("A separate note is now allowed and queued.");
       await Promise.all([load(), refreshReviewBadge()]);
     }));
+    if (reviewOnly) await renderVaultRecommendations();
   };
   let debounce;
   $("#doc-search").addEventListener("input", () => { clearTimeout(debounce); debounce = setTimeout(load, 250); });
@@ -1072,15 +1121,38 @@ async function renderLegacySettings() {
   });
 }
 
+function sweepScheduleFields(prefix, settings) {
+  const settingPrefix = prefix.replaceAll("-", "_");
+  const enabled = settings[`${settingPrefix}_schedule_enabled`] === "true";
+  const scheduleLabel = prefix.includes("index") ? "Schedule Index Sweep" : "Schedule Maintenance Sweep";
+  return `<div class="sweep-schedule">
+    <label class="check-row"><input id="${prefix}-schedule-enabled" type="checkbox" ${enabled ? "checked" : ""}> ${scheduleLabel}</label>
+    <div class="field-grid compact-grid">
+      <div class="field"><label for="${prefix}-frequency">Frequency</label><select id="${prefix}-frequency"><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option><option value="custom">Custom interval</option></select></div>
+      <div class="field"><label for="${prefix}-time">Start time</label><input id="${prefix}-time" type="time" value="${escapeHtml(settings[`${settingPrefix}_schedule_time`] || "02:00")}"></div>
+      <div class="field"><label for="${prefix}-interval">Custom hours</label><input id="${prefix}-interval" type="number" min="1" max="8760" value="${escapeHtml(settings[`${settingPrefix}_schedule_interval_hours`] || "24")}"></div>
+      <div class="field"><label for="${prefix}-weekday">Weekly day</label><select id="${prefix}-weekday"><option value="0">Monday</option><option value="1">Tuesday</option><option value="2">Wednesday</option><option value="3">Thursday</option><option value="4">Friday</option><option value="5">Saturday</option><option value="6">Sunday</option></select></div>
+      <div class="field"><label for="${prefix}-month-day">Monthly day</label><input id="${prefix}-month-day" type="number" min="1" max="28" value="${escapeHtml(settings[`${settingPrefix}_schedule_month_day`] || "1")}"></div>
+    </div>
+  </div>`;
+}
+
+function sweepProgress(active, type) {
+  if (!active || active.sweep_type !== type) return "";
+  const percent = active.total_notes ? Math.round((active.processed_notes / active.total_notes) * 100) : 0;
+  return `<div class="sweep-progress"><div><strong>${escapeHtml(active.status)}</strong><span>${active.processed_notes} / ${active.total_notes || "?"} notes · ${percent}%</span></div><progress max="100" value="${percent}"></progress><small>${escapeHtml(active.current_note || "Preparing vault sweep…")}</small><button class="danger stop-sweep" data-id="${active.id}" type="button">Stop Sweep</button></div>`;
+}
+
 async function renderVault() {
-  const [settings, agentData] = await Promise.all([
-    api("/api/v1/admin/settings"), api("/api/v1/admin/agents"),
+  const [settings, agentData, sweeps] = await Promise.all([
+    api("/api/v1/admin/settings"), api("/api/v1/admin/agents"), api("/api/v1/admin/vault/sweeps"),
   ]);
   state.agents = agentData.items;
   const vaultMode = settings.vault_mode || "local";
   const confirmed = settings.vault_confirmed === "true";
   const vaultOptions = state.agents.map((agent) => `<option value="${agent.id}" ${agent.id === settings.vault_agent_id ? "selected" : ""}>${escapeHtml(agent.name)} — ${agent.status}${agent.vault_ready ? ` — ${escapeHtml(agent.vault_path)}` : ""}</option>`).join("");
   const hostVault = settings.vault_host_path || settings.vault_path;
+  const recentSweeps = (sweeps.recent || []).slice(0, 6).map((item) => `<tr><td>${escapeHtml(item.sweep_type)}</td><td>${escapeHtml(item.status)}</td><td>${item.processed_notes} / ${item.total_notes}</td><td>${item.recommendations}</td><td>${item.applied_changes}</td><td>${relativeTime(item.finished_at || item.created_at)}</td><td>${item.applied_changes ? `<button class="quiet undo-sweep" type="button" data-id="${item.id}">Undo</button>` : "—"}</td></tr>`).join("");
   $("#content").innerHTML = `
     <section class="vault-choice-hero ${confirmed ? "confirmed" : "required"}">
       <span class="eyebrow">REQUIRED DESTINATION</span>
@@ -1104,7 +1176,22 @@ async function renderVault() {
         <div class="settings-actions"><button class="primary" type="submit">Save and confirm this vault</button></div>
         <p class="inline-status ${confirmed ? "good" : "bad"}">${confirmed ? "A vault choice is saved. Review the exact path above before syncing." : "No vault choice has been confirmed yet."}</p>
       </section>
-      <section class="settings-card"><h3>Vault safety</h3><p>Obsync never writes inside <code>.obsidian</code>, never overwrites a manual note, and preserves text below <strong>My notes</strong> in Obsync-managed notes.</p></section>
+      <section class="settings-card full-width sweep-overview"><div class="section-head"><div><span class="eyebrow">WHOLE-VAULT INTELLIGENCE</span><h3>Vault index</h3><p>Obsync has indexed <strong>${sweeps.indexed_notes}</strong> Markdown notes. Last complete index: <strong>${sweeps.last_indexed_at ? relativeTime(sweeps.last_indexed_at) : "Never"}</strong>.</p></div><div class="settings-actions compact"><button class="secondary start-sweep" data-type="index" type="button">Start Index Sweep</button><button class="quiet start-sweep" data-type="index" data-full="true" type="button">Rebuild Whole Index</button></div></div>
+        ${sweepProgress(sweeps.active, "index")}
+        <div class="field"><label for="vault-index-change-mode">Index sweep changes</label><select id="vault-index-change-mode"><option value="index-only">Index only — do not recommend changes</option><option value="review">Send all recommended changes to Review</option><option value="auto">Allow AI Agent to apply all recommended changes</option></select><small class="danger-copy">Automatic mode can change existing entries without human approval. Every change is logged and can be undone.</small></div>
+        ${sweepScheduleFields("vault-index", settings)}
+      </section>
+      <section class="settings-card full-width sweep-overview"><div class="section-head"><div><span class="eyebrow">ACTIVE VAULT CARE</span><h3>Maintenance Sweep</h3><p>Reviews indexed content for missing validated relationships and shared tags. Existing-document matching, source freshness, generated properties, and first folder placement are handled during normal source synchronization.</p></div><div class="settings-actions compact"><button class="secondary start-sweep" data-type="maintenance" type="button">Start Maintenance Sweep</button></div></div>
+        ${sweepProgress(sweeps.active, "maintenance")}
+        <div class="field"><label for="vault-maintenance-change-mode">Maintenance sweep changes</label><select id="vault-maintenance-change-mode"><option value="review">Send all recommended changes to Review</option><option value="auto">Allow AI Agent to apply all recommended changes</option></select><small class="danger-copy">Warning: automatic mode may modify existing notes, links, tags, and organization without human approval.</small></div>
+        <div class="behavior-grid maintenance-categories">
+          ${[["links", "Relationship links and backlinks"], ["tags", "Shared relationship tags"]].map(([value, label]) => `<label class="check-row"><input class="maintenance-category" type="checkbox" value="${value}"> ${label}</label>`).join("")}
+        </div>
+        ${sweepScheduleFields("vault-maintenance", settings)}
+      </section>
+      <section class="settings-card full-width"><h3>Whole-vault matching and links</h3><div class="field-grid compact-grid"><div class="field"><label for="existing-note-policy">Strong existing-note matches</label><select id="existing-note-policy"><option value="review">Send first adoption to Review</option><option value="auto">Adopt strong matches automatically</option></select><small>Exact source/content matches update automatically. Ambiguous matches always require review.</small></div><div class="field"><label for="vault-link-limit">Maximum validated links per note</label><input id="vault-link-limit" type="number" min="1" max="250" value="${escapeHtml(settings.vault_link_limit || "100")}"></div><div class="field"><label for="vault-link-score">Minimum relationship score</label><input id="vault-link-score" type="number" min="5" max="200" step="1" value="${escapeHtml(settings.vault_link_minimum_score || "24")}"><small>Higher is stricter; 24 is the balanced default.</small></div><div class="field"><label for="vault-timezone">Schedule timezone</label><input id="vault-timezone" value="${escapeHtml(settings.vault_schedule_timezone || "America/New_York")}"></div></div></section>
+      <section class="settings-card full-width"><h3>Sweep history and rollback</h3>${recentSweeps ? `<div class="table-wrap sweep-history"><table><thead><tr><th>Type</th><th>Status</th><th>Notes</th><th>Recommendations</th><th>Applied</th><th>Finished</th><th>Rollback</th></tr></thead><tbody>${recentSweeps}</tbody></table></div>` : '<p class="inline-status">No vault sweeps have run yet.</p>'}</section>
+      <section class="settings-card"><h3>Vault safety</h3><p>Obsync never writes inside <code>.obsidian</code>. Document adoption preserves the entire prior note outside the managed section. Sweeps use expected hashes, stop on concurrent edits, keep before/after content, and never auto-delete or auto-merge notes.</p></section>
     </form>`;
   const updateVaultMode = () => {
     const mode = $('input[name="vault-mode"]:checked').value;
@@ -1124,6 +1211,43 @@ async function renderVault() {
   };
   $("#vault-agent").addEventListener("change", updateAgentStatus);
   updateAgentStatus();
+  $("#vault-index-change-mode").value = settings.vault_index_change_mode || "index-only";
+  $("#vault-maintenance-change-mode").value = settings.vault_maintenance_change_mode || "review";
+  $("#existing-note-policy").value = settings.existing_note_policy || "review";
+  ["vault-index", "vault-maintenance"].forEach((prefix) => {
+    $(`#${prefix}-frequency`).value = settings[`${prefix.replaceAll("-", "_")}_schedule_frequency`] || "weekly";
+    $(`#${prefix}-weekday`).value = settings[`${prefix.replaceAll("-", "_")}_schedule_weekday`] || "6";
+  });
+  let maintenanceCategories = [];
+  try { maintenanceCategories = JSON.parse(settings.vault_maintenance_categories || "[]"); } catch (_error) { maintenanceCategories = ["links", "tags"]; }
+  $$(".maintenance-category").forEach((input) => { input.checked = maintenanceCategories.includes(input.value); });
+  $$(".start-sweep").forEach((button) => button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      const type = button.dataset.type;
+      const changeMode = type === "index" ? $("#vault-index-change-mode").value : $("#vault-maintenance-change-mode").value;
+      await api(`/api/v1/admin/vault/sweeps/${type}/start`, { method: "POST", body: { change_mode: changeMode, full_rebuild: button.dataset.full === "true" } });
+      toast(`${type === "index" ? "Index" : "Maintenance"} Sweep started.`);
+      await navigate("vault", { silent: true });
+    } catch (error) { toast(error.message, true); button.disabled = false; }
+  }));
+  $$(".stop-sweep").forEach((button) => button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      await api(`/api/v1/admin/vault/sweeps/${button.dataset.id}/stop`, { method: "POST" });
+      toast("Vault sweep is stopping safely.");
+      await navigate("vault", { silent: true });
+    } catch (error) { toast(error.message, true); button.disabled = false; }
+  }));
+  $$(".undo-sweep").forEach((button) => button.addEventListener("click", async () => {
+    if (!window.confirm("Undo every still-current note change applied by this sweep?")) return;
+    button.disabled = true;
+    try {
+      const result = await api(`/api/v1/admin/vault/sweeps/${button.dataset.id}/undo`, { method: "POST" });
+      toast(`Reverted ${result.reverted} sweep change(s).`, !result.ok);
+      await navigate("vault", { silent: true });
+    } catch (error) { toast(error.message, true); button.disabled = false; }
+  }));
   $("#browse-vault").addEventListener("click", async () => {
     const agentId = $("#vault-agent").value;
     if (!agentId) { toast("Choose a computer first.", true); return; }
@@ -1401,12 +1525,12 @@ function profileEditorMarkup(profile, profileData) {
       <div class="field">${labelWithHelp("profile-input-chars", "Document input characters", "Maximum extracted characters sent to the model and transferred by a full-content note.")}<input id="profile-input-chars" type="number" min="1000" max="2000000" step="1000" value="${escapeHtml(profile.input_char_limit)}" ${readonly}></div>
       <div class="field">${labelWithHelp("profile-candidates", "Vault note candidates", "Maximum existing notes supplied for related-note selection.")}<input id="profile-candidates" type="number" min="0" max="500" value="${escapeHtml(profile.candidate_limit)}" ${readonly}></div>
       <div class="field">${labelWithHelp("profile-tag-limit", "Tag limit", "Maximum validated AI tags stored on the note.")}<input id="profile-tag-limit" type="number" min="0" max="30" value="${escapeHtml(profile.tag_limit)}" ${readonly}></div>
-      <div class="field">${labelWithHelp("profile-related-limit", "Related-note limit", "Maximum validated existing-note wikilinks.")}<input id="profile-related-limit" type="number" min="0" max="30" value="${escapeHtml(profile.related_notes_limit)}" ${readonly}></div>
+      <div class="field">${labelWithHelp("profile-related-limit", "Related-note limit", "Maximum validated existing-note wikilinks. Relevant links are not restricted to one or two.")}<input id="profile-related-limit" type="number" min="0" max="250" value="${escapeHtml(profile.related_notes_limit)}" ${readonly}></div>
     </div>
     <h4>Obsidian behaviors</h4>
     <p>Choose how this profile uses Obsidian's native Markdown, YAML, tags, folders, and wikilinks. Internal Obsync identity properties remain protected so updates stay safe.</p>
     <div class="behavior-grid">
-      <label class="check-row"><input id="profile-vault-context" type="checkbox" ${checked(profile.use_vault_context)} ${disabled}> Read titles, paths, and tags from the selected vault for connection context</label>
+      <label class="check-row"><input id="profile-vault-context" type="checkbox" ${checked(profile.use_vault_context)} ${disabled}> Search the whole-vault index, including content, headings, properties, entities, links, and backlinks</label>
       <label class="check-row"><input id="profile-wikilinks" type="checkbox" ${checked(profile.use_wikilinks)} ${disabled}> Add validated <code>[[wikilinks]]</code> to clearly related existing notes</label>
       <label class="check-row"><input id="profile-tags" type="checkbox" ${checked(profile.use_tags)} ${disabled}> Generate searchable Obsidian tags</label>
       <label class="check-row"><input id="profile-properties" type="checkbox" ${checked(profile.use_properties)} ${disabled}> Generate type and category YAML properties</label>
@@ -1585,7 +1709,7 @@ async function renderHelp() {
         <article class="settings-card"><h3>Why Windows needs Obsync Desktop</h3><p>Docker and web browsers are intentionally isolated from arbitrary Windows files. Obsync Desktop includes the safe local bridge, native folder picker, background watcher, and start/stop controls in one app. Run it as Administrator for the one-time setup; background syncing then runs with limited permissions.</p><p>If a computer shows offline, open Obsync Desktop and choose Start this PC. Reconnecting reuses the saved pairing.</p></article>
         <article class="settings-card"><h3>Stopping and removing</h3><p>Use <strong>Stop inference</strong> on Local AI to end only the active model request and move that file to Review. Use <strong>Stop Global Sync</strong> to cancel all active sync and AI work. Each source folder also has independent Start, Pause, and Stop controls. Remove forgets a folder; Disconnect revokes a whole computer. Original files and existing Obsidian notes are always kept.</p></article>
         <article class="settings-card"><h3>Server vs. desktop</h3><p>The central server always appears as one connected computer. Docker can access only folders mounted into its container. Pair the physical desktop whenever the vault or source folders live in Windows Documents, another user folder, a Mac, or a different PC.</p></article>
-        <article class="settings-card"><h3>Local AI</h3><p>AI is optional. It receives extracted source text and approved candidate titles, not Obsidian API access. Obsync performs vault comparison and duplicate protection separately before writing. The live activity view is read-only and its bounded model trace is not stored as a chat history.</p></article>
+        <article class="settings-card"><h3>Local AI and the whole vault</h3><p>AI is optional. Obsync searches the complete whole-vault index, then sends bounded content from only the most relevant notes—not unrestricted filesystem or Obsidian API access. Obsync validates matching, folders, tags, properties, and path-qualified links before writing. The live activity view is read-only and its bounded model trace is not stored as chat history.</p></article>
         <article class="settings-card"><h3>Safety</h3><p>Obsync never edits, moves, or deletes source files. It owns only marked generated sections in Markdown and preserves text under <strong>My notes</strong>. Missing files are recorded rather than propagated as deletions.</p></article>
       </section>
       <section class="settings-card help-troubleshooting"><h3>Troubleshooting</h3>
@@ -1608,9 +1732,32 @@ function settingsPayload() {
 }
 
 function vaultSettingsPayload() {
-  return {
+  const payload = {
     vault_mode: $('input[name="vault-mode"]:checked')?.value || "local",
     vault_agent_id: $("#vault-agent")?.value || "",
+  };
+  if (!$("#vault-index-change-mode")) return payload;
+  return {
+    ...payload,
+    existing_note_policy: $("#existing-note-policy").value,
+    vault_index_schedule_enabled: $("#vault-index-schedule-enabled").checked,
+    vault_index_schedule_frequency: $("#vault-index-frequency").value,
+    vault_index_schedule_time: $("#vault-index-time").value,
+    vault_index_schedule_weekday: $("#vault-index-weekday").value,
+    vault_index_schedule_month_day: $("#vault-index-month-day").value,
+    vault_index_schedule_interval_hours: $("#vault-index-interval").value,
+    vault_index_change_mode: $("#vault-index-change-mode").value,
+    vault_maintenance_schedule_enabled: $("#vault-maintenance-schedule-enabled").checked,
+    vault_maintenance_schedule_frequency: $("#vault-maintenance-frequency").value,
+    vault_maintenance_schedule_time: $("#vault-maintenance-time").value,
+    vault_maintenance_schedule_weekday: $("#vault-maintenance-weekday").value,
+    vault_maintenance_schedule_month_day: $("#vault-maintenance-month-day").value,
+    vault_maintenance_schedule_interval_hours: $("#vault-maintenance-interval").value,
+    vault_maintenance_change_mode: $("#vault-maintenance-change-mode").value,
+    vault_schedule_timezone: $("#vault-timezone").value.trim(),
+    vault_maintenance_categories: $$(".maintenance-category:checked").map((input) => input.value),
+    vault_link_minimum_score: $("#vault-link-score").value,
+    vault_link_limit: $("#vault-link-limit").value,
   };
 }
 

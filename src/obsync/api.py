@@ -5,6 +5,7 @@ import json
 import os
 import socket
 import uuid
+from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any
@@ -249,12 +250,22 @@ def _clear_session_cookies(response: Response, *, secure: bool) -> None:
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     service = ObsyncService(settings)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        service.start_background_tasks()
+        try:
+            yield
+        finally:
+            await service.stop_background_tasks()
+
     app = FastAPI(
         title="Obsync API",
         version=__version__,
         docs_url="/api/docs",
         redoc_url=None,
         openapi_url="/api/openapi.json",
+        lifespan=lifespan,
     )
     app.state.service = service
 
@@ -583,6 +594,52 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def select_agent_vault(agent_id: str, _token: AdminDependency) -> dict[str, Any]:
         return service.queue_command(agent_id, "select_vault")
 
+    @app.get("/api/v1/admin/vault/sweeps")
+    async def vault_sweeps(_token: AdminDependency) -> dict[str, Any]:
+        return service.vault_sweep_status()
+
+    @app.post("/api/v1/admin/vault/sweeps/{sweep_type}/start")
+    async def start_vault_sweep(
+        sweep_type: str,
+        _token: AdminDependency,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = payload or {}
+        return service.start_vault_sweep(
+            sweep_type,
+            change_mode=str(payload.get("change_mode", "")),
+            full_rebuild=bool(payload.get("full_rebuild")),
+        )
+
+    @app.post("/api/v1/admin/vault/sweeps/{sweep_id}/stop")
+    async def stop_vault_sweep(sweep_id: str, _token: AdminDependency) -> dict[str, Any]:
+        return service.stop_vault_sweep(sweep_id)
+
+    @app.post("/api/v1/admin/vault/sweeps/{sweep_id}/undo")
+    async def undo_vault_sweep(sweep_id: str, _token: AdminDependency) -> dict[str, Any]:
+        return await service.undo_vault_sweep(sweep_id)
+
+    @app.get("/api/v1/admin/vault/changes")
+    async def vault_changes(
+        _token: AdminDependency,
+        status: str = "pending",
+        limit: int = Query(200, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ) -> dict[str, Any]:
+        return service.list_vault_changes(status=status, limit=limit, offset=offset)
+
+    @app.get("/api/v1/admin/vault/changes/{change_id}")
+    async def vault_change(change_id: str, _token: AdminDependency) -> dict[str, Any]:
+        return service.vault_change_diff(change_id)
+
+    @app.post("/api/v1/admin/vault/changes/{change_id}/approve")
+    async def approve_vault_change(change_id: str, _token: AdminDependency) -> dict[str, Any]:
+        return await service.approve_vault_change(change_id)
+
+    @app.post("/api/v1/admin/vault/changes/{change_id}/reject")
+    async def reject_vault_change(change_id: str, _token: AdminDependency) -> dict[str, Any]:
+        return service.reject_vault_change(change_id)
+
     @app.get("/api/v1/admin/documents")
     async def documents(
         _token: AdminDependency,
@@ -710,6 +767,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             vault_error=str(payload.get("vault_error", "")) if "vault_error" in payload else None,
         )
         return {"ok": True, "sync_enabled": service.pipeline_enabled()}
+
+    @app.post("/api/v1/agent/sweeps/{sweep_id}/progress")
+    async def sweep_progress(
+        sweep_id: str, payload: dict[str, Any], agent: AgentDependency
+    ) -> dict[str, Any]:
+        service.heartbeat(agent["id"])
+        return service.agent_sweep_progress(
+            agent["id"],
+            sweep_id,
+            processed=int(payload.get("processed", 0)),
+            total=int(payload.get("total", 0)),
+            current_note=str(payload.get("current_note", "")),
+        )
+
+    @app.post("/api/v1/agent/sweeps/{sweep_id}/notes")
+    async def sweep_notes(
+        sweep_id: str, payload: dict[str, Any], agent: AgentDependency
+    ) -> dict[str, Any]:
+        service.heartbeat(agent["id"])
+        raw_notes = payload.get("notes", [])
+        if not isinstance(raw_notes, list):
+            raise ValueError("Vault index batch is invalid")
+        return service.agent_sweep_notes(agent["id"], sweep_id, raw_notes)
 
     @app.post("/api/v1/agent/roots")
     async def upsert_root(payload: RootRequest, agent: AgentDependency) -> dict[str, Any]:
