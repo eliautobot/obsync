@@ -33,6 +33,7 @@ dependencies = [
   "python-multipart>=0.0.20,<1",
   "python-pptx>=1.0,<2",
   "PyYAML>=6.0,<7",
+  "tzdata>=2025.2",
   "uvicorn[standard]>=0.35,<1",
   "watchfiles>=1.1,<2",
 ]

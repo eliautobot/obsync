@@ -25,6 +25,7 @@ All notable changes to Obsync will be documented here.
 ### Fixed
 
 - Completed empty-vault rebuilds now clear stale indexed notes and record a visible completion time instead of leaving the previous index in place
+- Bundled IANA timezone data so scheduled sweeps accept named timezones consistently on Windows
 
 ### Safety
 
