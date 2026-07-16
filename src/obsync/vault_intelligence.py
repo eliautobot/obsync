@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from dataclasses import asdict, dataclass
+from datetime import date, datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -91,6 +93,30 @@ def search_terms(value: str, *, maximum: int = 5000) -> set[str]:
     return terms
 
 
+def _json_safe(value: Any, *, depth: int = 0) -> Any:
+    """Normalize YAML values before they cross the Desktop JSON boundary."""
+    if depth >= 20:
+        return str(value)
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, dict):
+        return {
+            str(key)[:200]: _json_safe(item, depth=depth + 1)
+            for key, item in list(value.items())[:1000]
+        }
+    if isinstance(value, set):
+        return [_json_safe(item, depth=depth + 1) for item in sorted(value, key=str)[:1000]]
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item, depth=depth + 1) for item in list(value)[:1000]]
+    return str(value)
+
+
 def _frontmatter(content: str) -> dict[str, Any]:
     if not content.startswith("---\n"):
         return {}
@@ -105,7 +131,7 @@ def _frontmatter(content: str) -> dict[str, Any]:
     for key, value in values.items():
         clean_key = str(key).strip()[:100]
         if clean_key:
-            result[clean_key] = value
+            result[clean_key] = _json_safe(value)
         if len(result) >= 100:
             break
     return result

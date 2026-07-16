@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -60,6 +61,38 @@ See [[Clients/Acme Holdings|Acme Holdings]]. #florida
     assert "Pro Quality Plumbing Inc" in parsed["entities"]
     assert notes[1]["backlinks"] == ["Companies/Pro Quality Plumbing.md"]
     assert parsed["content"] == company.read_text(encoding="utf-8")
+
+
+def test_whole_vault_frontmatter_is_json_safe(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    note = write_note(
+        vault,
+        "Records/Dated record.md",
+        """---
+created: 2026-07-16
+updated: 2026-07-16T12:34:56Z
+history:
+  - date: 2026-07-15
+date-keyed:
+  2026-07-14: active
+not-a-number: .nan
+flags: !!set {beta: null, alpha: null}
+binary: !!binary |
+  SGVsbG8=
+---
+# Dated record
+""",
+    )
+
+    parsed = parse_note(note, vault=vault).as_dict()
+
+    assert parsed["properties"]["created"] == "2026-07-16"
+    assert parsed["properties"]["updated"] == "2026-07-16T12:34:56+00:00"
+    assert parsed["properties"]["history"][0]["date"] == "2026-07-15"
+    assert parsed["properties"]["date-keyed"] == {"2026-07-14": "active"}
+    assert parsed["properties"]["flags"] == ["alpha", "beta"]
+    assert parsed["properties"]["binary"] == "Hello"
+    json.dumps(parsed, allow_nan=False)
 
 
 def test_entity_ranking_links_company_client_account_and_application(tmp_path: Path) -> None:

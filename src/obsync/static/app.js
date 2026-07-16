@@ -1143,6 +1143,12 @@ function sweepProgress(active, type) {
   return `<div class="sweep-progress"><div><strong>${escapeHtml(active.status)}</strong><span>${active.processed_notes} / ${active.total_notes || "?"} notes · ${percent}%</span></div><progress max="100" value="${percent}"></progress><small>${escapeHtml(active.current_note || "Preparing vault sweep…")}</small><button class="danger stop-sweep" data-id="${active.id}" type="button">Stop Sweep</button></div>`;
 }
 
+function sweepFailure(recent, type) {
+  const latest = (recent || []).find((item) => item.sweep_type === type);
+  if (!latest || latest.status !== "failed") return "";
+  return `<div class="sweep-failure" role="alert"><strong>Last ${escapeHtml(type)} sweep failed</strong><p>${escapeHtml(latest.error || "The sweep stopped before it could complete.")}</p><small>${latest.processed_notes} of ${latest.total_notes || "?"} notes were inspected. No unapproved changes were applied.</small></div>`;
+}
+
 async function renderVault() {
   const [settings, agentData, sweeps] = await Promise.all([
     api("/api/v1/admin/settings"), api("/api/v1/admin/agents"), api("/api/v1/admin/vault/sweeps"),
@@ -1152,7 +1158,7 @@ async function renderVault() {
   const confirmed = settings.vault_confirmed === "true";
   const vaultOptions = state.agents.map((agent) => `<option value="${agent.id}" ${agent.id === settings.vault_agent_id ? "selected" : ""}>${escapeHtml(agent.name)} — ${agent.status}${agent.vault_ready ? ` — ${escapeHtml(agent.vault_path)}` : ""}</option>`).join("");
   const hostVault = settings.vault_host_path || settings.vault_path;
-  const recentSweeps = (sweeps.recent || []).slice(0, 6).map((item) => `<tr><td>${escapeHtml(item.sweep_type)}</td><td>${escapeHtml(item.status)}</td><td>${item.processed_notes} / ${item.total_notes}</td><td>${item.recommendations}</td><td>${item.applied_changes}</td><td>${relativeTime(item.finished_at || item.created_at)}</td><td>${item.applied_changes ? `<button class="quiet undo-sweep" type="button" data-id="${item.id}">Undo</button>` : "—"}</td></tr>`).join("");
+  const recentSweeps = (sweeps.recent || []).slice(0, 6).map((item) => `<tr><td>${escapeHtml(item.sweep_type)}</td><td><strong>${escapeHtml(item.status)}</strong>${item.error ? `<small class="sweep-row-error">${escapeHtml(item.error)}</small>` : ""}</td><td>${item.processed_notes} / ${item.total_notes}</td><td>${item.recommendations}</td><td>${item.applied_changes}</td><td>${relativeTime(item.finished_at || item.created_at)}</td><td>${item.applied_changes ? `<button class="quiet undo-sweep" type="button" data-id="${item.id}">Undo</button>` : "—"}</td></tr>`).join("");
   $("#content").innerHTML = `
     <section class="vault-choice-hero ${confirmed ? "confirmed" : "required"}">
       <span class="eyebrow">REQUIRED DESTINATION</span>
@@ -1176,13 +1182,15 @@ async function renderVault() {
         <div class="settings-actions"><button class="primary" type="submit">Save and confirm this vault</button></div>
         <p class="inline-status ${confirmed ? "good" : "bad"}">${confirmed ? "A vault choice is saved. Review the exact path above before syncing." : "No vault choice has been confirmed yet."}</p>
       </section>
-      <section class="settings-card full-width sweep-overview"><div class="section-head"><div><span class="eyebrow">WHOLE-VAULT INTELLIGENCE</span><h3>Vault index</h3><p>Obsync has indexed <strong>${sweeps.indexed_notes}</strong> Markdown notes. Last complete index: <strong>${sweeps.last_indexed_at ? relativeTime(sweeps.last_indexed_at) : "Never"}</strong>.</p></div><div class="settings-actions compact"><button class="secondary start-sweep" data-type="index" type="button">Start Index Sweep</button><button class="quiet start-sweep" data-type="index" data-full="true" type="button">Rebuild Whole Index</button></div></div>
+      <section class="settings-card full-width sweep-overview"><div class="section-head"><div><span class="eyebrow">WHOLE-VAULT INTELLIGENCE</span><h3>Vault index</h3><p>Vault cache: <strong>${sweeps.indexed_notes}</strong> Markdown notes. Last successful Index Sweep: <strong>${sweeps.last_indexed_at ? relativeTime(sweeps.last_indexed_at) : "Never"}</strong>.</p></div><div class="settings-actions compact"><button class="secondary start-sweep" data-type="index" type="button">Start Index Sweep</button><button class="quiet start-sweep" data-type="index" data-full="true" type="button">Rebuild Whole Index</button></div></div>
         ${sweepProgress(sweeps.active, "index")}
+        ${sweepFailure(sweeps.recent, "index")}
         <div class="field"><label for="vault-index-change-mode">Index sweep changes</label><select id="vault-index-change-mode"><option value="index-only">Index only — do not recommend changes</option><option value="review">Send all recommended changes to Review</option><option value="auto">Allow AI Agent to apply all recommended changes</option></select><small class="danger-copy">Automatic mode can change existing entries without human approval. Every change is logged and can be undone.</small></div>
         ${sweepScheduleFields("vault-index", settings)}
       </section>
       <section class="settings-card full-width sweep-overview"><div class="section-head"><div><span class="eyebrow">ACTIVE VAULT CARE</span><h3>Maintenance Sweep</h3><p>Reviews indexed content for missing validated relationships and shared tags. Existing-document matching, source freshness, generated properties, and first folder placement are handled during normal source synchronization.</p></div><div class="settings-actions compact"><button class="secondary start-sweep" data-type="maintenance" type="button">Start Maintenance Sweep</button></div></div>
         ${sweepProgress(sweeps.active, "maintenance")}
+        ${sweepFailure(sweeps.recent, "maintenance")}
         <div class="field"><label for="vault-maintenance-change-mode">Maintenance sweep changes</label><select id="vault-maintenance-change-mode"><option value="review">Send all recommended changes to Review</option><option value="auto">Allow AI Agent to apply all recommended changes</option></select><small class="danger-copy">Warning: automatic mode may modify existing notes, links, tags, and organization without human approval.</small></div>
         <div class="behavior-grid maintenance-categories">
           ${[["links", "Relationship links and backlinks"], ["tags", "Shared relationship tags"]].map(([value, label]) => `<label class="check-row"><input class="maintenance-category" type="checkbox" value="${value}"> ${label}</label>`).join("")}

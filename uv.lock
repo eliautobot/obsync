@@ -413,7 +413,7 @@ wheels = [
 
 [[package]]
 name = "obsync-app"
-version = "0.13.0"
+version = "0.13.1"
 source = { editable = "." }
 dependencies = [
     { name = "beautifulsoup4" },

@@ -2,6 +2,14 @@
 
 All notable changes to Obsync will be documented here.
 
+## 0.13.1 - 2026-07-16
+
+### Fixed
+
+- Normalized YAML-native dates, datetimes, nested collections, non-finite numbers, binary values, and other uncommon frontmatter scalars before Desktop vault notes cross the JSON API boundary
+- Prevented real-world Obsidian date properties from stopping Index and Maintenance Sweeps at the first Desktop upload batch
+- Kept the latest sweep error visible beside its controls and clarified the difference between the migrated vault cache and the last successful Index Sweep
+
 ## 0.13.0 - 2026-07-16
 
 ### Added

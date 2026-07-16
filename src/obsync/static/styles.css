@@ -333,6 +333,11 @@ tr:last-child td { border-bottom: 0; }
 .sweep-progress progress { grid-column: 1; width: 100%; accent-color: var(--accent); }
 .sweep-progress small { grid-column: 1; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
 .sweep-progress .stop-sweep { grid-column: 2; grid-row: 1 / span 3; align-self: center; }
+.sweep-failure { margin-bottom: 16px; padding: 13px 14px; border: 1px solid color-mix(in srgb, var(--red) 55%, var(--border)); border-radius: 10px; background: color-mix(in srgb, var(--red) 8%, var(--panel)); }
+.sweep-failure strong, .sweep-failure p, .sweep-failure small { display: block; }
+.sweep-failure p { margin: 5px 0; color: var(--text); overflow-wrap: anywhere; }
+.sweep-failure small, .sweep-row-error { color: var(--muted); }
+.sweep-row-error { display: block; max-width: 330px; margin-top: 4px; overflow-wrap: anywhere; white-space: normal; }
 .danger-copy { color: var(--orange) !important; font-weight: 650; }
 .maintenance-categories { margin-top: 14px; }
 .sweep-history { max-height: 330px; overflow: auto; }

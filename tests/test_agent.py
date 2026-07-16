@@ -24,7 +24,9 @@ async def test_desktop_whole_vault_index_and_reviewed_maintenance_write(
     (vault / "Clients").mkdir()
     target = vault / "Companies" / "Pro Quality Plumbing.md"
     target.write_text(
-        "# Pro Quality Plumbing\n\nAccount ACME-7788 for Acme Holdings.", encoding="utf-8"
+        "---\ncreated: 2026-07-16\nupdated: 2026-07-16T12:34:56Z\n---\n"
+        "# Pro Quality Plumbing\n\nAccount ACME-7788 for Acme Holdings.",
+        encoding="utf-8",
     )
     (vault / "Clients" / "Acme Holdings.md").write_text(
         "# Acme Holdings\n\nPro Quality Plumbing account ACME-7788.", encoding="utf-8"

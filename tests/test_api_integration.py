@@ -104,6 +104,10 @@ def test_ui_includes_guided_help_and_obsync_desktop(client: TestClient) -> None:
     assert "Obsidian behaviors" in app_js
     assert "Start Index Sweep" in app_js
     assert "Start Maintenance Sweep" in app_js
+    assert "Last successful Index Sweep" in app_js
+    assert "sweepFailure" in app_js
+    assert "sweep-failure" in app_js
+    assert "sweep-row-error" in app_js
     assert "Schedule Index Sweep" in app_js
     assert "Schedule Maintenance Sweep" in app_js
     assert "Allow AI Agent to apply all recommended changes" in app_js
