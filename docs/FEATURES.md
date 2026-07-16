@@ -30,7 +30,8 @@ Obsync is a one-way, continuously reconciled knowledge pipeline from arbitrary f
 - Strict structured response schema and normalization
 - Rules-only fallback so model downtime never stops synchronization
 - Review threshold based on classification confidence
-- Live, read-only visibility into the active AI file, processing stages, model-emitted reasoning/output, and final decision
+- Immediate server-pushed, read-only visibility into the active AI file, processing stages, model-emitted reasoning/output, and final decision
+- Independent follow-latest mode for every inference panel, with manual-scroll takeover and an explicit return-to-live control
 - Independent inference cancellation that leaves Global Sync and other folders running
 - Feedback-driven AI re-review with one-run reviewer instructions
 - Related-note candidate selection and exact-title validation before creating `[[wikilinks]]`
@@ -64,7 +65,7 @@ Generated notes are grouped by destination prefix, source device, watched folder
 - Native **Add folder**, per-folder **Scan**, **View files**, and **Sync changes** controls
 - Global **Start Global Sync / Stop Global Sync** control with active sync and AI cancellation
 - Independent **Start / Pause / Stop** controls for every watched folder
-- Change-aware live status updates that preserve page and panel scroll positions
+- Change-aware live status updates that preserve page and panel scroll positions; Local AI activity is pushed immediately rather than waiting for the general refresh interval
 - Per-folder **Remove** action that preserves originals and existing notes
 - Green/orange/red comparison indicators and aggregate folder counts
 - One-time device enrollment codes

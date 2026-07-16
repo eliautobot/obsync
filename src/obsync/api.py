@@ -22,7 +22,7 @@ from fastapi import (
     Response,
     UploadFile,
 )
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -446,6 +446,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/v1/admin/ai/activity")
     async def ai_activity(_token: AdminDependency) -> dict[str, Any]:
         return service.ai_activity()
+
+    @app.get("/api/v1/admin/ai/activity/stream")
+    async def ai_activity_stream(_token: AdminDependency) -> StreamingResponse:
+        async def events():
+            stream = service.stream_ai_activity()
+            yield "retry: 1000\n\n"
+            try:
+                async for activity in stream:
+                    if activity is None:
+                        yield ": keep-alive\n\n"
+                        continue
+                    payload = json.dumps(activity, ensure_ascii=False, separators=(",", ":"))
+                    yield (f"id: {activity['revision']}\nevent: ai-activity\ndata: {payload}\n\n")
+            finally:
+                await stream.aclose()
+
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.post("/api/v1/admin/ai/stop")
     async def stop_ai_inference(

@@ -8,6 +8,7 @@ import platform
 import socket
 import tempfile
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -99,6 +100,8 @@ class ObsyncService:
         self._active_processing: dict[str, tuple[str, asyncio.Task[Any]]] = {}
         self._processing_activity: dict[str, dict[str, Any]] = {}
         self._last_inference: dict[str, Any] | None = None
+        self._ai_activity_revision = 0
+        self._ai_activity_subscribers: set[asyncio.Queue[int]] = set()
         self._cancel_reasons: dict[str, str] = {}
         self._dummy_password_hash = hash_password("obsync-invalid-password")
         self._bootstrap_admin_from_env()
@@ -184,7 +187,42 @@ class ObsyncService:
             "provider": self.db.get_setting("llm_provider", "ollama"),
             "model": self.db.get_setting("llm_model", ""),
             "enabled": self._llm_config().active,
+            "revision": self._ai_activity_revision,
         }
+
+    @property
+    def ai_activity_subscriber_count(self) -> int:
+        return len(self._ai_activity_subscribers)
+
+    def _notify_ai_activity(self) -> None:
+        self._ai_activity_revision += 1
+        for queue in tuple(self._ai_activity_subscribers):
+            if queue.full():
+                with suppress(asyncio.QueueEmpty):
+                    queue.get_nowait()
+            with suppress(asyncio.QueueFull):
+                queue.put_nowait(self._ai_activity_revision)
+
+    async def stream_ai_activity(
+        self, *, keepalive_seconds: float = 15
+    ) -> AsyncIterator[dict[str, Any] | None]:
+        """Yield current AI activity immediately and whenever model activity changes."""
+        queue: asyncio.Queue[int] = asyncio.Queue(maxsize=1)
+        self._ai_activity_subscribers.add(queue)
+        try:
+            yield self.ai_activity()
+            while True:
+                try:
+                    await asyncio.wait_for(queue.get(), timeout=keepalive_seconds)
+                except TimeoutError:
+                    yield None
+                    continue
+                while not queue.empty():
+                    with suppress(asyncio.QueueEmpty):
+                        queue.get_nowait()
+                yield self.ai_activity()
+        finally:
+            self._ai_activity_subscribers.discard(queue)
 
     def _start_activity(
         self,
@@ -246,6 +284,8 @@ class ObsyncService:
         if phase_label:
             activity["phase_label"] = phase_label
         activity["updated_at"] = now
+        if activity.get("used_ai"):
+            self._notify_ai_activity()
 
     def _finish_activity(self, document_id: str, *, outcome: str) -> None:
         activity = self._processing_activity.get(document_id)
@@ -256,6 +296,7 @@ class ObsyncService:
         activity["finished_at"] = utc_now()
         if activity.get("used_ai"):
             self._last_inference = self._public_activity(activity)
+            self._notify_ai_activity()
 
     def stop_inference(self, document_id: str = "") -> dict[str, Any]:
         stopped: list[str] = []
@@ -1723,6 +1764,7 @@ class ObsyncService:
                 if llm_config.active:
                     activity["phase"] = "inference"
                     activity["phase_label"] = "Local AI is analyzing the file"
+                    self._notify_ai_activity()
 
             def report_progress(kind: str, message: str) -> None:
                 phase = "inference"
@@ -1982,8 +2024,11 @@ class ObsyncService:
                 self._active_processing.pop(document_id, None)
             self._cancel_reasons.pop(document_id, None)
             final = self.db.query_one("SELECT status FROM documents WHERE id = ?", (document_id,))
+            used_ai = bool(self._processing_activity.get(document_id, {}).get("used_ai"))
             self._finish_activity(document_id, outcome=str(final["status"]) if final else "unknown")
             self._processing_activity.pop(document_id, None)
+            if used_ai:
+                self._notify_ai_activity()
 
     def mark_missing(self, agent_id: str, root_id: str, source_path: str) -> dict[str, Any]:
         self.require_pipeline_enabled()

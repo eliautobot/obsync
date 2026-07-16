@@ -2,6 +2,24 @@
 
 All notable changes to Obsync will be documented here.
 
+## 0.11.0 - 2026-07-15
+
+### Added
+
+- Added authenticated server-sent events for immediate Local AI activity updates without waiting for the general dashboard refresh interval
+- Added independent follow-latest behavior to every active document inference panel
+- Added a per-panel down-arrow control that appears when the user scrolls away and restores live following when selected
+
+### Changed
+
+- Updated only the changing Local AI session metadata and trace rows instead of rebuilding the entire Local AI panel for each model update
+- Made Local AI cards and traces fit narrow/mobile viewports without horizontal page overflow
+
+### Fixed
+
+- Stopped live inference from overriding a user's manual trace position while new tokens continue arriving
+- Closed browser EventSource connections, auto-scroll timers, and server subscriber queues during sign-out, page unload, reconnect, and cancelled gateway streams
+
 ## 0.10.0 - 2026-07-15
 
 ### Added

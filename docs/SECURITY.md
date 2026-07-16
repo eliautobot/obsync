@@ -47,7 +47,7 @@ Extracted document content is sent to the configured model endpoint. With a loca
 
 The system prompt labels source content as untrusted and tells the model not to follow embedded instructions. Model output is parsed as a strict object, normalized, length-limited, and constrained. Related links must exactly match server-provided candidates. All model-provided path components are slugged before filesystem use.
 
-The Local AI page can display provider-emitted reasoning and streamed output for the active and most recent inference. These bounded traces stay in server memory and are not persisted as a chat transcript. Reviewer feedback for an explicit re-review is stored with that document for auditability and is sent to the configured model endpoint for that run.
+The Local AI page can display provider-emitted reasoning and streamed output for the active and most recent inference. Authenticated same-origin server-sent events deliver those updates to the browser; each subscriber has a one-item coalescing queue that is removed when the stream disconnects. Browser sign-out and page-unload paths close their EventSource connection and pending auto-scroll timers. These bounded traces stay in server memory and are not persisted as a chat transcript. Reviewer feedback for an explicit re-review is stored with that document for auditability and is sent to the configured model endpoint for that run.
 
 LLMs are not security boundaries. Keep the vault backed up and review generated notes before relying on them for high-stakes decisions.
 

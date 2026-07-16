@@ -75,6 +75,7 @@ def test_health_ui_and_admin_auth(client: TestClient, admin_headers: dict[str, s
     assert client.get("/api/v1/admin/overview").status_code == 200
     client.cookies.clear()
     assert client.get("/api/v1/admin/overview").status_code == 401
+    assert client.get("/api/v1/admin/ai/activity/stream").status_code == 401
 
 
 def test_ui_includes_guided_help_and_obsync_desktop(client: TestClient) -> None:
@@ -98,6 +99,13 @@ def test_ui_includes_guided_help_and_obsync_desktop(client: TestClient) -> None:
     assert "Please choose which Obsidian Vault your files will be synced to" in app_js
     assert "Run as administrator" in app_js
     assert "setInterval(liveRefresh, 3000)" in app_js
+    assert 'new EventSource("/api/v1/admin/ai/activity/stream")' in app_js
+    assert "state.aiEventSource.close()" in app_js
+    assert 'window.addEventListener("pagehide", stopLiveUpdates)' in app_js
+    assert 'if (state.view === "local-ai") updateAiActivity(activity)' in app_js
+    assert "await refreshAiActivity();\n    } else if" not in app_js
+    assert "ai-jump-latest" in app_js
+    assert "state.aiFollow" in app_js
     assert "overviewSignature" in app_js
     assert "Current active file" in app_js
     assert "Stop inference" in app_js
@@ -108,7 +116,42 @@ def test_ui_includes_guided_help_and_obsync_desktop(client: TestClient) -> None:
     assert "Remove folder" in app_js
     assert "Keep that PowerShell window open" not in app_js
     assert ".help-tip" in styles
+    assert ".ai-jump-latest" in styles
+    assert "overflow-anchor: none" in styles
     assert "backdrop-filter: blur(3px)" not in styles
+
+
+def test_ai_activity_event_stream_formats_events_and_closes_gateway_subscription(
+    app, client: TestClient, admin_headers: dict[str, str], monkeypatch
+) -> None:
+    closed = False
+
+    async def finite_activity_stream():
+        nonlocal closed
+        try:
+            yield {
+                "active": [],
+                "last": None,
+                "provider": "ollama",
+                "model": "stream-model",
+                "enabled": True,
+                "revision": 42,
+            }
+            yield None
+        finally:
+            closed = True
+
+    monkeypatch.setattr(app.state.service, "stream_ai_activity", finite_activity_stream)
+    response = client.get("/api/v1/admin/ai/activity/stream", headers=admin_headers)
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["x-accel-buffering"] == "no"
+    assert "retry: 1000\n\n" in response.text
+    assert "id: 42\nevent: ai-activity\ndata:" in response.text
+    assert '"model":"stream-model"' in response.text
+    assert ": keep-alive\n\n" in response.text
+    assert closed is True
 
 
 def test_pipeline_can_stop_cancel_pending_work_and_resume(

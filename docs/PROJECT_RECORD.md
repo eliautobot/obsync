@@ -9,7 +9,7 @@ Obsync is a self-hosted ingestion layer that keeps an Obsidian vault aligned wit
 - Source: <https://github.com/eliautobot/obsync>
 - License: MIT
 - Initial release: `v0.1.0`
-- Current development version: `v0.10.0`
+- Current development version: `v0.11.0`
 
 ## Product decisions
 
@@ -42,6 +42,8 @@ Version 0.8.0 turns the Windows component into Obsync Desktop with bundled watch
 Version 0.9.0 separates vault, Local AI, and application settings; requires explicit vault confirmation; adds conservative duplicate review, custom AI instructions, per-folder controls, live UI updates, immediate reconciliation, one-click Desktop launching, and clear Windows administrator setup guidance.
 
 Version 0.10.0 adds live active-file and model-inference visibility, per-inference cancellation, complete review resolutions with feedback-driven AI re-review, scroll-stable live refreshes, and compact responsive document panels that remain bounded under large inventories.
+
+Version 0.11.0 replaces tick-based Local AI repainting with authenticated server-sent activity events, adds independent smart follow mode and return-to-live controls for every inference panel, and closes browser and server stream resources deterministically across reload, sign-out, and disconnect cycles.
 
 ## Initial validation
 

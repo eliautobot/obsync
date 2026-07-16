@@ -14,7 +14,7 @@ The server is the control plane and authoritative processing ledger. It provides
 - Format-specific extraction
 - Optional local-LLM classification
 - Atomic local generated-note writes or authenticated remote write commands
-- Review queue, bounded live processing activity, event history, and remote command queue
+- Review queue, bounded live processing activity with authenticated server-sent subscribers, event history, and remote command queue
 
 The Docker container receives two persistent mounts in server-mounted mode:
 
@@ -55,7 +55,7 @@ The server—not each agent—connects to the configured model endpoint. Support
 
 The server sends extracted text, metadata, and an optional allowlist of candidate related-note titles. User organization instructions are appended below a protected system prompt and cannot replace its JSON or untrusted-document rules. The model has no Obsidian API access. Obsync itself indexes the selected vault and rejects related links not present in the allowlist.
 
-Classification requests use streaming responses when the provider supports them. Obsync exposes the current file, pipeline stages, model-emitted reasoning/output fields, and decision in a read-only live view. This trace is bounded in memory and is not persisted as a chat transcript. An administrator can cancel an individual inference without stopping the global pipeline; the source file remains untouched and the document moves to Review.
+Classification requests use streaming responses when the provider supports them. Each model activity update is pushed to authenticated browsers over a server-sent event stream instead of waiting for the general dashboard refresh interval. The Local AI page updates stable session elements in place and keeps independent follow/manual-scroll state for every document trace. The trace is bounded in memory and is not persisted as a chat transcript. Browser disconnects remove their bounded subscriber queue in a `finally` cleanup path. An administrator can cancel an individual inference without stopping the global pipeline; the source file remains untouched and the document moves to Review.
 
 ## Data flow
 
@@ -69,7 +69,7 @@ Classification requests use streaming responses when the provider supports them.
 7. Sync uploads only pending source files
 8. Server checks agent token, root ownership, size, hash, and safe path
 9. Extractor produces bounded plain text
-10. LLM streams visible activity and returns structured classification, or rules provide fallback
+10. LLM activity is pushed live to subscribed browsers and returns structured classification, or rules provide fallback
 11. Server chooses/stabilizes destination and renders Markdown
 12. Server merges the preserved manual section
 13. Server writes atomically under `/vault`, or queues the managed note for the selected desktop vault writer

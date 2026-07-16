@@ -94,6 +94,76 @@ def test_repeated_pair_disconnect_cycles_leave_no_stale_computers(app) -> None:
 
 
 @pytest.mark.asyncio
+async def test_ai_activity_stream_pushes_each_inference_update_and_cleans_up(app) -> None:
+    service = app.state.service
+    stream = service.stream_ai_activity(keepalive_seconds=1)
+    initial = await anext(stream)
+    assert initial is not None
+    assert service.ai_activity_subscriber_count == 1
+
+    task = asyncio.current_task()
+    assert task is not None
+    service._start_activity(
+        "stream-document",
+        root_id="stream-root",
+        source_path="live/model-output.txt",
+        agent_name="Test PC",
+        root_name="Live Files",
+        task=task,
+    )
+    service._processing_activity["stream-document"]["used_ai"] = True
+    service._processing_activity["stream-document"]["ai_active"] = True
+    service._notify_ai_activity()
+    started = await asyncio.wait_for(anext(stream), timeout=1)
+    assert started is not None
+    assert started["revision"] > initial["revision"]
+
+    service._update_activity(
+        "stream-document",
+        "reasoning",
+        "Checking the vault index now.",
+        phase="inference",
+        phase_label="Local AI is reviewing the file",
+    )
+    reasoning = await asyncio.wait_for(anext(stream), timeout=1)
+    assert reasoning is not None
+    assert reasoning["active"][0]["events"][-1]["message"] == "Checking the vault index now."
+    assert reasoning["active"][0]["phase"] == "inference"
+
+    await stream.aclose()
+    service._processing_activity.pop("stream-document", None)
+    assert service.ai_activity_subscriber_count == 0
+
+
+@pytest.mark.asyncio
+async def test_gateway_stream_disconnect_stress_leaves_zero_subscribers(app) -> None:
+    service = app.state.service
+
+    for _cycle in range(50):
+        stream = service.stream_ai_activity(keepalive_seconds=0.01)
+        assert await anext(stream) is not None
+        assert service.ai_activity_subscriber_count == 1
+        await stream.aclose()
+        assert service.ai_activity_subscriber_count == 0
+
+    streams = [service.stream_ai_activity(keepalive_seconds=0.01) for _ in range(25)]
+    await asyncio.gather(*(anext(stream) for stream in streams))
+    assert service.ai_activity_subscriber_count == 25
+    await asyncio.gather(*(stream.aclose() for stream in streams))
+    assert service.ai_activity_subscriber_count == 0
+
+
+@pytest.mark.asyncio
+async def test_ai_activity_stream_keepalive_also_cleans_up(app) -> None:
+    service = app.state.service
+    stream = service.stream_ai_activity(keepalive_seconds=0.001)
+    assert await anext(stream) is not None
+    assert await asyncio.wait_for(anext(stream), timeout=1) is None
+    await stream.aclose()
+    assert service.ai_activity_subscriber_count == 0
+
+
+@pytest.mark.asyncio
 async def test_incomplete_llm_settings_report_disabled(app) -> None:
     result = await app.state.service.test_llm()
     assert result["ok"] is False

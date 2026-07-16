@@ -14,6 +14,12 @@ const state = {
   liveTimer: null,
   liveRefreshing: false,
   liveSignature: "",
+  aiActivity: null,
+  aiEventSource: null,
+  aiStreamRevision: -1,
+  aiFollow: new Map(),
+  aiScrollPositions: new Map(),
+  aiScrollTimers: new Map(),
 };
 
 function captureScrollState() {
@@ -129,8 +135,10 @@ function clearLegacyToken() {
 }
 
 function showLogin(message = "") {
-  if (state.liveTimer) clearInterval(state.liveTimer);
-  state.liveTimer = null;
+  stopLiveUpdates();
+  state.aiActivity = null;
+  state.aiFollow.clear();
+  state.aiScrollPositions.clear();
   state.authMode = "login";
   state.session = null;
   $("#app").hidden = true;
@@ -148,6 +156,7 @@ function showLogin(message = "") {
 }
 
 function showSetup(legacyMigrationRequired) {
+  stopLiveUpdates();
   state.authMode = "setup";
   state.session = null;
   $("#app").hidden = true;
@@ -172,6 +181,7 @@ function showSetup(legacyMigrationRequired) {
 }
 
 function showSetupRequired() {
+  stopLiveUpdates();
   state.authMode = "blocked";
   state.session = null;
   $("#app").hidden = true;
@@ -349,9 +359,7 @@ async function liveRefresh() {
     const changed = signature !== state.liveSignature;
     state.liveSignature = signature;
     updateShellStatus(overview);
-    if (state.view === "local-ai") {
-      await refreshAiActivity();
-    } else if (changed && ["overview", "sources", "documents", "review", "settings"].includes(state.view)) {
+    if (changed && ["overview", "sources", "documents", "review", "settings"].includes(state.view)) {
       await navigate(state.view, { silent: true });
     }
   } catch (_error) {
@@ -361,9 +369,44 @@ async function liveRefresh() {
   }
 }
 
-function startLiveUpdates() {
+function stopAiActivityStream() {
+  if (state.aiEventSource) state.aiEventSource.close();
+  state.aiEventSource = null;
+  state.aiStreamRevision = -1;
+}
+
+function startAiActivityStream() {
+  stopAiActivityStream();
+  if (!state.session || typeof EventSource === "undefined") return;
+  const source = new EventSource("/api/v1/admin/ai/activity/stream");
+  state.aiEventSource = source;
+  source.addEventListener("ai-activity", (event) => {
+    if (state.aiEventSource !== source) return;
+    try {
+      const activity = JSON.parse(event.data);
+      const revision = Number(activity.revision ?? event.lastEventId ?? 0);
+      if (revision < state.aiStreamRevision) return;
+      state.aiStreamRevision = revision;
+      state.aiActivity = activity;
+      if (state.view === "local-ai") updateAiActivity(activity);
+    } catch (_error) {
+      // Ignore a malformed event. EventSource keeps the last valid activity visible.
+    }
+  });
+}
+
+function stopLiveUpdates() {
   if (state.liveTimer) clearInterval(state.liveTimer);
+  state.liveTimer = null;
+  stopAiActivityStream();
+  state.aiScrollTimers.forEach((timer) => clearTimeout(timer));
+  state.aiScrollTimers.clear();
+}
+
+function startLiveUpdates() {
+  stopLiveUpdates();
   state.liveTimer = setInterval(liveRefresh, 3000);
+  startAiActivityStream();
 }
 
 function updatePipelineControl(status) {
@@ -1102,25 +1145,199 @@ async function renderVault() {
   });
 }
 
+function aiSessions(activity) {
+  return activity.active?.length ? activity.active : activity.last ? [activity.last] : [];
+}
+
+function aiSessionIsActive(activity, documentId) {
+  return Boolean((activity.active || []).find((item) => item.document_id === documentId));
+}
+
+function aiEventLabel(kind) {
+  if (kind === "reasoning") return "MODEL THINKING";
+  if (kind === "output") return "MODEL OUTPUT";
+  return String(kind || "stage").toUpperCase();
+}
+
+function aiTraceEvents(session) {
+  return session.events?.length
+    ? session.events
+    : [{ kind: "stage", message: "Waiting for model activity…" }];
+}
+
+function aiTraceMarkup(session) {
+  return aiTraceEvents(session).map((event) => `<div class="ai-trace-event ${escapeHtml(event.kind)}"><span>${escapeHtml(aiEventLabel(event.kind))}</span><pre>${escapeHtml(event.message)}</pre></div>`).join("");
+}
+
+function aiSessionHeadMarkup(session, isActive) {
+  return `<div><span class="eyebrow">${isActive ? "LIVE AI SESSION" : "LAST AI SESSION"}</span><h3>${escapeHtml(session.source_name)}</h3><p title="${escapeHtml(session.source_path)}">${escapeHtml(session.agent_name)} · ${escapeHtml(session.root_name)} · ${escapeHtml(session.source_path)}</p></div><span class="status-pill ${isActive ? "" : "offline"}">${isActive ? "working" : escapeHtml(session.outcome || "finished")}</span>`;
+}
+
+function aiSessionMetaMarkup(session, activity) {
+  return `<div><small>Stage</small><strong>${escapeHtml(session.phase_label || session.phase || "Finished")}</strong></div><div><small>Model</small><strong>${escapeHtml(session.provider || activity.provider)}${session.model || activity.model ? ` · ${escapeHtml(session.model || activity.model)}` : ""}</strong></div><div><small>Elapsed</small><strong>${session.elapsed_seconds || 0}s</strong></div>`;
+}
+
+function aiSessionActionsMarkup(session, isActive) {
+  return `<small>This is a read-only view of model-emitted activity and Obsync's processing stages.</small>${isActive && session.cancellable ? `<button class="danger stop-inference" type="button" data-document="${escapeHtml(session.document_id)}">Stop inference</button>` : ""}`;
+}
+
 function aiActivityMarkup(activity) {
-  const sessions = activity.active?.length ? activity.active : activity.last ? [activity.last] : [];
+  const sessions = aiSessions(activity);
   if (!sessions.length) {
     return `<section class="settings-card ai-live-card"><div class="ai-live-head"><div><span class="eyebrow">LIVE AI SESSION</span><h3>Local AI is idle</h3></div><span class="status-pill offline">idle</span></div><div class="ai-idle"><span>✦</span><p>No model inference is active. Start a folder sync or request a re-review to see the file, model activity, streamed response, and decision here.</p></div></section>`;
   }
   return sessions.map((session) => {
-    const isActive = Boolean((activity.active || []).find((item) => item.document_id === session.document_id));
-    const events = (session.events || []).map((event) => `<div class="ai-trace-event ${escapeHtml(event.kind)}"><span>${escapeHtml(event.kind === "reasoning" ? "MODEL THINKING" : event.kind === "output" ? "MODEL OUTPUT" : event.kind.toUpperCase())}</span><pre>${escapeHtml(event.message)}</pre></div>`).join("") || '<div class="ai-trace-event stage"><span>STAGE</span><pre>Waiting for model activity…</pre></div>';
-    return `<section class="settings-card ai-live-card ${isActive ? "active" : "completed"}">
-      <div class="ai-live-head"><div><span class="eyebrow">${isActive ? "LIVE AI SESSION" : "LAST AI SESSION"}</span><h3>${escapeHtml(session.source_name)}</h3><p title="${escapeHtml(session.source_path)}">${escapeHtml(session.agent_name)} · ${escapeHtml(session.root_name)} · ${escapeHtml(session.source_path)}</p></div><span class="status-pill ${isActive ? "" : "offline"}">${isActive ? "working" : escapeHtml(session.outcome || "finished")}</span></div>
-      <div class="ai-session-meta"><div><small>Stage</small><strong>${escapeHtml(session.phase_label || session.phase || "Finished")}</strong></div><div><small>Model</small><strong>${escapeHtml(session.provider || activity.provider)}${session.model || activity.model ? ` · ${escapeHtml(session.model || activity.model)}` : ""}</strong></div><div><small>Elapsed</small><strong>${session.elapsed_seconds || 0}s</strong></div></div>
-      <div class="ai-trace" data-preserve-scroll="true" data-scroll-key="ai-trace-${escapeHtml(session.document_id)}" aria-live="polite">${events}</div>
-      <div class="ai-live-actions"><small>This is a read-only view of model-emitted activity and Obsync's processing stages.</small>${isActive && session.cancellable ? `<button class="danger stop-inference" type="button" data-document="${escapeHtml(session.document_id)}">Stop inference</button>` : ""}</div>
+    const isActive = aiSessionIsActive(activity, session.document_id);
+    return `<section class="settings-card ai-live-card ${isActive ? "active" : "completed"}" data-ai-session-id="${escapeHtml(session.document_id)}">
+      <div class="ai-live-head" data-ai-session-head>${aiSessionHeadMarkup(session, isActive)}</div>
+      <div class="ai-session-meta" data-ai-session-meta>${aiSessionMetaMarkup(session, activity)}</div>
+      <div class="ai-trace-shell">
+        <div class="ai-trace" data-document="${escapeHtml(session.document_id)}" data-preserve-scroll="true" data-scroll-key="ai-trace-${escapeHtml(session.document_id)}" aria-live="polite" role="log">${aiTraceMarkup(session)}</div>
+        <button class="ai-jump-latest" type="button" data-document="${escapeHtml(session.document_id)}" aria-label="Jump to latest AI activity" title="Jump to latest AI activity" hidden>↓</button>
+      </div>
+      <div class="ai-live-actions" data-ai-session-actions>${aiSessionActionsMarkup(session, isActive)}</div>
     </section>`;
   }).join("");
 }
 
+function updateAiJumpButton(documentId) {
+  const host = $("#ai-live-host");
+  if (!host) return;
+  $$(".ai-jump-latest", host).forEach((button) => {
+    if (button.dataset.document === documentId) button.hidden = state.aiFollow.get(documentId) !== false;
+  });
+}
+
+function setAiFollow(documentId, follow) {
+  state.aiFollow.set(documentId, follow);
+  updateAiJumpButton(documentId);
+}
+
+function scrollAiTraceToLatest(trace, documentId, behavior = "auto") {
+  setAiFollow(documentId, true);
+  trace.dataset.autoScrolling = behavior;
+  trace.scrollTo({ top: trace.scrollHeight, behavior });
+  clearTimeout(state.aiScrollTimers.get(documentId));
+  const delay = behavior === "smooth" ? 450 : 80;
+  state.aiScrollTimers.set(documentId, setTimeout(() => {
+    if (state.aiFollow.get(documentId) !== false) trace.scrollTop = trace.scrollHeight;
+    trace.dataset.autoScrolling = "false";
+    state.aiScrollPositions.set(documentId, trace.scrollTop);
+    state.aiScrollTimers.delete(documentId);
+  }, delay));
+}
+
+function wireAiTrace(trace) {
+  if (trace.dataset.scrollWired === "true") return;
+  trace.dataset.scrollWired = "true";
+  const documentId = trace.dataset.document;
+  trace.addEventListener("wheel", (event) => {
+    if (event.deltaY < 0) {
+      trace.dataset.autoScrolling = "false";
+      setAiFollow(documentId, false);
+    }
+  }, { passive: true });
+  trace.addEventListener("scroll", () => {
+    state.aiScrollPositions.set(documentId, trace.scrollTop);
+    const atLatest = trace.scrollHeight - trace.scrollTop - trace.clientHeight <= 8;
+    if (trace.dataset.autoScrolling === "smooth") return;
+    if (trace.dataset.autoScrolling === "auto" && atLatest) return;
+    trace.dataset.autoScrolling = "false";
+    setAiFollow(documentId, atLatest);
+  }, { passive: true });
+}
+
+function initializeAiActivityPanels() {
+  const host = $("#ai-live-host");
+  if (!host) return;
+  $$(".ai-trace", host).forEach((trace) => {
+    const documentId = trace.dataset.document;
+    wireAiTrace(trace);
+    if (!state.aiFollow.has(documentId)) state.aiFollow.set(documentId, true);
+    if (state.aiFollow.get(documentId) !== false) {
+      requestAnimationFrame(() => scrollAiTraceToLatest(trace, documentId));
+    } else {
+      trace.scrollTop = state.aiScrollPositions.get(documentId) || 0;
+      updateAiJumpButton(documentId);
+    }
+  });
+}
+
+function updateAiTrace(trace, session) {
+  const documentId = session.document_id;
+  const follow = state.aiFollow.get(documentId) !== false;
+  const scrollTop = trace.scrollTop;
+  const events = aiTraceEvents(session);
+  const rows = [...trace.children];
+  events.forEach((event, index) => {
+    let row = rows[index];
+    if (!row) {
+      row = document.createElement("div");
+      row.innerHTML = "<span></span><pre></pre>";
+      trace.append(row);
+    }
+    row.className = `ai-trace-event ${event.kind || "stage"}`;
+    $("span", row).textContent = aiEventLabel(event.kind);
+    $("pre", row).textContent = event.message || "";
+  });
+  rows.slice(events.length).forEach((row) => row.remove());
+  if (follow) requestAnimationFrame(() => scrollAiTraceToLatest(trace, documentId));
+  else {
+    trace.scrollTop = scrollTop;
+    state.aiScrollPositions.set(documentId, scrollTop);
+    updateAiJumpButton(documentId);
+  }
+}
+
+function pruneAiPanelState(documentIds) {
+  const visible = new Set(documentIds);
+  [...state.aiFollow.keys()].forEach((documentId) => {
+    if (visible.has(documentId)) return;
+    clearTimeout(state.aiScrollTimers.get(documentId));
+    state.aiScrollTimers.delete(documentId);
+    state.aiFollow.delete(documentId);
+    state.aiScrollPositions.delete(documentId);
+  });
+}
+
+function updateAiActivity(activity) {
+  state.aiActivity = activity;
+  const host = $("#ai-live-host");
+  if (!host) return;
+  const sessions = aiSessions(activity);
+  const currentIds = $$("[data-ai-session-id]", host).map((card) => card.dataset.aiSessionId);
+  const nextIds = sessions.map((session) => String(session.document_id));
+  pruneAiPanelState(nextIds);
+  if (currentIds.join("\u0000") !== nextIds.join("\u0000")) {
+    host.innerHTML = aiActivityMarkup(activity);
+    initializeAiActivityPanels();
+    return;
+  }
+  sessions.forEach((session, index) => {
+    const card = $$("[data-ai-session-id]", host)[index];
+    const isActive = aiSessionIsActive(activity, session.document_id);
+    card.classList.toggle("active", isActive);
+    card.classList.toggle("completed", !isActive);
+    $("[data-ai-session-head]", card).innerHTML = aiSessionHeadMarkup(session, isActive);
+    $("[data-ai-session-meta]", card).innerHTML = aiSessionMetaMarkup(session, activity);
+    $("[data-ai-session-actions]", card).innerHTML = aiSessionActionsMarkup(session, isActive);
+    updateAiTrace($(".ai-trace", card), session);
+  });
+}
+
 function wireAiActivityControls() {
-  $$(".stop-inference").forEach((button) => button.addEventListener("click", async () => {
+  const host = $("#ai-live-host");
+  if (!host || host.dataset.controlsWired === "true") return;
+  host.dataset.controlsWired = "true";
+  host.addEventListener("click", async (event) => {
+    const jumpButton = event.target.closest(".ai-jump-latest");
+    if (jumpButton) {
+      const trace = $(`.ai-trace[data-document="${CSS.escape(jumpButton.dataset.document)}"]`, host);
+      if (trace) scrollAiTraceToLatest(trace, jumpButton.dataset.document, "smooth");
+      return;
+    }
+    const button = event.target.closest(".stop-inference");
+    if (!button) return;
     button.disabled = true;
     button.textContent = "Stopping…";
     try {
@@ -1129,17 +1346,14 @@ function wireAiActivityControls() {
       await refreshAiActivity();
       await refreshReviewBadge();
     } catch (error) { toast(error.message, true); button.disabled = false; button.textContent = "Stop inference"; }
-  }));
+  });
 }
 
 async function refreshAiActivity() {
-  const host = $("#ai-live-host");
-  if (!host) return;
-  const scrollState = captureScrollState();
+  if (!$("#ai-live-host")) return;
   const activity = await api("/api/v1/admin/ai/activity");
-  host.innerHTML = aiActivityMarkup(activity);
-  wireAiActivityControls();
-  restoreScrollState(scrollState);
+  state.aiStreamRevision = Math.max(state.aiStreamRevision, Number(activity.revision || 0));
+  updateAiActivity(activity);
 }
 
 async function renderLocalAI() {
@@ -1147,6 +1361,9 @@ async function renderLocalAI() {
     api("/api/v1/admin/settings"), api("/api/v1/admin/ai/activity"),
   ]);
   const enabled = settings.llm_enabled === "true";
+  state.aiActivity = activity;
+  state.aiStreamRevision = Math.max(state.aiStreamRevision, Number(activity.revision || 0));
+  pruneAiPanelState(aiSessions(activity).map((session) => String(session.document_id)));
   $("#content").innerHTML = `<div class="settings-layout"><div id="ai-live-host">${aiActivityMarkup(activity)}</div><form class="settings-layout" id="ai-settings-form">
     <section class="settings-card"><h3>${headingWithHelp("Local AI connection", "Optional local classification through Ollama, LM Studio, or another OpenAI-compatible server.")}</h3>
       <div class="field-grid">
@@ -1172,6 +1389,7 @@ async function renderLocalAI() {
     </section>
   </form></div>`;
   wireAiActivityControls();
+  initializeAiActivityPanels();
   $("#llm-provider").value = settings.llm_provider || "ollama";
   $("#duplicate-policy").value = settings.duplicate_policy || "review";
   $("#ai-settings-form").addEventListener("submit", async (event) => {
@@ -1369,6 +1587,10 @@ $("#menu-button").addEventListener("click", () => {
 });
 $("#modal-close").addEventListener("click", () => $("#modal").close());
 $$(".nav-item").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.view)));
+window.addEventListener("pagehide", stopLiveUpdates);
+window.addEventListener("pageshow", (event) => {
+  if (event.persisted && state.session) startLiveUpdates();
+});
 
 const storedTheme = localStorage.getItem("obsync_theme");
 setTheme(storedTheme || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"));
