@@ -25,6 +25,27 @@ CREATE TABLE IF NOT EXISTS settings (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS ai_profiles (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    description TEXT NOT NULL DEFAULT '',
+    config_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vault_notes (
+    vault_key TEXT NOT NULL,
+    path TEXT NOT NULL,
+    title TEXT NOT NULL,
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(vault_key, path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_notes_title
+ON vault_notes(vault_key, title COLLATE NOCASE);
+
 CREATE TABLE IF NOT EXISTS admin_users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT NOT NULL COLLATE NOCASE UNIQUE,
@@ -256,9 +277,9 @@ class Database:
                 connection.execute("ALTER TABLE enrollments ADD COLUMN agent_id TEXT")
             row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
-                connection.execute("INSERT INTO schema_meta(version) VALUES (6)")
-            elif int(row["version"]) < 6:
-                connection.execute("UPDATE schema_meta SET version = 6")
+                connection.execute("INSERT INTO schema_meta(version) VALUES (7)")
+            elif int(row["version"]) < 7:
+                connection.execute("UPDATE schema_meta SET version = 7")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

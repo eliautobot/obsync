@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import httpx
@@ -546,7 +547,10 @@ async def test_desktop_vault_audit_reports_matching_modified_and_missing_notes(
     )
     manual = desktop_vault / "Reference" / "12_Laws_and_Rules.md"
     manual.parent.mkdir()
-    manual.write_text("# Laws and Rules\n\nExisting curated note.\n", encoding="utf-8")
+    manual.write_text(
+        "---\ntags: [law, permit]\n---\n# Laws and Rules\n\nExisting curated note.\n",
+        encoding="utf-8",
+    )
     client.post(
         "/api/v1/agent/heartbeat",
         headers=agent_headers,
@@ -615,3 +619,10 @@ async def test_desktop_vault_audit_reports_matching_modified_and_missing_notes(
     assert matching["destination_path"] == "Imported/matching.md"
     duplicate = next(item for item in docs if item["source_path"] == "Laws and Rules.txt")
     assert duplicate["duplicate_path"] == "Reference/12_Laws_and_Rules.md"
+    vault_note = app.state.service.db.query_one(
+        "SELECT * FROM vault_notes WHERE vault_key = ? AND path = ?",
+        (enrolled_agent["agent_id"], "Reference/12_Laws_and_Rules.md"),
+    )
+    assert vault_note is not None
+    assert vault_note["title"] == "Laws and Rules"
+    assert json.loads(vault_note["tags_json"]) == ["law", "permit"]

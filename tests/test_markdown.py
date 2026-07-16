@@ -12,11 +12,13 @@ from obsync.markdown import (
     likely_same_note_title,
     merge_preserving_manual,
     normalized_note_title,
+    note_tags,
     note_title,
     note_title_from_path,
     render_markdown,
     set_source_status,
 )
+from obsync.profiles import BRIEF_SUMMARY_PROFILE, FULL_TRANSFER_PROFILE
 
 
 def make_note(summary: str = "A useful summary.") -> str:
@@ -54,6 +56,76 @@ def test_rendered_note_has_obsidian_structure() -> None:
     assert "[[Acme Client]]" in note
     assert GENERATED_START in note and GENERATED_END in note
     assert "## My notes" in note
+
+
+def test_full_transfer_and_summary_profiles_control_note_body() -> None:
+    full = render_markdown(
+        document_id="full-1",
+        source_path="records/full.txt",
+        source_name="full.txt",
+        source_hash="fullhash",
+        source_size=999,
+        source_mtime_ns=1,
+        machine_name="Office PC",
+        root_name="Records",
+        mime_type="text/plain",
+        extractor="text",
+        extracted_text="Every clause, figure, and context line.",
+        extraction_warning="",
+        truncated=False,
+        analysis=Analysis(
+            title="Complete Record",
+            summary="This summary must not replace the record.",
+            category="Records",
+            document_type="record",
+            tags=["complete"],
+            confidence=0.9,
+            related_notes=["Client Record"],
+            profile_name=FULL_TRANSFER_PROFILE.name,
+        ),
+        profile=FULL_TRANSFER_PROFILE,
+    )
+    assert "## Document content\n\nEvery clause, figure, and context line." in full
+    assert "## Summary" not in full
+    assert "<details" not in full
+    assert "obsync_profile: Full document transfer" in full
+
+    brief = render_markdown(
+        document_id="brief-1",
+        source_path="records/brief.txt",
+        source_name="brief.txt",
+        source_hash="briefhash",
+        source_size=999,
+        source_mtime_ns=1,
+        machine_name="Office PC",
+        root_name="Records",
+        mime_type="text/plain",
+        extractor="text",
+        extracted_text="This complete source must be omitted from a summary-only note.",
+        extraction_warning="",
+        truncated=False,
+        analysis=Analysis(
+            title="Brief Record",
+            summary="Only the important result.",
+            category="Records",
+            document_type="record",
+            tags=["brief"],
+            confidence=0.9,
+            profile_name=BRIEF_SUMMARY_PROFILE.name,
+        ),
+        profile=BRIEF_SUMMARY_PROFILE,
+    )
+    assert "## Summary\n\nOnly the important result." in brief
+    assert "complete source must be omitted" not in brief
+
+
+def test_obsidian_frontmatter_tags_are_available_for_vault_context() -> None:
+    assert note_tags("---\ntags: [Client, permit-renewal, '#Florida']\n---\n# Note") == [
+        "Client",
+        "permit-renewal",
+        "Florida",
+    ]
+    assert note_tags("# No properties") == []
 
 
 def test_manual_content_survives_update() -> None:

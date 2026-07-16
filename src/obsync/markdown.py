@@ -8,6 +8,7 @@ from typing import Any
 import yaml
 
 from .llm import Analysis
+from .profiles import AIProfile
 
 GENERATED_START = "<!-- obsync:generated:start -->"
 GENERATED_END = "<!-- obsync:generated:end -->"
@@ -46,6 +47,7 @@ def render_markdown(
     extraction_warning: str,
     truncated: bool,
     analysis: Analysis,
+    profile: AIProfile | None = None,
     status: str = "active",
 ) -> str:
     now = datetime.now(UTC).isoformat(timespec="seconds")
@@ -58,10 +60,17 @@ def render_markdown(
         "obsync_hash": source_hash,
         "obsync_mime": mime_type,
         "obsync_updated": now,
-        "type": analysis.document_type,
-        "category": analysis.category,
-        "tags": sorted(set(["obsync", *analysis.tags])),
+        "obsync_profile": analysis.profile_name,
     }
+    if profile is None or profile.use_properties:
+        properties.update(
+            {
+                "type": analysis.document_type,
+                "category": analysis.category,
+            }
+        )
+    if profile is None or profile.use_tags:
+        properties["tags"] = sorted(set(["obsync", *analysis.tags]))
 
     lines = [
         _yaml_frontmatter(properties),
@@ -75,12 +84,19 @@ def render_markdown(
         f"> Machine: **{machine_name}** · Watched folder: **{root_name}**  ",
         f"> Status: **{status}** · Confidence: **{round(analysis.confidence * 100)}%**",
         "",
-        "## Summary",
-        "",
-        analysis.summary or f"Synced source file `{source_name}`.",
     ]
 
-    if analysis.related_notes:
+    content_mode = profile.note_content_mode if profile else "full-and-summary"
+    if content_mode in {"summary", "full-and-summary"}:
+        lines.extend(
+            [
+                "## Summary",
+                "",
+                analysis.summary or f"Synced source file `{source_name}`.",
+            ]
+        )
+
+    if analysis.related_notes and (profile is None or profile.use_wikilinks):
         lines.extend(
             [
                 "",
@@ -105,35 +121,41 @@ def render_markdown(
             ]
         )
 
-    lines.extend(
-        [
-            "",
-            "## Source details",
-            "",
-            f"- File: `{source_name}`",
-            f"- Format: `{mime_type}`",
-            f"- Size: `{source_size}` bytes",
-            f"- Modified (ns): `{source_mtime_ns}`",
-            f"- SHA-256: `{source_hash}`",
-            f"- Extractor: `{extractor}`",
-        ]
-    )
-    if truncated:
-        lines.append("- Extraction was truncated by the configured character limit")
-
-    if extracted_text:
-        safe_text = _clean_document_text(extracted_text)
+    if profile is None or profile.include_source_details:
         lines.extend(
             [
                 "",
-                "<details>",
-                "<summary>Extracted source content</summary>",
+                "## Source details",
                 "",
-                safe_text,
-                "",
-                "</details>",
+                f"- File: `{source_name}`",
+                f"- Format: `{mime_type}`",
+                f"- Size: `{source_size}` bytes",
+                f"- Modified (ns): `{source_mtime_ns}`",
+                f"- SHA-256: `{source_hash}`",
+                f"- Extractor: `{extractor}`",
             ]
         )
+        if truncated:
+            lines.append("- Extraction was truncated by the active AI profile input limit")
+
+    if extracted_text and content_mode in {"full", "full-and-summary"}:
+        safe_text = _clean_document_text(extracted_text)
+        if content_mode == "full":
+            lines.extend(["", "## Document content", "", safe_text])
+        else:
+            lines.extend(
+                [
+                    "",
+                    "## Complete extracted document",
+                    "",
+                    "<details open>",
+                    "<summary>Show or hide complete content</summary>",
+                    "",
+                    safe_text,
+                    "",
+                    "</details>",
+                ]
+            )
 
     lines.extend(
         [
@@ -237,6 +259,32 @@ def note_title(content: str, path: Path) -> str:
     if heading:
         return heading.group(1).strip()[:200]
     return note_title_from_path(path)[:200]
+
+
+def note_tags(content: str) -> list[str]:
+    """Read searchable tags from ordinary Obsidian YAML frontmatter."""
+    if not content.startswith("---\n"):
+        return []
+    try:
+        frontmatter, _body = content[4:].split("\n---", 1)
+        values = yaml.safe_load(frontmatter) or {}
+    except (ValueError, yaml.YAMLError):
+        return []
+    if not isinstance(values, dict):
+        return []
+    raw_tags = values.get("tags", [])
+    if isinstance(raw_tags, str):
+        raw_tags = re.split(r"[,\s]+", raw_tags)
+    if not isinstance(raw_tags, list):
+        return []
+    tags: list[str] = []
+    for value in raw_tags:
+        tag = str(value).strip().lstrip("#")[:80]
+        if tag and tag not in tags:
+            tags.append(tag)
+        if len(tags) >= 30:
+            break
+    return tags
 
 
 def normalized_note_title(value: str) -> str:

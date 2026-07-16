@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from obsync.llm import LLMAnalyzer, LLMConfig, fallback_analysis, validate_base_url
+from obsync.profiles import FULL_TRANSFER_PROFILE
 
 
 def test_fallback_analysis_uses_path_and_text() -> None:
@@ -127,6 +128,80 @@ async def test_ollama_stream_reports_model_activity_and_reviewer_feedback(monkey
     assert any(kind == "reasoning" for kind, _message in progress)
     assert any(kind == "output" for kind, _message in progress)
     assert any(kind == "decision" for kind, _message in progress)
+
+
+@pytest.mark.asyncio
+async def test_custom_profile_controls_prompts_context_and_model_parameters(monkeypatch) -> None:
+    captured: dict = {}
+    profile = FULL_TRANSFER_PROFILE.custom_copy(profile_id="custom-1", name="Legal archive")
+    profile.role_prompt = "Preserve every legal clause."
+    profile.user_prompt_template = (
+        "PATH={{source_path}}\nTYPE={{mime_type}}\nNOTES={{candidate_notes}}\n"
+        "BODY={{document_content}}\nREVIEW={{review_feedback}}"
+    )
+    profile.temperature = 0.35
+    profile.top_p = 0.72
+    profile.max_output_tokens = 6789
+    profile.input_char_limit = 12
+    profile.candidate_limit = 2
+
+    decision = json.dumps(
+        {
+            "title": "Legal Archive",
+            "summary": "Complete legal record.",
+            "category": "Legal",
+            "document_type": "contract",
+            "tags": ["legal"],
+            "confidence": 0.95,
+            "related_notes": ["Client Alpha"],
+        }
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(200, json={"message": {"content": decision}})
+
+    transport = httpx.MockTransport(handler)
+
+    class MockClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = transport
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", MockClient)
+    result = await LLMAnalyzer(
+        LLMConfig(
+            enabled=True,
+            provider="ollama",
+            base_url="http://model",
+            model="local",
+            profile=profile,
+        )
+    ).analyze(
+        source_path="Contracts/agreement.txt",
+        text="123456789012EXCLUDED",
+        mime_type="text/plain",
+        candidates=[
+            {"title": "Client Alpha", "path": "Clients/Alpha.md", "tags": ["client"]},
+            {"title": "Legal Rules", "path": "Legal/Rules.md", "tags": ["law"]},
+            {"title": "Excluded Third", "path": "Other.md", "tags": []},
+        ],
+        review_feedback="Keep the clauses.",
+    )
+    assert captured["options"] == {
+        "temperature": 0.35,
+        "top_p": 0.72,
+        "num_predict": 6789,
+    }
+    system = captured["messages"][0]["content"]
+    user = captured["messages"][1]["content"]
+    assert "Preserve every legal clause." in system
+    assert "BODY=123456789012" in user
+    assert "EXCLUDED" not in user
+    assert "[[Client Alpha]] | path: Clients/Alpha.md | tags: client" in user
+    assert "Excluded Third" not in user
+    assert result.profile_id == "custom-1"
+    assert result.profile_name == "Legal archive"
 
 
 @pytest.mark.asyncio

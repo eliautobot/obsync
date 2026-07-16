@@ -652,6 +652,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def get_settings(_token: AdminDependency) -> dict[str, Any]:
         return service.settings_for_ui()
 
+    @app.get("/api/v1/admin/ai/profiles")
+    async def get_ai_profiles(_token: AdminDependency) -> dict[str, Any]:
+        return service.ai_profiles_for_ui()
+
+    @app.post("/api/v1/admin/ai/profiles")
+    async def create_ai_profile(payload: dict[str, Any], _token: AdminDependency) -> dict[str, Any]:
+        return service.create_ai_profile(payload)
+
+    @app.put("/api/v1/admin/ai/profiles/{profile_id}")
+    async def update_ai_profile(
+        profile_id: str, payload: dict[str, Any], _token: AdminDependency
+    ) -> dict[str, Any]:
+        return service.update_ai_profile(profile_id, payload)
+
+    @app.post("/api/v1/admin/ai/profiles/{profile_id}/activate")
+    async def activate_ai_profile(profile_id: str, _token: AdminDependency) -> dict[str, Any]:
+        return service.activate_ai_profile(profile_id)
+
+    @app.delete("/api/v1/admin/ai/profiles/{profile_id}")
+    async def delete_ai_profile(profile_id: str, _token: AdminDependency) -> dict[str, Any]:
+        return service.delete_ai_profile(profile_id)
+
     @app.put("/api/v1/admin/settings")
     async def put_settings(payload: dict[str, Any], _token: AdminDependency) -> dict[str, Any]:
         return service.update_settings(payload)

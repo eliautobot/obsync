@@ -53,7 +53,9 @@ The server—not each agent—connects to the configured model endpoint. Support
 - Ollama `/api/chat` for classification and `/api/tags` for connection checks
 - OpenAI-compatible `/v1/chat/completions` for classification and `/v1/models` for connection checks, including LM Studio
 
-The server sends extracted text, metadata, and an optional allowlist of candidate related-note titles. User organization instructions are appended below a protected system prompt and cannot replace its JSON or untrusted-document rules. The model has no Obsidian API access. Obsync itself indexes the selected vault and rejects related links not present in the allowlist.
+The active AI profile controls the role prompt, user-prompt template, provider parameters, input/output bounds, note content mode, and Obsidian organization features. The immutable Full document transfer profile makes the complete extracted source the note body; model output supplies metadata and a separate search-oriented summary. The immutable Brief summary profile produces a compact summary-only body. Custom profiles can be copied from either built-in and edited independently. The protected JSON schema and untrusted-document boundary remain visible but read-only.
+
+When vault context is enabled, Obsync catalogs Markdown titles, relative paths, and frontmatter tags from the server-mounted vault or a selected Desktop vault. It ranks that real vault catalog for the source document and sends only the bounded candidates to the model. Returned links must exactly match those candidates. Obsidian does not expose a remote core API for these operations, so Obsync uses its native filesystem contract: Markdown, YAML properties, tags, folders, and `[[wikilinks]]`.
 
 Classification requests use streaming responses when the provider supports them. Each model activity update is pushed to authenticated browsers over a server-sent event stream instead of waiting for the general dashboard refresh interval. The Local AI page updates stable session elements in place and keeps independent follow/manual-scroll state for every document trace. The trace is bounded in memory and is not persisted as a chat transcript. Browser disconnects remove their bounded subscriber queue in a `finally` cleanup path. An administrator can cancel an individual inference without stopping the global pipeline; the source file remains untouched and the document moves to Review.
 
@@ -68,9 +70,9 @@ Classification requests use streaming responses when the provider supports them.
 6. UI reports in-sync, modified, new, possible-duplicate, vault-missing, and source-missing states
 7. Sync uploads only pending source files
 8. Server checks agent token, root ownership, size, hash, and safe path
-9. Extractor produces bounded plain text
-10. LLM activity is pushed live to subscribed browsers and returns structured classification, or rules provide fallback
-11. Server chooses/stabilizes destination and renders Markdown
+9. Extractor produces plain text bounded by the active AI profile
+10. LLM activity is pushed live to subscribed browsers and returns structured organization metadata, or rules provide fallback
+11. Server chooses/stabilizes destination and renders the configured full-text or summary-only Markdown body
 12. Server merges the preserved manual section
 13. Server writes atomically under `/vault`, or queues the managed note for the selected desktop vault writer
 14. SQLite ledger, comparison state, and event stream are updated

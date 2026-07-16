@@ -34,7 +34,11 @@ Obsync is a one-way, continuously reconciled knowledge pipeline from arbitrary f
 - Independent follow-latest mode for every inference panel, with manual-scroll takeover and an explicit return-to-live control
 - Independent inference cancellation that leaves Global Sync and other folders running
 - Feedback-driven AI re-review with one-run reviewer instructions
-- Related-note candidate selection and exact-title validation before creating `[[wikilinks]]`
+- Immutable Full document transfer and Brief summary AI profiles
+- Copyable, editable, activatable, and deletable custom AI profiles
+- Visible profile prompts, prompt template, provider parameters, context limits, and output behavior
+- Per-profile Obsidian controls for vault context, `[[wikilinks]]`, tags, properties, folders, and source details
+- Real vault title/path/tag cataloging with related-note candidate selection and exact-title validation
 
 ## Obsidian output
 
@@ -43,11 +47,8 @@ Each document receives:
 - Stable `obsync_id`
 - Source machine, watched root, relative source path, hash, type, and update properties
 - Human-readable title
-- Summary
-- Category
-- Tags
-- Related-note wikilinks when the model selects an allowed candidate
-- Source details and extracted content
+- Full extracted content, a combined summary and full body, or a brief summary according to the active profile
+- Optional category, tags, related-note wikilinks, YAML properties, and source details according to the profile
 - A manual section that Obsync preserves across updates
 
 Generated notes are grouped by destination prefix, source device, watched folder, and initial category. Their destination remains stable on later edits, preventing routine reclassification from breaking backlinks.
@@ -73,7 +74,7 @@ Generated notes are grouped by destination prefix, source device, watched folder
 - Searchable, compact document table with bounded panel scrolling and responsive mobile cards
 - Error retry commands
 - Complete review workflow with Approve, Disregard, feedback-driven Redo AI review, and explicit separate-note creation for possible duplicates
-- LLM configuration and connection test
+- Complete Local AI connection, profile, prompt, parameter, and Obsidian behavior configuration
 - Fast model discovery that does not start inference
 - Automatic server computer plus optional paired desktops
 - Native desktop folder picker for watched roots and the vault

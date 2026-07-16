@@ -27,6 +27,7 @@ from .markdown import (
     likely_same_note_title,
     managed_note_metadata,
     merge_preserving_manual,
+    note_tags,
     note_title,
     note_title_from_path,
     set_source_status,
@@ -679,7 +680,13 @@ class AgentRuntime:
             except (OSError, UnicodeError):
                 continue
             relative = note.relative_to(vault).as_posix()
-            catalog.append({"path": relative, "title": note_title(content, note)})
+            catalog.append(
+                {
+                    "path": relative,
+                    "title": note_title(content, note),
+                    "tags": note_tags(content),
+                }
+            )
             if not metadata:
                 continue
             key = (
@@ -749,7 +756,7 @@ class AgentRuntime:
                     "duplicate_title": duplicate["title"] if duplicate else "",
                 }
             )
-        return json.dumps(results, ensure_ascii=False)
+        return json.dumps({"documents": results, "notes": catalog[:5000]}, ensure_ascii=False)
 
     def _ensure_watch_task(self, root: RootConfig) -> None:
         existing = self._watch_tasks.get(root.root_key)

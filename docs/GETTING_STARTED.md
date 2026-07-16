@@ -59,7 +59,9 @@ The model endpoint must be reachable from the server container.
 - Ollama default port: `11434`
 - LM Studio default port: `1234`
 
-In **Settings**, choose the provider, base URL, and model. Press **Check connection**. This performs a bounded model-list request and does not start inference, so a cold model does not cause a false timeout. Do not expose an unauthenticated LLM port to the public Internet.
+In **Local AI**, choose the provider, base URL, and model. Press **Check connection**. This performs a bounded model-list request and does not start inference, so a cold model does not cause a false timeout. Do not expose an unauthenticated LLM port to the public Internet.
+
+Choose **Full document transfer** when the Obsidian note must retain the complete extracted source. Choose **Brief summary** only when a compact record is intentional. Use **Copy** on either built-in to create a custom profile, edit its prompts, parameters, note behavior, and Obsidian organization switches, save it, then choose **Activate**. Built-ins and the protected safety/schema prompt cannot be changed or deleted.
 
 ## 3. Pair a source computer
 

@@ -15,6 +15,8 @@ const state = {
   liveRefreshing: false,
   liveSignature: "",
   aiActivity: null,
+  aiProfiles: null,
+  aiSelectedProfileId: "",
   aiEventSource: null,
   aiStreamRevision: -1,
   aiFollow: new Map(),
@@ -318,6 +320,8 @@ async function openSecuritySetup() {
 async function openApp(session, promptToSecure = false) {
   state.session = session;
   clearLegacyToken();
+  const meta = await api("/api/v1/meta", { authRequest: true });
+  $("#version-label").textContent = `v${meta.version}`;
   $("#login-screen").hidden = true;
   $("#app").hidden = false;
   updateSecurityState(session);
@@ -1174,7 +1178,7 @@ function aiSessionHeadMarkup(session, isActive) {
 }
 
 function aiSessionMetaMarkup(session, activity) {
-  return `<div><small>Stage</small><strong>${escapeHtml(session.phase_label || session.phase || "Finished")}</strong></div><div><small>Model</small><strong>${escapeHtml(session.provider || activity.provider)}${session.model || activity.model ? ` · ${escapeHtml(session.model || activity.model)}` : ""}</strong></div><div><small>Elapsed</small><strong>${session.elapsed_seconds || 0}s</strong></div>`;
+  return `<div><small>Stage</small><strong>${escapeHtml(session.phase_label || session.phase || "Finished")}</strong></div><div><small>AI profile</small><strong>${escapeHtml(session.profile_name || "Full document transfer")}</strong></div><div><small>Model</small><strong>${escapeHtml(session.provider || activity.provider)}${session.model || activity.model ? ` · ${escapeHtml(session.model || activity.model)}` : ""}</strong></div><div><small>Elapsed</small><strong>${session.elapsed_seconds || 0}s</strong></div>`;
 }
 
 function aiSessionActionsMarkup(session, isActive) {
@@ -1356,15 +1360,103 @@ async function refreshAiActivity() {
   updateAiActivity(activity);
 }
 
+function aiProfileCard(profile, activeId, selectedId) {
+  const active = profile.id === activeId;
+  const selected = profile.id === selectedId;
+  return `<article class="ai-profile-card ${active ? "active" : ""} ${selected ? "selected" : ""}">
+    <button class="ai-profile-select" type="button" data-profile-select="${escapeHtml(profile.id)}">
+      <span><strong>${escapeHtml(profile.name)}</strong><small>${profile.builtin ? "Built-in · read-only" : "Custom · editable"}</small></span>
+      ${active ? '<span class="status-pill online">Active</span>' : ""}
+    </button>
+    <p>${escapeHtml(profile.description)}</p>
+    <div class="settings-actions compact">
+      ${active ? "" : `<button class="primary activate-profile" type="button" data-profile-id="${escapeHtml(profile.id)}">Use profile</button>`}
+      <button class="secondary copy-profile" type="button" data-profile-id="${escapeHtml(profile.id)}">Copy to custom</button>
+      ${profile.builtin ? "" : `<button class="danger delete-profile" type="button" data-profile-id="${escapeHtml(profile.id)}">Delete</button>`}
+    </div>
+  </article>`;
+}
+
+function profileEditorMarkup(profile, profileData) {
+  const locked = profile.builtin;
+  const readonly = locked ? "readonly" : "";
+  const disabled = locked ? "disabled" : "";
+  const checked = (value) => value ? "checked" : "";
+  return `<form class="settings-card profile-editor" id="profile-editor-form">
+    <div class="profile-editor-head"><div><span class="eyebrow">${locked ? "BUILT-IN PROFILE" : "CUSTOM PROFILE"}</span><h3>${escapeHtml(profile.name)}</h3><p>${locked ? "Built-in profiles are protected. Copy this profile to customize every field." : "Every behavior below is saved with this profile and used by its next inference."}</p></div>${locked ? `<button class="secondary copy-profile" type="button" data-profile-id="${escapeHtml(profile.id)}">Copy to custom</button>` : ""}</div>
+    <div class="field-grid">
+      <div class="field">${labelWithHelp("profile-name", "Profile name", "The name shown in the profile picker and live inference view.")}<input id="profile-name" maxlength="80" value="${escapeHtml(profile.name)}" ${readonly}></div>
+      <div class="field full-width">${labelWithHelp("profile-description", "Description", "Explains when this profile should be used.")}<textarea id="profile-description" rows="3" maxlength="500" ${readonly}>${escapeHtml(profile.description)}</textarea></div>
+      <div class="field full-width">${labelWithHelp("profile-content-mode", "Note content behavior", "Full transfer writes complete extracted text. Full plus summary writes both. Brief summary omits the extracted body.")}<select id="profile-content-mode" ${disabled}><option value="full">Full document transfer — complete extracted text</option><option value="full-and-summary">Full document plus AI summary</option><option value="summary">Brief summary only</option></select></div>
+    </div>
+    <h4>Inference prompts</h4>
+    <div class="field">${labelWithHelp("profile-role-prompt", "AI role prompt", "The editable profile-specific system role. The protected safety/schema prompt below is always applied first.")}<textarea id="profile-role-prompt" rows="10" maxlength="20000" ${readonly}>${escapeHtml(profile.role_prompt)}</textarea></div>
+    <div class="field">${labelWithHelp("profile-user-template", "User prompt template", `Controls exactly how document data reaches the model. Available placeholders: ${profileData.prompt_placeholders.join(", ")}.`)}<textarea id="profile-user-template" rows="13" maxlength="20000" ${readonly}>${escapeHtml(profile.user_prompt_template)}</textarea></div>
+    <details class="prompt-boundary"><summary>Protected inference prompt (visible, not editable)</summary><p>This prompt enforces JSON, treats documents as untrusted, and protects the vault. It is shown in full so the actual inference behavior is inspectable.</p><textarea rows="18" readonly>${escapeHtml(profileData.protected_system_prompt)}</textarea></details>
+    <h4>Model parameters</h4>
+    <div class="field-grid compact-grid">
+      <div class="field">${labelWithHelp("profile-temperature", "Temperature", "Lower values are more consistent; higher values are more varied.")}<input id="profile-temperature" type="number" min="0" max="2" step="0.05" value="${escapeHtml(profile.temperature)}" ${readonly}></div>
+      <div class="field">${labelWithHelp("profile-top-p", "Top P", "Limits token sampling by cumulative probability.")}<input id="profile-top-p" type="number" min="0" max="1" step="0.05" value="${escapeHtml(profile.top_p)}" ${readonly}></div>
+      <div class="field">${labelWithHelp("profile-output-tokens", "Maximum output tokens", "Maximum tokens allowed for the model's metadata JSON response.")}<input id="profile-output-tokens" type="number" min="128" max="32768" value="${escapeHtml(profile.max_output_tokens)}" ${readonly}></div>
+      <div class="field">${labelWithHelp("profile-input-chars", "Document input characters", "Maximum extracted characters sent to the model and transferred by a full-content note.")}<input id="profile-input-chars" type="number" min="1000" max="2000000" step="1000" value="${escapeHtml(profile.input_char_limit)}" ${readonly}></div>
+      <div class="field">${labelWithHelp("profile-candidates", "Vault note candidates", "Maximum existing notes supplied for related-note selection.")}<input id="profile-candidates" type="number" min="0" max="500" value="${escapeHtml(profile.candidate_limit)}" ${readonly}></div>
+      <div class="field">${labelWithHelp("profile-tag-limit", "Tag limit", "Maximum validated AI tags stored on the note.")}<input id="profile-tag-limit" type="number" min="0" max="30" value="${escapeHtml(profile.tag_limit)}" ${readonly}></div>
+      <div class="field">${labelWithHelp("profile-related-limit", "Related-note limit", "Maximum validated existing-note wikilinks.")}<input id="profile-related-limit" type="number" min="0" max="30" value="${escapeHtml(profile.related_notes_limit)}" ${readonly}></div>
+    </div>
+    <h4>Obsidian behaviors</h4>
+    <p>Choose how this profile uses Obsidian's native Markdown, YAML, tags, folders, and wikilinks. Internal Obsync identity properties remain protected so updates stay safe.</p>
+    <div class="behavior-grid">
+      <label class="check-row"><input id="profile-vault-context" type="checkbox" ${checked(profile.use_vault_context)} ${disabled}> Read titles, paths, and tags from the selected vault for connection context</label>
+      <label class="check-row"><input id="profile-wikilinks" type="checkbox" ${checked(profile.use_wikilinks)} ${disabled}> Add validated <code>[[wikilinks]]</code> to clearly related existing notes</label>
+      <label class="check-row"><input id="profile-tags" type="checkbox" ${checked(profile.use_tags)} ${disabled}> Generate searchable Obsidian tags</label>
+      <label class="check-row"><input id="profile-properties" type="checkbox" ${checked(profile.use_properties)} ${disabled}> Generate type and category YAML properties</label>
+      <label class="check-row"><input id="profile-folders" type="checkbox" ${checked(profile.organize_folders)} ${disabled}> Organize new notes into AI-selected category folders</label>
+      <label class="check-row"><input id="profile-source-details" type="checkbox" ${checked(profile.include_source_details)} ${disabled}> Include source file details and integrity hash</label>
+    </div>
+    <div class="info-box"><strong>How Obsync connects to Obsidian</strong><p>${escapeHtml(profileData.implementation)}</p></div>
+    ${locked ? "" : '<div class="settings-actions"><button class="primary" type="submit">Save custom profile</button></div>'}
+  </form>`;
+}
+
+function profilePayload() {
+  return {
+    name: $("#profile-name").value.trim(),
+    description: $("#profile-description").value.trim(),
+    note_content_mode: $("#profile-content-mode").value,
+    role_prompt: $("#profile-role-prompt").value.trim(),
+    user_prompt_template: $("#profile-user-template").value,
+    temperature: $("#profile-temperature").value,
+    top_p: $("#profile-top-p").value,
+    max_output_tokens: $("#profile-output-tokens").value,
+    input_char_limit: $("#profile-input-chars").value,
+    candidate_limit: $("#profile-candidates").value,
+    tag_limit: $("#profile-tag-limit").value,
+    related_notes_limit: $("#profile-related-limit").value,
+    use_vault_context: $("#profile-vault-context").checked,
+    use_wikilinks: $("#profile-wikilinks").checked,
+    use_tags: $("#profile-tags").checked,
+    use_properties: $("#profile-properties").checked,
+    organize_folders: $("#profile-folders").checked,
+    include_source_details: $("#profile-source-details").checked,
+  };
+}
+
 async function renderLocalAI() {
-  const [settings, activity] = await Promise.all([
-    api("/api/v1/admin/settings"), api("/api/v1/admin/ai/activity"),
+  const [settings, activity, profiles] = await Promise.all([
+    api("/api/v1/admin/settings"), api("/api/v1/admin/ai/activity"), api("/api/v1/admin/ai/profiles"),
   ]);
   const enabled = settings.llm_enabled === "true";
   state.aiActivity = activity;
+  state.aiProfiles = profiles;
+  if (!profiles.items.some((item) => item.id === state.aiSelectedProfileId)) state.aiSelectedProfileId = profiles.active_profile_id;
+  const selectedProfile = profiles.items.find((item) => item.id === state.aiSelectedProfileId) || profiles.items[0];
   state.aiStreamRevision = Math.max(state.aiStreamRevision, Number(activity.revision || 0));
   pruneAiPanelState(aiSessions(activity).map((session) => String(session.document_id)));
-  $("#content").innerHTML = `<div class="settings-layout"><div id="ai-live-host">${aiActivityMarkup(activity)}</div><form class="settings-layout" id="ai-settings-form">
+  const profileCards = profiles.items.map((profile) => aiProfileCard(profile, profiles.active_profile_id, selectedProfile.id)).join("");
+  $("#content").innerHTML = `<div class="settings-layout"><div id="ai-live-host">${aiActivityMarkup(activity)}</div>
+    <section class="settings-card"><div class="section-head compact"><div><h3>${headingWithHelp("AI profiles", "The active profile controls the role, prompt template, note content, inference parameters, and Obsidian behaviors.")}</h3><p>Choose a protected default or copy one into a fully editable custom profile.</p></div><button class="primary" type="button" id="new-ai-profile">+ New custom from active</button></div><div class="ai-profile-grid">${profileCards}</div></section>
+    ${profileEditorMarkup(selectedProfile, profiles)}
+    <form class="settings-layout" id="ai-settings-form">
     <section class="settings-card"><h3>${headingWithHelp("Local AI connection", "Optional local classification through Ollama, LM Studio, or another OpenAI-compatible server.")}</h3>
       <div class="field-grid">
         <label class="check-row full-width"><input id="llm-enabled" type="checkbox" ${enabled ? "checked" : ""}> Enable Local AI organization</label>
@@ -1378,20 +1470,42 @@ async function renderLocalAI() {
       <div class="settings-actions"><button class="secondary" type="button" id="test-llm">Check connection</button></div>
       <p class="inline-status" id="llm-test-status" hidden></p>
     </section>
-    <section class="settings-card"><h3>AI organization instructions</h3><p>Obsync always uses a protected system prompt that requires safe JSON and treats document content as untrusted. Add your own organization preferences below.</p>
-      <div class="field">${labelWithHelp("llm-instructions", "Custom system instructions", "Controls titles, summaries, categories, and tags without replacing Obsync safety rules.")}<textarea id="llm-instructions" rows="8" maxlength="8000" placeholder="Example: Use plumbing permit categories and concise business titles.">${escapeHtml(settings.llm_instructions || "")}</textarea><small>Optional. Obsync's protected safety prompt is always applied first.</small></div>
-    </section>
     <section class="settings-card"><h3>Vault matching and duplicate protection</h3>
       <div class="field">${labelWithHelp("duplicate-policy", "Possible duplicate handling", "A conservative title and Obsync-metadata scan runs before automatic writing.")}<select id="duplicate-policy"><option value="review">Hold possible duplicates for review (recommended)</option><option value="allow">Allow separate notes automatically</option></select></div>
-      <label class="check-row"><input id="llm-vault-context" type="checkbox" ${settings.llm_vault_context !== "false" ? "checked" : ""}> Let Local AI use candidate note titles from Obsync's vault index for related-note links</label>
-      <div class="info-box"><strong>What the AI can access</strong><p>The Local AI does not connect to the Obsidian API. Obsync scans the selected vault through the server mount or Desktop app. The AI receives extracted source text and, when enabled above, candidate note titles—not control of Obsidian.</p></div>
       <div class="settings-actions"><button class="primary" type="submit">Save Local AI settings</button></div>
     </section>
   </form></div>`;
   wireAiActivityControls();
   initializeAiActivityPanels();
+  $("#profile-content-mode").value = selectedProfile.note_content_mode;
   $("#llm-provider").value = settings.llm_provider || "ollama";
   $("#duplicate-policy").value = settings.duplicate_policy || "review";
+  $$('[data-profile-select]').forEach((button) => button.addEventListener("click", async () => {
+    state.aiSelectedProfileId = button.dataset.profileSelect;
+    await renderLocalAI();
+  }));
+  $$(".activate-profile").forEach((button) => button.addEventListener("click", async () => {
+    try { await api(`/api/v1/admin/ai/profiles/${encodeURIComponent(button.dataset.profileId)}/activate`, { method: "POST" }); toast("AI profile activated. New inference will use it."); await renderLocalAI(); }
+    catch (error) { toast(error.message, true); }
+  }));
+  $$(".copy-profile").forEach((button) => button.addEventListener("click", async () => {
+    try { const created = await api("/api/v1/admin/ai/profiles", { method: "POST", body: { source_profile_id: button.dataset.profileId } }); state.aiSelectedProfileId = created.id; toast("Editable custom profile created."); await renderLocalAI(); }
+    catch (error) { toast(error.message, true); }
+  }));
+  $$(".delete-profile").forEach((button) => button.addEventListener("click", async () => {
+    if (!confirm("Delete this custom AI profile? Built-in profiles and documents are unaffected.")) return;
+    try { await api(`/api/v1/admin/ai/profiles/${encodeURIComponent(button.dataset.profileId)}`, { method: "DELETE" }); state.aiSelectedProfileId = ""; toast("Custom profile deleted."); await renderLocalAI(); }
+    catch (error) { toast(error.message, true); }
+  }));
+  $("#new-ai-profile").addEventListener("click", async () => {
+    try { const created = await api("/api/v1/admin/ai/profiles", { method: "POST", body: { source_profile_id: profiles.active_profile_id, name: "Custom AI profile" } }); state.aiSelectedProfileId = created.id; toast("Editable custom profile created."); await renderLocalAI(); }
+    catch (error) { toast(error.message, true); }
+  });
+  if (!selectedProfile.builtin) $("#profile-editor-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try { await api(`/api/v1/admin/ai/profiles/${encodeURIComponent(selectedProfile.id)}`, { method: "PUT", body: profilePayload() }); toast("Custom AI profile saved."); await renderLocalAI(); }
+    catch (error) { toast(error.message, true); }
+  });
   $("#ai-settings-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     try { await api("/api/v1/admin/settings", { method: "PUT", body: aiSettingsPayload() }); toast("Local AI settings saved."); }
@@ -1509,8 +1623,6 @@ function aiSettingsPayload() {
     llm_api_key: $("#llm-key").value,
     review_threshold: $("#review-threshold").value,
     llm_timeout_seconds: $("#llm-timeout").value,
-    llm_instructions: $("#llm-instructions")?.value.trim() || "",
-    llm_vault_context: $("#llm-vault-context")?.checked ?? true,
     duplicate_policy: $("#duplicate-policy")?.value || "review",
   };
 }

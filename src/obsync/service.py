@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import socket
 import tempfile
 import uuid
@@ -23,10 +24,20 @@ from .markdown import (
     likely_same_note_title,
     managed_note_metadata,
     merge_preserving_manual,
+    note_tags,
     note_title,
     note_title_from_path,
     render_markdown,
     set_source_status,
+)
+from .profiles import (
+    BUILTIN_PROFILE_MAP,
+    BUILTIN_PROFILES,
+    FULL_TRANSFER_PROFILE,
+    PROMPT_PLACEHOLDERS,
+    PROTECTED_SYSTEM_PROMPT,
+    AIProfile,
+    validate_profile,
 )
 from .security import (
     hash_password,
@@ -55,6 +66,7 @@ DEFAULT_SETTINGS: dict[str, tuple[str, bool]] = {
     "llm_timeout_seconds": ("120", False),
     "llm_instructions": ("", False),
     "llm_vault_context": ("true", False),
+    "ai_active_profile_id": ("", False),
     "duplicate_policy": ("review", False),
     "review_threshold": ("0.65", False),
 }
@@ -90,6 +102,7 @@ class ObsyncService:
         self.db = db or Database(settings.database_path)
         self.db.initialize()
         self._ensure_defaults()
+        self._ensure_ai_profiles()
         self._inventory_vault_indexes: dict[
             str,
             tuple[
@@ -115,6 +128,176 @@ class ObsyncService:
             missing["sync_enabled"] = ("false", False)
         if missing:
             self.db.set_settings(missing)
+
+    def _ensure_ai_profiles(self) -> None:
+        active_id = self.db.get_setting("ai_active_profile_id", "")
+        if active_id and self._profile_by_id(active_id):
+            return
+        legacy_instructions = self.db.get_setting("llm_instructions", "").strip()
+        legacy_vault_context = self.db.get_setting("llm_vault_context", "true") == "true"
+        if legacy_instructions or not legacy_vault_context:
+            profile = FULL_TRANSFER_PROFILE.custom_copy(
+                profile_id=str(uuid.uuid4()), name="Imported AI settings"
+            )
+            if legacy_instructions:
+                profile.role_prompt = (
+                    f"{profile.role_prompt}\n\nImported organization preferences:\n"
+                    f"{legacy_instructions[:8000]}"
+                )
+            profile.use_vault_context = legacy_vault_context
+            profile.use_wikilinks = legacy_vault_context
+            self._insert_custom_profile(profile)
+        # Upgrades preserve legacy preferences as a custom profile, but the
+        # complete-transfer behavior becomes active so existing installations
+        # do not keep producing the brief notes this release is correcting.
+        active_id = FULL_TRANSFER_PROFILE.id
+        self.db.set_settings({"ai_active_profile_id": (active_id, False)})
+
+    def _insert_custom_profile(self, profile: AIProfile) -> None:
+        now = utc_now()
+        stored = profile.as_dict()
+        stored.update({"builtin": False, "created_at": now, "updated_at": now})
+        self.db.execute(
+            """
+            INSERT INTO ai_profiles(id, name, description, config_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                profile.id,
+                profile.name,
+                profile.description,
+                json.dumps(stored, ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+
+    @staticmethod
+    def _profile_from_row(row: dict[str, Any]) -> AIProfile:
+        try:
+            payload = json.loads(row.get("config_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        payload.update({"name": row["name"], "description": row["description"]})
+        return validate_profile(
+            payload,
+            profile_id=str(row["id"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def _profile_by_id(self, profile_id: str) -> AIProfile | None:
+        builtin = BUILTIN_PROFILE_MAP.get(profile_id)
+        if builtin:
+            return builtin
+        row = self.db.query_one("SELECT * FROM ai_profiles WHERE id = ?", (profile_id,))
+        return self._profile_from_row(row) if row else None
+
+    def active_ai_profile(self) -> AIProfile:
+        profile_id = self.db.get_setting("ai_active_profile_id", FULL_TRANSFER_PROFILE.id)
+        return self._profile_by_id(profile_id) or FULL_TRANSFER_PROFILE
+
+    def ai_profiles_for_ui(self) -> dict[str, Any]:
+        custom = [
+            self._profile_from_row(row)
+            for row in self.db.query_all("SELECT * FROM ai_profiles ORDER BY name COLLATE NOCASE")
+        ]
+        active = self.active_ai_profile()
+        return {
+            "active_profile_id": active.id,
+            "items": [profile.as_dict() for profile in (*BUILTIN_PROFILES, *custom)],
+            "protected_system_prompt": PROTECTED_SYSTEM_PROMPT,
+            "prompt_placeholders": list(PROMPT_PLACEHOLDERS),
+            "implementation": (
+                "Obsync uses the vault's Markdown, YAML properties, tags, folders, and "
+                "[[wikilinks]] through the server mount or Obsync Desktop. Obsidian does not "
+                "provide a remote core API, so no plugin or cloud access is required."
+            ),
+        }
+
+    def _unique_profile_name(self, preferred: str, *, exclude_id: str = "") -> str:
+        base = preferred.strip()[:80] or "Custom AI profile"
+        names = {profile.name.casefold() for profile in BUILTIN_PROFILES}
+        names.update(
+            str(row["name"]).casefold()
+            for row in self.db.query_all(
+                "SELECT name FROM ai_profiles WHERE id != ?", (exclude_id,)
+            )
+        )
+        if base.casefold() not in names:
+            return base
+        suffix = 2
+        while True:
+            addition = f" {suffix}"
+            candidate = f"{base[: 80 - len(addition)]}{addition}"
+            if candidate.casefold() not in names:
+                return candidate
+            suffix += 1
+
+    def create_ai_profile(self, payload: dict[str, Any]) -> dict[str, Any]:
+        source_id = str(payload.get("source_profile_id", "")).strip()
+        source = self._profile_by_id(source_id) if source_id else self.active_ai_profile()
+        if not source:
+            raise ValueError("The source AI profile does not exist")
+        requested_name = str(payload.get("name", "")).strip() or f"{source.name} copy"
+        name = self._unique_profile_name(requested_name)
+        profile = source.custom_copy(profile_id=str(uuid.uuid4()), name=name)
+        self._insert_custom_profile(profile)
+        self.db.add_event("ai.profile_created", f"Created AI profile {name}")
+        return profile.as_dict()
+
+    def update_ai_profile(self, profile_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if profile_id in BUILTIN_PROFILE_MAP:
+            raise ValueError("Built-in AI profiles cannot be edited; copy it to a custom profile")
+        row = self.db.query_one("SELECT * FROM ai_profiles WHERE id = ?", (profile_id,))
+        if not row:
+            raise ValueError("AI profile not found")
+        existing = self._profile_from_row(row).as_dict()
+        existing.update(payload)
+        requested_name = str(existing.get("name", "")).strip()
+        existing["name"] = self._unique_profile_name(requested_name, exclude_id=profile_id)
+        now = utc_now()
+        profile = validate_profile(
+            existing,
+            profile_id=profile_id,
+            created_at=str(row["created_at"]),
+            updated_at=now,
+        )
+        self.db.execute(
+            """
+            UPDATE ai_profiles SET name = ?, description = ?, config_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                profile.name,
+                profile.description,
+                json.dumps(profile.as_dict(), ensure_ascii=False),
+                now,
+                profile_id,
+            ),
+        )
+        self.db.add_event("ai.profile_updated", f"Updated AI profile {profile.name}")
+        return profile.as_dict()
+
+    def activate_ai_profile(self, profile_id: str) -> dict[str, Any]:
+        profile = self._profile_by_id(profile_id)
+        if not profile:
+            raise ValueError("AI profile not found")
+        self.db.set_settings({"ai_active_profile_id": (profile.id, False)})
+        self.db.add_event("ai.profile_activated", f"Activated AI profile {profile.name}")
+        return self.ai_profiles_for_ui()
+
+    def delete_ai_profile(self, profile_id: str) -> dict[str, Any]:
+        if profile_id in BUILTIN_PROFILE_MAP:
+            raise ValueError("Built-in AI profiles cannot be deleted")
+        row = self.db.query_one("SELECT name FROM ai_profiles WHERE id = ?", (profile_id,))
+        if not row:
+            raise ValueError("AI profile not found")
+        self.db.execute("DELETE FROM ai_profiles WHERE id = ?", (profile_id,))
+        if self.db.get_setting("ai_active_profile_id", "") == profile_id:
+            self.db.set_settings({"ai_active_profile_id": (FULL_TRANSFER_PROFILE.id, False)})
+        self.db.add_event("ai.profile_deleted", f"Deleted AI profile {row['name']}")
+        return self.ai_profiles_for_ui()
 
     def _bootstrap_admin_from_env(self) -> None:
         if self.has_admin_account():
@@ -175,6 +358,7 @@ class ObsyncService:
         return sorted(rows, key=lambda item: str(item.get("started_at", "")))
 
     def ai_activity(self) -> dict[str, Any]:
+        profile = self.active_ai_profile()
         active = [
             self._public_activity(item)
             for item in self._processing_activity.values()
@@ -186,6 +370,8 @@ class ObsyncService:
             "last": dict(self._last_inference) if self._last_inference else None,
             "provider": self.db.get_setting("llm_provider", "ollama"),
             "model": self.db.get_setting("llm_model", ""),
+            "profile_id": profile.id,
+            "profile_name": profile.name,
             "enabled": self._llm_config().active,
             "revision": self._ai_activity_revision,
         }
@@ -774,6 +960,7 @@ class ObsyncService:
         with self.db.transaction() as connection:
             connection.execute("DELETE FROM enrollments WHERE agent_id = ?", (agent_id,))
             connection.execute("DELETE FROM events WHERE agent_id = ?", (agent_id,))
+            connection.execute("DELETE FROM vault_notes WHERE vault_key = ?", (agent_id,))
             connection.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
         self.db.add_event(
             "agent.disconnected",
@@ -1080,9 +1267,9 @@ class ObsyncService:
 
     def _local_vault_snapshot(
         self,
-    ) -> tuple[dict[tuple[str, str, str], dict[str, str]], list[dict[str, str]]]:
+    ) -> tuple[dict[tuple[str, str, str], dict[str, str]], list[dict[str, Any]]]:
         index: dict[tuple[str, str, str], dict[str, str]] = {}
-        catalog: list[dict[str, str]] = []
+        catalog: list[dict[str, Any]] = []
         if not self.settings.vault_path.is_dir():
             return index, catalog
         for path in self.settings.vault_path.rglob("*.md"):
@@ -1094,7 +1281,13 @@ class ObsyncService:
             except (OSError, UnicodeError):
                 continue
             relative = path.relative_to(self.settings.vault_path).as_posix()
-            catalog.append({"path": relative, "title": note_title(content, path)})
+            catalog.append(
+                {
+                    "path": relative,
+                    "title": note_title(content, path),
+                    "tags": note_tags(content),
+                }
+            )
             if not metadata:
                 continue
             key = (
@@ -1109,7 +1302,7 @@ class ObsyncService:
     @staticmethod
     def _possible_duplicate(
         source_title: str,
-        catalog: list[dict[str, str]],
+        catalog: list[dict[str, Any]],
         *,
         current_destination: str = "",
     ) -> dict[str, str] | None:
@@ -1131,7 +1324,7 @@ class ObsyncService:
         agent_name: str,
         root_name: str,
         vault_index: dict[tuple[str, str, str], dict[str, str]],
-        vault_catalog: list[dict[str, str]],
+        vault_catalog: list[dict[str, Any]],
     ) -> tuple[str, str, str, str, str]:
         destination = str(document.get("destination_path") or "")
         if document.get("status") == "ignored":
@@ -1479,29 +1672,81 @@ class ObsyncService:
             model=self.db.get_setting("llm_model", ""),
             api_key=self.db.get_setting("llm_api_key", ""),
             timeout_seconds=max(5, min(timeout, 600)),
-            custom_instructions=self.db.get_setting("llm_instructions", ""),
+            profile=self.active_ai_profile(),
         )
 
-    def _candidate_titles(self, source_path: str, limit: int = 100) -> list[str]:
-        if self.db.get_setting("llm_vault_context", "true").lower() != "true":
-            return []
-        words = {
-            word.lower()
-            for word in Path(source_path).stem.replace("_", " ").replace("-", " ").split()
-            if len(word) >= 4
+    @staticmethod
+    def _candidate_terms(source_path: str, text: str) -> set[str]:
+        stop = {
+            "about",
+            "after",
+            "before",
+            "could",
+            "document",
+            "from",
+            "have",
+            "into",
+            "other",
+            "should",
+            "that",
+            "their",
+            "there",
+            "these",
+            "this",
+            "with",
         }
-        rows = self.db.query_all(
-            "SELECT DISTINCT title FROM documents WHERE status = 'synced' AND title != '' "
-            "ORDER BY updated_at DESC LIMIT 500"
-        )
-        scored = []
-        for row in rows:
-            title = row["title"]
-            title_words = set(title.lower().split())
-            score = len(words & title_words)
-            scored.append((score, title))
-        scored.sort(key=lambda item: (-item[0], item[1].casefold()))
-        return [title for _, title in scored[:limit]]
+        return {
+            word
+            for word in re.findall(r"[a-z0-9][a-z0-9-]{3,}", f"{source_path} {text[:8000]}".lower())
+            if word not in stop
+        }
+
+    def _candidate_notes(
+        self,
+        source_path: str,
+        text: str,
+        profile: AIProfile,
+    ) -> list[dict[str, Any]]:
+        if not profile.use_vault_context or not profile.candidate_limit:
+            return []
+        catalog: list[dict[str, Any]] = []
+        if self.db.get_setting("vault_mode", "local") == "local":
+            _index, catalog = self._local_vault_snapshot()
+        else:
+            vault_key = self.db.get_setting("vault_agent_id", "")
+            for row in self.db.query_all(
+                "SELECT path, title, tags_json FROM vault_notes WHERE vault_key = ? "
+                "ORDER BY title COLLATE NOCASE LIMIT 5000",
+                (vault_key,),
+            ):
+                with suppress(TypeError, json.JSONDecodeError):
+                    row["tags"] = json.loads(row.pop("tags_json") or "[]")
+                catalog.append(row)
+        if not catalog:
+            catalog = [
+                {"path": row["destination_path"], "title": row["title"], "tags": []}
+                for row in self.db.query_all(
+                    "SELECT DISTINCT destination_path, title FROM documents "
+                    "WHERE status = 'synced' AND title != '' ORDER BY updated_at DESC LIMIT 1000"
+                )
+            ]
+        terms = self._candidate_terms(source_path, text)
+        scored: list[tuple[int, str, dict[str, Any]]] = []
+        seen: set[str] = set()
+        for note in catalog:
+            title = str(note.get("title", "")).strip()
+            if not title or title.casefold() in seen:
+                continue
+            seen.add(title.casefold())
+            tags = note.get("tags", [])
+            haystack = " ".join(
+                [title, str(note.get("path", "")), *(str(tag) for tag in tags)]
+            ).lower()
+            note_terms = set(re.findall(r"[a-z0-9][a-z0-9-]{3,}", haystack))
+            score = len(terms & note_terms)
+            scored.append((score, title.casefold(), note))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [note for _score, _title, note in scored[: profile.candidate_limit]]
 
     def _new_destination(
         self,
@@ -1510,13 +1755,15 @@ class ObsyncService:
         agent_name: str,
         root: dict[str, Any],
         analysis: Analysis,
+        profile: AIProfile,
     ) -> str:
         segments = [
             str(root["destination"]),
             slugify(agent_name, "device"),
             slugify(str(root["name"]), "folder"),
-            slugify(analysis.category, "documents"),
         ]
+        if profile.organize_folders:
+            segments.append(slugify(analysis.category, "documents"))
         filename = f"{slugify(analysis.title, 'document')}-{document_id[:8]}.md"
         relative = Path(*segments) / filename
         safe_relative_path(str(relative))
@@ -1744,8 +1991,10 @@ class ObsyncService:
                 task=task,
             )
         try:
+            llm_config = self._llm_config()
+            active_profile = llm_config.active_profile
             extracted = await asyncio.to_thread(
-                extract_document, staged_file, self.settings.max_extract_chars
+                extract_document, staged_file, active_profile.input_char_limit
             )
             self._update_activity(
                 document_id,
@@ -1754,13 +2003,14 @@ class ObsyncService:
                 phase="preparing-ai",
                 phase_label="Preparing Local AI request",
             )
-            llm_config = self._llm_config()
             activity = self._processing_activity.get(document_id)
             if activity:
                 activity["used_ai"] = llm_config.active
                 activity["ai_active"] = llm_config.active
                 activity["provider"] = llm_config.provider if llm_config.active else "rules"
                 activity["model"] = llm_config.model if llm_config.active else ""
+                activity["profile_id"] = active_profile.id
+                activity["profile_name"] = active_profile.name
                 if llm_config.active:
                     activity["phase"] = "inference"
                     activity["phase_label"] = "Local AI is analyzing the file"
@@ -1791,7 +2041,7 @@ class ObsyncService:
                 source_path=source_rel,
                 text=extracted.text,
                 mime_type=extracted.mime_type,
-                candidates=self._candidate_titles(source_rel),
+                candidates=self._candidate_notes(source_rel, extracted.text, active_profile),
                 review_feedback=review_feedback,
             )
             if activity:
@@ -1869,6 +2119,7 @@ class ObsyncService:
                     agent_name=agent["name"],
                     root=root,
                     analysis=analysis,
+                    profile=active_profile,
                 )
             )
             generated = render_markdown(
@@ -1886,6 +2137,7 @@ class ObsyncService:
                 extraction_warning=extracted.warning,
                 truncated=extracted.truncated,
                 analysis=analysis,
+                profile=active_profile,
             )
             remote_vault = self._remote_vault_agent()
             self._update_activity(
@@ -2352,9 +2604,15 @@ class ObsyncService:
             )
         elif command["command"] == "audit_vault" and ok:
             try:
-                audit_rows = json.loads(result)
+                audit_payload = json.loads(result)
             except (TypeError, json.JSONDecodeError) as exc:
                 raise ValueError("Vault audit returned invalid data") from exc
+            vault_notes: list[Any] = []
+            if isinstance(audit_payload, dict):
+                audit_rows = audit_payload.get("documents", [])
+                vault_notes = audit_payload.get("notes", [])
+            else:
+                audit_rows = audit_payload
             if not isinstance(audit_rows, list):
                 raise ValueError("Vault audit returned invalid data")
             now = utc_now()
@@ -2413,6 +2671,32 @@ class ObsyncService:
                         "UPDATE documents SET status = 'duplicate-review', needs_review = 1 "
                         "WHERE id = ?",
                         (audit_document_id,),
+                    )
+            if isinstance(vault_notes, list):
+                sanitized_notes: list[tuple[str, str, str, str, str]] = []
+                for note in vault_notes[:5000]:
+                    if not isinstance(note, dict):
+                        continue
+                    path = str(note.get("path", "")).strip()[:2000]
+                    title = str(note.get("title", "")).strip()[:200]
+                    raw_tags = note.get("tags", [])
+                    tags = (
+                        [str(tag).strip()[:80] for tag in raw_tags[:30] if str(tag).strip()]
+                        if isinstance(raw_tags, list)
+                        else []
+                    )
+                    if path and title:
+                        sanitized_notes.append(
+                            (agent_id, path, title, json.dumps(tags, ensure_ascii=False), now)
+                        )
+                with self.db.transaction() as connection:
+                    connection.execute("DELETE FROM vault_notes WHERE vault_key = ?", (agent_id,))
+                    connection.executemany(
+                        """
+                        INSERT INTO vault_notes(vault_key, path, title, tags_json, updated_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        sanitized_notes,
                     )
             self.db.add_event(
                 "vault.audited",

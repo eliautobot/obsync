@@ -8,6 +8,7 @@ import pytest
 
 from obsync.config import Settings
 from obsync.db import Database
+from obsync.profiles import FULL_TRANSFER_PROFILE
 from obsync.security import hash_token
 from obsync.service import ObsyncService, PipelinePausedError
 
@@ -338,6 +339,32 @@ def test_upgrade_stops_existing_pipeline_until_vault_is_reconfirmed(tmp_path) ->
     service = ObsyncService(settings, db=database)
     assert service.pipeline_status()["enabled"] is False
     assert service.settings_for_ui()["vault_confirmed"] == "false"
+
+
+def test_upgrade_preserves_legacy_ai_preferences_but_activates_full_transfer(tmp_path) -> None:
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        vault_path=tmp_path / "vault",
+        admin_token="",
+    )
+    settings.prepare()
+    database = Database(settings.database_path)
+    database.initialize()
+    database.set_settings(
+        {
+            "llm_instructions": ("Keep legal citations exact.", False),
+            "llm_vault_context": ("false", False),
+        }
+    )
+
+    service = ObsyncService(settings, db=database)
+    profiles = service.ai_profiles_for_ui()
+
+    assert profiles["active_profile_id"] == FULL_TRANSFER_PROFILE.id
+    imported = next(item for item in profiles["items"] if item["name"] == "Imported AI settings")
+    assert imported["builtin"] is False
+    assert "Keep legal citations exact." in imported["role_prompt"]
+    assert imported["use_vault_context"] is False
 
 
 def test_vault_and_ai_settings_validate_unsafe_or_invalid_choices(app) -> None:

@@ -96,6 +96,12 @@ def test_ui_includes_guided_help_and_obsync_desktop(client: TestClient) -> None:
     assert "Stop Global Sync" in index
     assert 'data-view="vault"' in index
     assert 'data-view="local-ai"' in index
+    assert '<span id="version-label">v…</span>' in index
+    assert '$("#version-label").textContent = `v${meta.version}`' in app_js
+    assert "AI profiles" in app_js
+    assert "Protected inference prompt" in app_js
+    assert "Full document transfer" in app_js
+    assert "Obsidian behaviors" in app_js
     assert "Please choose which Obsidian Vault your files will be synced to" in app_js
     assert "Run as administrator" in app_js
     assert "setInterval(liveRefresh, 3000)" in app_js
@@ -119,6 +125,92 @@ def test_ui_includes_guided_help_and_obsync_desktop(client: TestClient) -> None:
     assert ".ai-jump-latest" in styles
     assert "overflow-anchor: none" in styles
     assert "backdrop-filter: blur(3px)" not in styles
+
+
+def test_ai_profiles_are_copyable_editable_activatable_and_protected(
+    client: TestClient, admin_headers: dict[str, str]
+) -> None:
+    profiles = client.get("/api/v1/admin/ai/profiles", headers=admin_headers).json()
+    assert profiles["active_profile_id"] == "builtin-full-transfer"
+    assert [item["id"] for item in profiles["items"][:2]] == [
+        "builtin-full-transfer",
+        "builtin-brief-summary",
+    ]
+    assert all(item["builtin"] for item in profiles["items"][:2])
+    assert "Return exactly one JSON object" in profiles["protected_system_prompt"]
+    assert "{{document_content}}" in profiles["prompt_placeholders"]
+
+    copied = client.post(
+        "/api/v1/admin/ai/profiles",
+        headers=admin_headers,
+        json={"source_profile_id": "builtin-full-transfer", "name": "Detailed legal files"},
+    )
+    assert copied.status_code == 200, copied.text
+    custom = copied.json()
+    assert custom["builtin"] is False
+    assert custom["note_content_mode"] == "full"
+
+    custom.update(
+        {
+            "description": "Keep complete legal records with custom connections.",
+            "role_prompt": "Preserve every legal clause and connect matching clients.",
+            "user_prompt_template": (
+                "File {{source_path}} ({{mime_type}})\n{{candidate_notes}}\n"
+                "{{document_content}}\nReviewer: {{review_feedback}}"
+            ),
+            "note_content_mode": "full-and-summary",
+            "temperature": 0.25,
+            "top_p": 0.8,
+            "max_output_tokens": 6000,
+            "input_char_limit": 750000,
+            "candidate_limit": 150,
+            "tag_limit": 14,
+            "related_notes_limit": 12,
+            "use_vault_context": True,
+            "use_wikilinks": True,
+            "use_tags": True,
+            "use_properties": True,
+            "organize_folders": False,
+            "include_source_details": True,
+        }
+    )
+    updated = client.put(
+        f"/api/v1/admin/ai/profiles/{custom['id']}",
+        headers=admin_headers,
+        json=custom,
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["max_output_tokens"] == 6000
+    assert updated.json()["organize_folders"] is False
+
+    activated = client.post(
+        f"/api/v1/admin/ai/profiles/{custom['id']}/activate", headers=admin_headers
+    )
+    assert activated.status_code == 200
+    assert activated.json()["active_profile_id"] == custom["id"]
+
+    protected = client.put(
+        "/api/v1/admin/ai/profiles/builtin-full-transfer",
+        headers=admin_headers,
+        json=custom,
+    )
+    assert protected.status_code == 400
+    assert "cannot be edited" in protected.json()["detail"]
+    missing_content = client.put(
+        f"/api/v1/admin/ai/profiles/{custom['id']}",
+        headers=admin_headers,
+        json={**custom, "user_prompt_template": "No document placeholder"},
+    )
+    assert missing_content.status_code == 400
+    assert "{{document_content}}" in missing_content.json()["detail"]
+
+    deleted = client.delete(f"/api/v1/admin/ai/profiles/{custom['id']}", headers=admin_headers)
+    assert deleted.status_code == 200
+    assert deleted.json()["active_profile_id"] == "builtin-full-transfer"
+    builtin_delete = client.delete(
+        "/api/v1/admin/ai/profiles/builtin-brief-summary", headers=admin_headers
+    )
+    assert builtin_delete.status_code == 400
 
 
 def test_ai_activity_event_stream_formats_events_and_closes_gateway_subscription(
