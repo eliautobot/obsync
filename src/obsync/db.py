@@ -58,6 +58,19 @@ CREATE TABLE IF NOT EXISTS vault_notes (
 CREATE INDEX IF NOT EXISTS idx_vault_notes_title
 ON vault_notes(vault_key, title COLLATE NOCASE);
 
+CREATE TABLE IF NOT EXISTS vault_models (
+    vault_key TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'not-learned',
+    model_json TEXT NOT NULL DEFAULT '{}',
+    fingerprint TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    model_name TEXT NOT NULL DEFAULT '',
+    note_count INTEGER NOT NULL DEFAULT 0,
+    learned_at TEXT,
+    error TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS vault_sweeps (
     id TEXT PRIMARY KEY,
     sweep_type TEXT NOT NULL,
@@ -102,6 +115,7 @@ CREATE TABLE IF NOT EXISTS vault_changes (
     after_content TEXT NOT NULL,
     reason TEXT NOT NULL DEFAULT '',
     evidence_json TEXT NOT NULL DEFAULT '[]',
+    decision_json TEXT NOT NULL DEFAULT '{}',
     confidence REAL NOT NULL DEFAULT 0,
     error TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
@@ -352,6 +366,14 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_vault_notes_hash "
                 "ON vault_notes(vault_key, content_hash)"
             )
+            vault_change_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(vault_changes)").fetchall()
+            }
+            if "decision_json" not in vault_change_columns:
+                connection.execute(
+                    "ALTER TABLE vault_changes ADD COLUMN decision_json TEXT NOT NULL DEFAULT '{}'"
+                )
             connection.execute(
                 """
                 UPDATE documents
@@ -372,9 +394,20 @@ class Database:
                 connection.execute("ALTER TABLE enrollments ADD COLUMN agent_id TEXT")
             row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
-                connection.execute("INSERT INTO schema_meta(version) VALUES (8)")
-            elif int(row["version"]) < 8:
-                connection.execute("UPDATE schema_meta SET version = 8")
+                connection.execute("INSERT INTO schema_meta(version) VALUES (9)")
+            elif int(row["version"]) < 9:
+                connection.execute(
+                    "UPDATE vault_changes SET status = 'superseded', reviewed_at = ?, "
+                    "error = 'Superseded by the adaptive relationship engine; run a new "
+                    "Maintenance Sweep.' WHERE status = 'pending'",
+                    (utc_now(),),
+                )
+                connection.execute(
+                    "UPDATE settings SET value = '20', updated_at = ? "
+                    "WHERE key = 'vault_link_limit' AND CAST(value AS INTEGER) > 50",
+                    (utc_now(),),
+                )
+                connection.execute("UPDATE schema_meta SET version = 9")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

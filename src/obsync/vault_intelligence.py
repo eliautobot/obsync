@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import re
+from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from difflib import SequenceMatcher
@@ -23,19 +24,12 @@ _WORD_RE = re.compile(r"[a-z0-9][a-z0-9_-]{2,}")
 _HEADING_RE = re.compile(r"(?m)^#{1,6}\s+(.+?)\s*$")
 _WIKILINK_RE = re.compile(r"!?(?:\[\[)([^\]\n]+?)(?:\]\])")
 _INLINE_TAG_RE = re.compile(r"(?<![\w/])#([A-Za-z][\w/-]{1,79})")
-_IDENTIFIER_RE = re.compile(
-    r"(?i)\b(account|application|claim|client|contract|customer|invoice|job|order|permit|"
-    r"policy|project|property|reference|vendor)[ \t]*(?:number|no\.?|#|id)?[ \t]*"
-    r"[:#-]?[ \t]*"
+_LABELED_IDENTIFIER_RE = re.compile(
+    r"(?i)\b([A-Z][A-Z0-9_-]{1,39})"
+    r"(?:[ \t]+(?:number|no\.?|id)|[ \t]*[:#-])[ \t:#-]*"
     r"([A-Z0-9][A-Z0-9./_-]{2,})\b"
 )
 _EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
-_ORG_RE = re.compile(
-    r"\b([A-Z][A-Za-z0-9&.'-]*(?:\s+[A-Z][A-Za-z0-9&.'-]*){0,6}\s+"
-    r"(?:Inc\.?|LLC|Ltd\.?|Corp\.?|Corporation|Company|Co\.?|Group|Association|Agency|"
-    r"Department|University|Bank|Insurance|Plumbing|Engineering))\b"
-)
-
 STOP_WORDS = frozenset(
     {
         "about",
@@ -76,6 +70,14 @@ STOP_WORDS = frozenset(
 
 def content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def strip_maintenance_block(content: str) -> str:
+    """Remove model-generated relationship data before indexing or inference."""
+    if MAINTENANCE_START not in content:
+        return content
+    pattern = re.escape(MAINTENANCE_START) + r".*?" + re.escape(MAINTENANCE_END)
+    return re.sub(pattern, "", content, count=1, flags=re.DOTALL).rstrip() + "\n"
 
 
 def normalized_text(value: str) -> str:
@@ -168,24 +170,12 @@ def extract_entities(
         add(title)
     for alias in aliases or []:
         add(alias)
-    for kind, identifier in _IDENTIFIER_RE.findall(content[:MAX_INDEXED_NOTE_CHARS]):
-        if identifier.casefold() in {
-            "active",
-            "application",
-            "details",
-            "information",
-            "name",
-            "number",
-            "record",
-            "status",
-            "update",
-        }:
+    for label, identifier in _LABELED_IDENTIFIER_RE.findall(content[:MAX_INDEXED_NOTE_CHARS]):
+        if not any(character.isdigit() for character in identifier):
             continue
-        add(f"{kind.casefold()}:{identifier.casefold()}")
+        add(f"{label.casefold()}:{identifier.casefold()}")
     for email in _EMAIL_RE.findall(content[:MAX_INDEXED_NOTE_CHARS]):
         add(f"email:{email.casefold()}")
-    for organization in _ORG_RE.findall(content[:MAX_INDEXED_NOTE_CHARS]):
-        add(organization)
     return entities[:300]
 
 
@@ -219,17 +209,18 @@ def parse_note(
 ) -> IndexedNote:
     raw = path.read_text(encoding="utf-8") if content is None else content
     bounded = raw[:MAX_INDEXED_NOTE_CHARS]
+    knowledge = strip_maintenance_block(bounded)
     properties = _frontmatter(bounded)
     aliases = _string_list(properties.get("aliases", properties.get("alias", [])), maximum=100)
-    tags = note_tags(bounded)
-    for tag in _INLINE_TAG_RE.findall(bounded):
+    tags = note_tags(knowledge)
+    for tag in _INLINE_TAG_RE.findall(knowledge):
         if tag not in tags:
             tags.append(tag)
         if len(tags) >= 200:
             break
-    headings = [heading.strip()[:300] for heading in _HEADING_RE.findall(bounded)[:500]]
+    headings = [heading.strip()[:300] for heading in _HEADING_RE.findall(knowledge)[:500]]
     links: list[str] = []
-    for raw_link in _WIKILINK_RE.findall(bounded):
+    for raw_link in _WIKILINK_RE.findall(knowledge):
         target = raw_link.split("|", 1)[0].split("#", 1)[0].strip()
         if target and target not in links:
             links.append(target[:500])
@@ -247,7 +238,7 @@ def parse_note(
         links=links,
         backlinks=[],
         properties=properties,
-        entities=extract_entities(bounded, title=title, aliases=aliases),
+        entities=extract_entities(knowledge, title=title, aliases=aliases),
         content=bounded,
         content_hash=content_hash(raw),
         modified_ns=modified_ns
@@ -311,6 +302,7 @@ def rank_notes(
     limit: int = 100,
     exclude_path: str = "",
 ) -> list[dict[str, Any]]:
+    text = strip_maintenance_block(text)
     source_title = Path(source_path).stem.replace("_", " ").replace("-", " ").strip()
     source_terms = search_terms(f"{source_path} {text}")
     source_entities = extract_entities(text, title=source_title)
@@ -322,7 +314,7 @@ def rank_notes(
         if exclude_path and str(note.get("path", "")).casefold() == exclude_path.casefold():
             continue
         title = str(note.get("title", "")).strip()
-        content = str(note.get("content", ""))
+        content = strip_maintenance_block(str(note.get("content", "")))
         aliases = [str(value) for value in note.get("aliases", [])]
         tags = [str(value) for value in note.get("tags", [])]
         entities = [str(value) for value in note.get("entities", [])]
@@ -437,73 +429,118 @@ def existing_note_match(
     return best
 
 
-class VaultSearchIndex:
-    """Reusable inverted index for vault-wide maintenance without quadratic scans."""
+def _property_scalars(value: Any, *, prefix: str = "", depth: int = 0) -> set[str]:
+    if depth >= 5:
+        return set()
+    if isinstance(value, dict):
+        result: set[str] = set()
+        for key, item in list(value.items())[:100]:
+            clean_key = normalized_text(str(key))[:80]
+            result.update(
+                _property_scalars(
+                    item,
+                    prefix=f"{prefix}.{clean_key}" if prefix and clean_key else clean_key,
+                    depth=depth + 1,
+                )
+            )
+        return result
+    if isinstance(value, (list, tuple, set)):
+        result: set[str] = set()
+        for item in list(value)[:100]:
+            result.update(_property_scalars(item, prefix=prefix, depth=depth + 1))
+        return result
+    clean = normalized_text(str(value))[:200]
+    if not prefix or len(clean) < 3:
+        return set()
+    return {f"{prefix.casefold()}={clean}"}
+
+
+def _note_search_text(note: dict[str, Any]) -> str:
+    properties = note.get("properties", {})
+    property_text = " ".join(sorted(_property_scalars(properties)))
+    values = [
+        str(note.get("title", "")),
+        str(note.get("path", "")),
+        *(str(value) for value in note.get("aliases", [])),
+        *(str(value) for value in note.get("tags", [])),
+        *(str(value) for value in note.get("headings", [])),
+        *(str(value) for value in note.get("entities", [])),
+        property_text,
+        strip_maintenance_block(str(note.get("content", ""))),
+    ]
+    return " ".join(values)
+
+
+class AdaptiveVaultIndex:
+    """Corpus-adaptive retrieval; it proposes candidates but never decides relationships."""
 
     def __init__(self, notes: list[dict[str, Any]]):
         self.notes = notes
+        self.term_counts: list[Counter[str]] = []
         self.postings: dict[str, list[int]] = {}
+        document_frequency: Counter[str] = Counter()
         for index, note in enumerate(notes):
-            values = [
-                str(note.get("title", "")),
-                str(note.get("path", "")),
-                *(str(value) for value in note.get("aliases", [])),
-                *(str(value) for value in note.get("tags", [])),
-                *(str(value) for value in note.get("entities", [])),
-                str(note.get("content", "")),
-            ]
-            for term in search_terms(" ".join(values)):
+            terms = Counter(search_terms(_note_search_text(note)))
+            self.term_counts.append(terms)
+            for term in terms:
                 self.postings.setdefault(term, []).append(index)
+                document_frequency[term] += 1
+        total = max(1, len(notes))
+        self.idf = {
+            term: math.log((total + 1) / (frequency + 1)) + 1
+            for term, frequency in document_frequency.items()
+        }
 
     def candidates(
-        self, source_path: str, text: str, *, exclude_path: str = ""
+        self,
+        source_path: str,
+        text: str,
+        *,
+        exclude_path: str = "",
+        maximum: int = 20,
+        source_note: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        terms = search_terms(f"{source_path} {text}")
-        maximum_posting = max(50, min(1000, len(self.notes) // 5 or 50))
-        ranked_terms = sorted(
-            ((len(self.postings.get(term, [])), term) for term in terms if self.postings.get(term)),
-            key=lambda item: (item[0], item[1]),
-        )
+        source_text = _note_search_text(source_note) if source_note else f"{source_path} {text}"
+        query_terms = Counter(search_terms(source_text))
         indexes: set[int] = set()
-        for frequency, term in ranked_terms:
-            if frequency > maximum_posting:
-                continue
-            indexes.update(self.postings[term])
+        for term in sorted(query_terms, key=lambda value: (-self.idf.get(value, 0), value)):
+            indexes.update(self.postings.get(term, []))
             if len(indexes) >= 2000:
                 break
-        return [
-            self.notes[index]
-            for index in indexes
-            if not exclude_path
-            or str(self.notes[index].get("path", "")).casefold() != exclude_path.casefold()
-        ]
-
-
-def related_notes_for_maintenance(
-    note: dict[str, Any],
-    notes: list[dict[str, Any]],
-    *,
-    maximum: int = 100,
-    minimum_score: float = 24,
-    search_index: VaultSearchIndex | None = None,
-) -> list[dict[str, Any]]:
-    candidates = (
-        search_index.candidates(
-            str(note.get("path", "")),
-            str(note.get("content", "")),
-            exclude_path=str(note.get("path", "")),
-        )
-        if search_index
-        else notes
-    )
-    ranked = rank_notes(
-        str(note.get("path", "")),
-        str(note.get("content", "")),
-        candidates,
-        limit=maximum,
-        exclude_path=str(note.get("path", "")),
-    )
-    return [candidate for candidate in ranked if float(candidate.get("score", 0)) >= minimum_score]
+        source_properties = _property_scalars((source_note or {}).get("properties", {}))
+        query_weight = sum(self.idf.get(term, 1) ** 2 for term in query_terms) ** 0.5 or 1.0
+        scored: list[tuple[float, str, dict[str, Any]]] = []
+        for index in indexes:
+            note = self.notes[index]
+            path = str(note.get("path", ""))
+            if exclude_path and path.casefold() == exclude_path.casefold():
+                continue
+            counts = self.term_counts[index]
+            overlap = set(query_terms) & set(counts)
+            if not overlap:
+                continue
+            dot = sum(self.idf.get(term, 1) ** 2 for term in overlap)
+            note_weight = sum(self.idf.get(term, 1) ** 2 for term in counts) ** 0.5 or 1.0
+            similarity = dot / (query_weight * note_weight)
+            shared_properties = source_properties & _property_scalars(note.get("properties", {}))
+            score = similarity + min(len(shared_properties), 5) * 0.05
+            reasons = [f"corpus similarity {similarity:.3f}"]
+            if shared_properties:
+                reasons.append(f"{len(shared_properties)} exact shared property value(s)")
+            clean_content = strip_maintenance_block(str(note.get("content", "")))
+            enriched = dict(note)
+            enriched.update(
+                {
+                    "retrieval_score": round(score, 6),
+                    "score": round(score, 6),
+                    "reasons": reasons,
+                    "link_target": link_target(note),
+                    "content_excerpt": _excerpt(clean_content, set(query_terms), maximum=4000),
+                }
+            )
+            scored.append((score, str(note.get("title", "")).casefold(), enriched))
+        scored.sort(key=lambda item: (-item[0], item[1], str(item[2].get("path", ""))))
+        return [note for _score, _title, note in scored[: max(0, maximum)]]
 
 
 def maintenance_content(
@@ -511,21 +548,33 @@ def maintenance_content(
     related: list[dict[str, Any]],
     *,
     include_tags: bool = True,
+    suggested_tags: list[str] | None = None,
 ) -> str:
-    links = [link_target(note) for note in related]
+    links: list[tuple[str, str]] = []
+    for note in related:
+        target = str(note.get("target") or link_target(note)).strip()
+        relationship = str(note.get("relationship", "")).strip()[:160]
+        if target and target not in {item[0] for item in links}:
+            links.append((target, relationship))
     tags: list[str] = []
     if include_tags:
-        for note in related:
-            for value in note.get("tags", []):
-                tag = slugify(str(value), fallback="", max_length=40)
-                if tag and tag not in tags:
-                    tags.append(tag)
-                if len(tags) >= 20:
-                    break
+        tag_sources: list[Any] = list(suggested_tags or [])
+        if suggested_tags is None:
+            for note in related:
+                tag_sources.extend(note.get("tags", []))
+        for value in tag_sources:
+            tag = slugify(str(value), fallback="", max_length=40)
+            if tag and tag not in tags:
+                tags.append(tag)
             if len(tags) >= 20:
                 break
+    if not links and not tags:
+        return strip_maintenance_block(content)
     lines = [MAINTENANCE_START, "", "## Related knowledge", ""]
-    lines.extend(f"- [[{target}]]" for target in links)
+    lines.extend(
+        f"- [[{target}]]" + (f" — {relationship}" if relationship else "")
+        for target, relationship in links
+    )
     if tags:
         lines.extend(["", "Related tags: " + " ".join(f"#{tag}" for tag in tags)])
     lines.extend(

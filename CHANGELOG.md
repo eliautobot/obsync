@@ -2,6 +2,34 @@
 
 All notable changes to Obsync will be documented here.
 
+## 0.14.0 - 2026-07-16
+
+### Added
+
+- Added an adaptive per-vault organization model learned from indexed note content, structure, folders, properties, and human review outcomes without built-in business categories
+- Added a separate Local AI relationship-adjudication pass requiring an exact candidate target, a specific relationship, source-side evidence, target-side evidence, grounded facts, and configurable confidence
+- Added visible adaptive-model status, learned vault patterns, candidate limits, confidence controls, evidence-backed link ceilings, and relationship details in Review
+
+### Changed
+
+- Whole-vault retrieval now uses corpus-adaptive relevance only to shortlist candidates; similarity can never create a link by itself
+- Document processing now uses AI-selected existing folders and evidence-backed AI relationships instead of appending deterministic score-based links
+- Maintenance Sweeps now require a configured Local AI model and learn or refresh the vault model when content, the active AI profile, model, or review feedback changes
+- Relationship feedback from applied and rejected recommendations is included in later model learning
+- The default link safety ceiling is 20 and the supported ceiling is 50; it is a maximum, not a target
+
+### Fixed
+
+- Prevented invoices, templates, and other same-type notes from being linked merely because they share document vocabulary, tags, folders, or formats
+- Excluded generated maintenance blocks from future tags, links, entities, retrieval, model learning, fingerprints, prompts, and evidence validation
+- Added a safe recalculation path that can remove previously overlinked generated blocks while preserving all user-authored content
+- Superseded unreviewed v0.13 deterministic recommendations during migration so obsolete suggestions cannot be applied after upgrade
+- Preserved existing generated blocks when Local AI fails instead of treating an inference error as an empty relationship decision
+
+### Validation
+
+- Added adversarial invoice-corpus tests, hallucinated-target and ungrounded-evidence rejection tests, novel-vault taxonomy tests, migration/repair tests, Desktop round-trip coverage, and a 5,000-note adaptive-index stress test
+
 ## 0.13.1 - 2026-07-16
 
 ### Fixed

@@ -5,7 +5,14 @@ import json
 import httpx
 import pytest
 
-from obsync.llm import LLMAnalyzer, LLMConfig, fallback_analysis, validate_base_url
+from obsync.llm import (
+    LLMAnalyzer,
+    LLMConfig,
+    _extract_json,
+    _normalize_relationship_decision,
+    fallback_analysis,
+    validate_base_url,
+)
 from obsync.profiles import FULL_TRANSFER_PROFILE
 
 
@@ -15,6 +22,304 @@ def test_fallback_analysis_uses_path_and_text() -> None:
     assert result.category == "Acme"
     assert "txt" in result.tags
     assert result.provider == "rules"
+
+
+def test_fallback_analysis_bounds_long_preview_and_tag_count() -> None:
+    result = fallback_analysis(
+        "Many Words/alpha_beta_gamma_delta_epsilon_zeta_eta_theta.txt",
+        "detailed content " * 100,
+        "",
+    )
+
+    assert result.summary.endswith("…")
+    assert len(result.tags) == 6
+
+
+def test_json_extraction_accepts_wrappers_and_rejects_invalid_shapes() -> None:
+    assert _extract_json('```json\n{"ok": true}\n```') == {"ok": True}
+    assert _extract_json('Model output: {"ok": true} trailing text') == {"ok": True}
+    with pytest.raises(ValueError, match="did not return JSON"):
+        _extract_json("no structured response")
+    with pytest.raises(ValueError, match="JSON object"):
+        _extract_json("[1, 2, 3]")
+
+
+def test_relationship_validator_requires_exact_target_specificity_evidence_and_confidence() -> None:
+    candidates = [
+        {"title": "Client Alpha", "link_target": "People/Client Alpha"},
+        {"title": "Project Orion", "link_target": "Projects/Project Orion"},
+    ]
+    result = _normalize_relationship_decision(
+        {
+            "relationships": [
+                {
+                    "target": "Invented Note",
+                    "relationship": "Client owns the account",
+                    "evidence": ["SOURCE: account A1", "TARGET: client A1"],
+                    "confidence": 0.99,
+                },
+                {
+                    "target": "People/Client Alpha",
+                    "relationship": "same type",
+                    "evidence": ["SOURCE: record", "TARGET: record"],
+                    "confidence": 0.99,
+                },
+                {
+                    "target": "People/Client Alpha",
+                    "relationship": "Client owns the source account",
+                    "evidence": ["The notes look similar", "TARGET: account A1"],
+                    "confidence": 0.99,
+                },
+                {
+                    "target": "Projects/Project Orion",
+                    "relationship": "Source invoice funds Project Orion",
+                    "evidence": ["SOURCE: project Orion", "TARGET: invoice INV-9"],
+                    "confidence": 0.61,
+                },
+                {
+                    "target": "People/Client Alpha",
+                    "relationship": "Client Alpha is the named account owner",
+                    "evidence": ["SOURCE: owner Client Alpha", "TARGET: account A1"],
+                    "confidence": 0.94,
+                },
+            ]
+        },
+        candidates,
+        minimum_confidence=0.72,
+        maximum_links=20,
+    )
+
+    assert result["relationships"] == [
+        {
+            "target": "People/Client Alpha",
+            "relationship": "Client Alpha is the named account owner",
+            "evidence": ["SOURCE: owner Client Alpha", "TARGET: account A1"],
+            "confidence": 0.94,
+        }
+    ]
+
+
+def test_relationship_validator_rejects_ungrounded_model_evidence() -> None:
+    candidates = [
+        {
+            "title": "Client Alpha",
+            "link_target": "People/Client Alpha",
+            "content": "Client Alpha owns billing account A1.",
+        }
+    ]
+    result = _normalize_relationship_decision(
+        {
+            "relationships": [
+                {
+                    "target": "People/Client Alpha",
+                    "relationship": "Client Alpha owns the billing account",
+                    "evidence": [
+                        "SOURCE: Project Borealis owns account Z9",
+                        "TARGET: Project Borealis owns account Z9",
+                    ],
+                    "confidence": 0.99,
+                },
+                {
+                    "target": "People/Client Alpha",
+                    "relationship": "Client Alpha owns the billing account",
+                    "evidence": [
+                        "SOURCE: Invoice INV-9 bills Client Alpha",
+                        "TARGET: Client Alpha owns billing account A1",
+                    ],
+                    "confidence": 0.95,
+                },
+            ]
+        },
+        candidates,
+        minimum_confidence=0.72,
+        maximum_links=20,
+        source_note={
+            "path": "Invoices/INV-9.md",
+            "title": "Invoice INV-9",
+            "content": "Invoice INV-9 bills Client Alpha for account A1.",
+        },
+    )
+
+    assert len(result["relationships"]) == 1
+    assert result["relationships"][0]["confidence"] == 0.95
+
+
+@pytest.mark.asyncio
+async def test_vault_model_accepts_vault_specific_patterns_without_fixed_categories(
+    monkeypatch,
+) -> None:
+    analyzer = LLMAnalyzer(
+        LLMConfig(
+            enabled=True,
+            provider="ollama",
+            base_url="http://model",
+            model="local",
+        )
+    )
+
+    async def complete(_system, user):
+        assert "Mycelium Specimen" in user
+        return {
+            "vault_summary": "A field-research vault organized by specimen and expedition.",
+            "organization_principles": ["Specimen notes belong with their expedition."],
+            "note_patterns": [
+                {"name": "mycelium specimen", "signals": ["spore print", "collection site"]}
+            ],
+            "relationship_guidance": ["Link a specimen to its recorded expedition."],
+            "negative_relationship_guidance": ["Do not link specimens only by genus."],
+            "folder_guidance": ["Use existing expedition folders."],
+            "confidence": 0.91,
+        }
+
+    monkeypatch.setattr(analyzer, "_complete_json", complete)
+    model = await analyzer.learn_vault_model(
+        [
+            {
+                "path": "Field/Specimens/Mycelium Specimen.md",
+                "title": "Mycelium Specimen",
+                "content": "Spore print collected during Expedition Lumen.",
+            }
+        ]
+    )
+
+    assert model["note_patterns"][0]["name"] == "mycelium specimen"
+    assert model["provider"] == "ollama"
+
+
+@pytest.mark.asyncio
+async def test_adaptive_relationship_call_uses_specialized_prompt_and_grounded_validation(
+    monkeypatch,
+) -> None:
+    captured: dict = {}
+    decision = {
+        "source_category": "billing",
+        "source_role": "client invoice",
+        "summary": "The invoice names the client account.",
+        "suggested_tags": ["Client Billing"],
+        "relationships": [
+            {
+                "target": "People/Client Alpha",
+                "relationship": "Client Alpha owns the billed account",
+                "evidence": [
+                    "SOURCE: Invoice INV-9 bills Client Alpha",
+                    "TARGET: Client Alpha owns billing account A1",
+                ],
+                "confidence": 0.93,
+            }
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(200, json={"message": {"content": json.dumps(decision)}})
+
+    transport = httpx.MockTransport(handler)
+
+    class MockClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = transport
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", MockClient)
+    analyzer = LLMAnalyzer(
+        LLMConfig(
+            enabled=True,
+            provider="ollama",
+            base_url="http://model",
+            model="local",
+            custom_instructions="Respect this vault's naming style.",
+        )
+    )
+    result = await analyzer.adjudicate_relationships(
+        {
+            "path": "Invoices/INV-9.md",
+            "title": "Invoice INV-9",
+            "content": "Invoice INV-9 bills Client Alpha for account A1.",
+        },
+        [
+            {
+                "path": "People/Client Alpha.md",
+                "title": "Client Alpha",
+                "link_target": "People/Client Alpha",
+                "content": "Client Alpha owns billing account A1.",
+                "content_excerpt": "Client Alpha owns billing account A1.",
+            }
+        ],
+        vault_model={"vault_summary": "Client records and billing notes."},
+        minimum_confidence=0.72,
+        maximum_links=20,
+    )
+
+    system = captured["messages"][0]["content"]
+    assert "Candidate retrieval is only a shortlist" in system
+    assert "Respect this vault's naming style." in system
+    assert result["relationships"][0]["target"] == "People/Client Alpha"
+    assert result["suggested_tags"] == ["client-billing"]
+
+
+@pytest.mark.asyncio
+async def test_document_analysis_accepts_evidence_backed_relationship_and_existing_folder(
+    monkeypatch,
+) -> None:
+    decision = {
+        "title": "Invoice INV-9",
+        "summary": "Billing record for Client Alpha.",
+        "category": "Billing",
+        "document_type": "invoice",
+        "destination_folder": "People",
+        "tags": ["billing"],
+        "confidence": 0.94,
+        "relationships": [
+            {
+                "target": "People/Client Alpha",
+                "relationship": "Client Alpha is the billed account owner",
+                "evidence": [
+                    "SOURCE: Invoice INV-9 bills Client Alpha",
+                    "TARGET: Client Alpha owns account A1",
+                ],
+                "confidence": 0.93,
+            }
+        ],
+        "organization_reason": "The existing People folder contains the client record.",
+    }
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"message": {"content": json.dumps(decision)}})
+
+    transport = httpx.MockTransport(handler)
+
+    class MockClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = transport
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", MockClient)
+    result = await LLMAnalyzer(
+        LLMConfig(
+            enabled=True,
+            provider="ollama",
+            base_url="http://model",
+            model="local",
+        )
+    ).analyze(
+        source_path="Incoming/INV-9.pdf",
+        text="Invoice INV-9 bills Client Alpha for account A1.",
+        mime_type="application/pdf",
+        candidates=[
+            {
+                "title": "Client Alpha",
+                "path": "People/Client Alpha.md",
+                "link_target": "People/Client Alpha",
+                "content_excerpt": "Client Alpha owns account A1.",
+            }
+        ],
+        vault_model={"vault_summary": "People and billing records."},
+    )
+
+    assert result.related_notes == ["People/Client Alpha"]
+    assert result.relationships[0]["confidence"] == 0.93
+    assert result.destination_folder == "People"
+    assert result.organization_reason.startswith("The existing People folder")
 
 
 @pytest.mark.parametrize("url", ["", "localhost:11434", "file:///tmp/model", "ftp://model"])

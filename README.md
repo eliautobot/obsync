@@ -24,7 +24,7 @@ The source stays untouched. Obsync is not a copy-for-copy file mirror; it is a l
 - Exposes the role prompt, prompt template, inference parameters, content behavior, and Obsidian organization controls
 - Indexes the complete Markdown vault—content, folders, headings, aliases, properties, tags, links, backlinks, entities, and stable record identifiers—for whole-vault matching
 - Updates a matching existing note in place instead of creating a duplicate, while preserving the original note and later manual additions
-- Adds every validated, materially relevant relationship link rather than limiting documents to one or two links
+- Learns each vault's own organization model and adds only evidence-backed, materially relevant relationships—never links based on a shared word or document type alone
 - Runs manual or scheduled Index and Maintenance Sweeps with live progress, safe Stop, Review/automatic modes, complete diffs, and Undo Sweep
 - Falls back to deterministic rules whenever the LLM is unavailable
 - Generates Obsidian properties, summaries, tags, categories, and `[[wikilinks]]`
@@ -147,12 +147,12 @@ Update Python-based desktop agents to the same release as the server, then verif
 
 ```bash
 python -m pip install --upgrade \
-  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.13.1"
+  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.14.0"
 obsync --version
 obsync agent scan
 ```
 
-Replace `v0.13.1` with the release you are installing. For Windows, use **Sources → Add another computer → Download Obsync Desktop**, right-click it, choose **Run as administrator**, and then choose **Connect and install**. Elevation is required only for setup; the watcher runs with limited permissions and no visible terminal. Command-line Windows and Linux agents remain available for advanced installations.
+Replace `v0.14.0` with the release you are installing. For Windows, use **Sources → Add another computer → Download Obsync Desktop**, right-click it, choose **Run as administrator**, and then choose **Connect and install**. Elevation is required only for setup; the watcher runs with limited permissions and no visible terminal. Command-line Windows and Linux agents remain available for advanced installations.
 
 Before any update, back up the Obsidian vault and Obsync `/data` volume. The full [Updating and rollback guide](docs/UPDATING.md) includes copy-and-paste backup commands for Linux and Windows, fixed-version installs, every agent type, verification, and safe rollback instructions.
 
@@ -221,14 +221,14 @@ Choose an active AI profile before syncing:
 
 Every custom profile exposes its role prompt, user-prompt template, content mode, input/output limits, temperature, Top P, candidate/tag/link limits, and controls for vault context, `[[wikilinks]]`, tags, YAML properties, category folders, and source details. The protected output schema and prompt-injection boundary are visible but read-only.
 
-Obsidian has no remote core API for this workflow. Obsync integrates through Obsidian's native vault formats. Its scheduled or manual whole-vault index records note content, headings, aliases, properties, tags, paths, folders, links, backlinks, entities, hashes, and modification times. Every source document is ranked against that complete index; bounded content from the most relevant notes reaches the model, returned path-qualified links are validated, and Obsync performs the actual Markdown writes.
+Obsidian has no remote core API for this workflow. Obsync integrates through Obsidian's native vault formats. Its scheduled or manual whole-vault index records note content, headings, aliases, properties, tags, paths, folders, links, backlinks, stable identifiers, hashes, and modification times. Corpus-adaptive retrieval shortlists relevant notes, then a per-vault Local AI model decides whether a real relationship exists. Returned path-qualified links require a specific relationship, grounded source and target evidence, and the configured confidence before Obsync performs the Markdown write.
 
 ## Whole-vault sweeps and maintenance
 
 Open **Obsidian Vault** to run or schedule two independent operations:
 
 - **Index Sweep** refreshes the agent's whole-vault knowledge. It can index only, send resulting recommendations to Review, or automatically apply them.
-- **Maintenance Sweep** finds and refreshes materially related links and tags while checking properties, folder placement, possible duplicates, and managed-source freshness.
+- **Maintenance Sweep** requires Local AI, learns or refreshes the vault-specific organization model, and recalculates evidence-backed links and tags. Similarity only retrieves candidates; it never creates a link.
 
 Both sweeps support **Start**, **Stop**, daily/weekly/monthly/custom schedules, live note-level progress, and no-overlap protection. Review mode is the safe default. Automatic mode carries a prominent warning because it can change existing entries without human approval. Every applied sweep change stores expected hashes, evidence, confidence, and complete before/after content. Concurrent user edits stop the affected recommendation, and **Undo Sweep** restores changes that are still current. Sweeps never automatically delete or merge notes.
 
@@ -258,6 +258,7 @@ If an ordinary destination is not a verified exact match or an explicitly approv
 - [Supported files](docs/SUPPORTED_FILES.md)
 - [Security model](docs/SECURITY.md)
 - [Development and testing](docs/DEVELOPMENT.md)
+- [v0.14.0 release notes](docs/releases/v0.14.0.md)
 - [v0.13.1 release notes](docs/releases/v0.13.1.md)
 - [v0.13.0 release notes](docs/releases/v0.13.0.md)
 - [v0.12.1 release notes](docs/releases/v0.12.1.md)

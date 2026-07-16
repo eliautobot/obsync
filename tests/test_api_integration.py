@@ -162,8 +162,9 @@ def test_vault_sweep_settings_are_validated_and_saved(
             "vault_maintenance_change_mode": "auto",
             "vault_schedule_timezone": "America/New_York",
             "vault_maintenance_categories": ["links", "tags"],
-            "vault_link_minimum_score": 28,
-            "vault_link_limit": 140,
+            "vault_relationship_candidate_limit": 30,
+            "vault_relationship_min_confidence": 0.8,
+            "vault_link_limit": 25,
             "existing_note_policy": "review",
         },
     )
@@ -172,7 +173,9 @@ def test_vault_sweep_settings_are_validated_and_saved(
     assert saved["vault_index_schedule_enabled"] == "true"
     assert saved["vault_maintenance_change_mode"] == "auto"
     assert saved["vault_maintenance_categories"] == '["links", "tags"]'
-    assert saved["vault_link_limit"] == "140"
+    assert saved["vault_relationship_candidate_limit"] == "30"
+    assert saved["vault_relationship_min_confidence"] == "0.8"
+    assert saved["vault_link_limit"] == "25"
 
     invalid = client.put(
         "/api/v1/admin/settings",

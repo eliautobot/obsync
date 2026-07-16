@@ -53,16 +53,15 @@ from .security import (
     verify_token,
 )
 from .vault_intelligence import (
-    VaultSearchIndex,
+    AdaptiveVaultIndex,
     add_backlinks,
     content_hash,
     decode_db_note,
     existing_note_match,
     maintenance_content,
     parse_note,
-    rank_notes,
-    related_notes_for_maintenance,
     serialize_note_for_db,
+    strip_maintenance_block,
 )
 
 DEFAULT_SETTINGS: dict[str, tuple[str, bool]] = {
@@ -98,8 +97,9 @@ DEFAULT_SETTINGS: dict[str, tuple[str, bool]] = {
     "vault_maintenance_change_mode": ("review", False),
     "vault_schedule_timezone": ("America/New_York", False),
     "vault_maintenance_categories": ('["links", "tags"]', False),
-    "vault_link_minimum_score": ("24", False),
-    "vault_link_limit": ("100", False),
+    "vault_relationship_candidate_limit": ("20", False),
+    "vault_relationship_min_confidence": ("0.72", False),
+    "vault_link_limit": ("20", False),
 }
 
 PIPELINE_COMMANDS = frozenset(
@@ -536,6 +536,7 @@ class ObsyncService:
         reason: str,
         evidence: list[str],
         confidence: float,
+        decision: dict[str, Any] | None = None,
     ) -> str:
         change_id = str(uuid.uuid4())
         before_content = str(note.get("content", ""))
@@ -544,7 +545,8 @@ class ObsyncService:
             INSERT INTO vault_changes(
                 id, sweep_id, vault_key, path, change_type, status, before_hash, after_hash,
                 before_content, after_content, reason, evidence_json, confidence, created_at
-            ) VALUES (?, ?, ?, ?, 'organize-note', 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
+                , decision_json
+            ) VALUES (?, ?, ?, ?, 'organize-note', 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 change_id,
@@ -559,19 +561,164 @@ class ObsyncService:
                 json.dumps(evidence[:30], ensure_ascii=False),
                 max(0.0, min(float(confidence), 1.0)),
                 utc_now(),
+                json.dumps(decision or {}, ensure_ascii=False),
             ),
         )
         return change_id
 
+    def _relationship_feedback(self, *, maximum: int = 100) -> list[dict[str, Any]]:
+        rows = self.db.query_all(
+            "SELECT path, status, decision_json FROM vault_changes "
+            "WHERE status IN ('applied', 'rejected') AND decision_json != '{}' "
+            "ORDER BY reviewed_at DESC LIMIT ?",
+            (max(1, min(maximum, 500)),),
+        )
+        feedback: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                decision = json.loads(row.get("decision_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(decision, dict):
+                continue
+            feedback.append(
+                {
+                    "source_path": str(row.get("path", "")),
+                    "outcome": str(row.get("status", "")),
+                    "relationships": list(decision.get("relationships", []))[:20],
+                }
+            )
+        return feedback
+
+    def _vault_model_fingerprint(
+        self,
+        notes: list[dict[str, Any]],
+        feedback: list[dict[str, Any]],
+        config: LLMConfig,
+    ) -> str:
+        digest = hashlib.sha256()
+        digest.update(config.provider.encode())
+        digest.update(b"\0")
+        digest.update(config.model.encode())
+        digest.update(b"\0")
+        digest.update(config.active_profile.id.encode())
+        for note in sorted(notes, key=lambda item: str(item.get("path", "")).casefold()):
+            digest.update(str(note.get("path", "")).encode())
+            digest.update(b"\0")
+            knowledge_hash = content_hash(strip_maintenance_block(str(note.get("content", ""))))
+            digest.update(knowledge_hash.encode())
+        digest.update(json.dumps(feedback, sort_keys=True, ensure_ascii=False).encode())
+        return digest.hexdigest()
+
+    def vault_model_status(self) -> dict[str, Any]:
+        row = self.db.query_one(
+            "SELECT * FROM vault_models WHERE vault_key = ?", (self._vault_key(),)
+        )
+        if not row:
+            return {
+                "status": "not-learned",
+                "model": {},
+                "note_count": 0,
+                "learned_at": "",
+                "provider": "",
+                "model_name": "",
+                "error": "",
+            }
+        try:
+            row["model"] = json.loads(row.pop("model_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            row["model"] = {}
+        return row
+
+    async def _learn_vault_model(
+        self, notes: list[dict[str, Any]], sweep_id: str
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        config = self._llm_config()
+        if not config.active:
+            raise ValueError(
+                "Maintenance Sweep requires Local AI. Enable and test a model in Local AI settings."
+            )
+        feedback = self._relationship_feedback()
+        fingerprint = self._vault_model_fingerprint(notes, feedback, config)
+        current = self.db.query_one(
+            "SELECT * FROM vault_models WHERE vault_key = ?", (self._vault_key(),)
+        )
+        if (
+            current
+            and current.get("status") == "ready"
+            and current.get("fingerprint") == fingerprint
+            and current.get("provider") == config.provider
+            and current.get("model_name") == config.model
+        ):
+            try:
+                cached = json.loads(current.get("model_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                cached = {}
+            if cached:
+                return cached, feedback
+        now = utc_now()
+        self.db.execute(
+            """
+            INSERT INTO vault_models(
+                vault_key, status, model_json, fingerprint, provider, model_name,
+                note_count, learned_at, error, updated_at
+            ) VALUES (?, 'learning', '{}', ?, ?, ?, ?, NULL, '', ?)
+            ON CONFLICT(vault_key) DO UPDATE SET status = 'learning',
+                fingerprint = excluded.fingerprint,
+                provider = excluded.provider, model_name = excluded.model_name,
+                note_count = excluded.note_count, error = '', updated_at = excluded.updated_at
+            """,
+            (self._vault_key(), fingerprint, config.provider, config.model, len(notes), now),
+        )
+        self.db.execute(
+            "UPDATE vault_sweeps SET current_note = 'Learning adaptive vault model', "
+            "updated_at = ? "
+            "WHERE id = ?",
+            (now, sweep_id),
+        )
+        try:
+            model = await LLMAnalyzer(config).learn_vault_model(notes, feedback=feedback)
+        except Exception as exc:
+            self.db.execute(
+                "UPDATE vault_models SET status = 'failed', error = ?, updated_at = ? "
+                "WHERE vault_key = ?",
+                (str(exc)[:2000], utc_now(), self._vault_key()),
+            )
+            raise
+        learned_at = utc_now()
+        self.db.execute(
+            "UPDATE vault_models SET status = 'ready', model_json = ?, learned_at = ?, "
+            "error = '', updated_at = ? WHERE vault_key = ?",
+            (json.dumps(model, ensure_ascii=False), learned_at, learned_at, self._vault_key()),
+        )
+        return model, feedback
+
     async def _generate_maintenance_changes(self, sweep_id: str) -> list[str]:
         notes = self._indexed_vault_notes()
+        if not notes:
+            self.db.execute(
+                "UPDATE vault_sweeps SET recommendations = 0, updated_at = ? WHERE id = ?",
+                (utc_now(), sweep_id),
+            )
+            return []
         try:
-            maximum = max(1, min(int(self.db.get_setting("vault_link_limit", "100")), 250))
-            minimum = max(
-                5.0, min(float(self.db.get_setting("vault_link_minimum_score", "24")), 200.0)
+            maximum = max(1, min(int(self.db.get_setting("vault_link_limit", "20")), 50))
+            candidate_limit = max(
+                5,
+                min(
+                    int(self.db.get_setting("vault_relationship_candidate_limit", "20")),
+                    50,
+                ),
+            )
+            minimum_confidence = max(
+                0.5,
+                min(
+                    float(self.db.get_setting("vault_relationship_min_confidence", "0.72")),
+                    1.0,
+                ),
             )
         except ValueError:
-            maximum, minimum = 100, 24.0
+            maximum, candidate_limit, minimum_confidence = 20, 20, 0.72
         categories_raw = self.db.get_setting("vault_maintenance_categories", "[]")
         try:
             categories = set(json.loads(categories_raw))
@@ -579,7 +726,11 @@ class ObsyncService:
             categories = {"links", "tags"}
         change_ids: list[str] = []
         total = len(notes)
-        search_index = await asyncio.to_thread(VaultSearchIndex, notes)
+        vault_model, feedback = await self._learn_vault_model(notes, sweep_id)
+        analyzer = LLMAnalyzer(self._llm_config())
+        search_index = await asyncio.to_thread(AdaptiveVaultIndex, notes)
+        failures = 0
+        attempted = 0
         for index, note in enumerate(notes, start=1):
             if self._sweep_stop.is_set():
                 break
@@ -590,44 +741,83 @@ class ObsyncService:
             )
             if not ({"links", "tags"} & categories):
                 continue
-            related = await asyncio.to_thread(
-                related_notes_for_maintenance,
-                note,
-                notes,
-                maximum=maximum,
-                minimum_score=minimum,
-                search_index=search_index,
+            candidates = await asyncio.to_thread(
+                search_index.candidates,
+                str(note.get("path", "")),
+                strip_maintenance_block(str(note.get("content", ""))),
+                exclude_path=str(note.get("path", "")),
+                maximum=candidate_limit,
+                source_note=note,
             )
-            if not related:
+            attempted += 1
+            try:
+                decision = await analyzer.adjudicate_relationships(
+                    note,
+                    candidates,
+                    vault_model=vault_model,
+                    minimum_confidence=minimum_confidence,
+                    maximum_links=maximum,
+                    feedback=feedback,
+                )
+            except Exception as exc:
+                failures += 1
+                self.db.add_event(
+                    "vault.relationship_decision_failed",
+                    f"Skipped {note['path']}; Local AI relationship decision failed: {exc}",
+                    level="error",
+                    details={"sweep_id": sweep_id, "path": note["path"]},
+                )
                 continue
+            relationships = decision.get("relationships", []) if "links" in categories else []
+            tags = decision.get("suggested_tags", []) if "tags" in categories else []
             after = maintenance_content(
                 str(note.get("content", "")),
-                related,
+                relationships,
                 include_tags="tags" in categories,
+                suggested_tags=tags,
             )
             if after == note.get("content"):
                 continue
-            evidence: list[str] = []
-            for related_note in related[:20]:
-                evidence.append(
-                    f"{related_note.get('title')}: "
-                    + "; ".join(str(item) for item in related_note.get("reasons", [])[:3])
+            evidence = [
+                f"{relationship['target']}: {item}"
+                for relationship in relationships
+                for item in relationship.get("evidence", [])
+            ][:30]
+            relationship_confidences = [
+                float(item.get("confidence", 0.0)) for item in relationships
+            ]
+            confidence = (
+                min(relationship_confidences)
+                if relationship_confidences
+                else float(vault_model.get("confidence", 0.75))
+            )
+            if relationships:
+                reason = (
+                    f"AI selected {len(relationships)} evidence-backed relationship(s) "
+                    f"from {len(candidates)} retrieved candidates."
                 )
-            confidence = min(0.99, 0.55 + float(related[0].get("score", 0)) / 200)
+            elif strip_maintenance_block(str(note.get("content", ""))) != str(
+                note.get("content", "")
+            ):
+                reason = "AI found no supported relationships; remove the previous generated block."
+            else:
+                reason = "AI recommended vault-specific tags supported by this note."
             change_ids.append(
                 self._create_vault_change(
                     sweep_id=sweep_id,
                     note=note,
                     after_content=after,
-                    reason=(
-                        f"Add or refresh {len(related)} validated relationship link(s)"
-                        " using the whole-vault index."
-                    ),
+                    reason=(decision.get("summary") or reason)[:1000],
                     evidence=evidence,
                     confidence=confidence,
+                    decision=decision,
                 )
             )
             await asyncio.sleep(0)
+        if attempted and failures == attempted:
+            raise ValueError(
+                "Local AI failed every relationship decision; no vault changes were generated"
+            )
         self.db.execute(
             "UPDATE vault_sweeps SET recommendations = ?, updated_at = ? WHERE id = ?",
             (len(change_ids), utc_now(), sweep_id),
@@ -834,6 +1024,10 @@ class ObsyncService:
         allowed = {"index-only", "review", "auto"} if sweep_type == "index" else {"review", "auto"}
         if mode not in allowed:
             raise ValueError("Sweep change handling is invalid")
+        if (sweep_type == "maintenance" or mode != "index-only") and not self._llm_config().active:
+            raise ValueError(
+                "Maintenance recommendations require Local AI. Enable and test a model first."
+            )
         sweep_id = str(uuid.uuid4())
         now = utc_now()
         self.db.execute(
@@ -911,6 +1105,7 @@ class ObsyncService:
             "recent": recent,
             "indexed_notes": int(indexed["count"] if indexed else 0),
             "last_indexed_at": last_indexed_at,
+            "model": self.vault_model_status(),
         }
 
     def list_vault_changes(
@@ -932,6 +1127,10 @@ class ObsyncService:
                 row["evidence"] = json.loads(row.pop("evidence_json") or "[]")
             except (TypeError, json.JSONDecodeError):
                 row["evidence"] = []
+            try:
+                row["decision"] = json.loads(row.pop("decision_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                row["decision"] = {}
             row.pop("before_content", None)
             row.pop("after_content", None)
         return {"items": rows, "total": int(count["count"] if count else 0)}
@@ -944,6 +1143,10 @@ class ObsyncService:
             change["evidence"] = json.loads(change.pop("evidence_json") or "[]")
         except (TypeError, json.JSONDecodeError):
             change["evidence"] = []
+        try:
+            change["decision"] = json.loads(change.pop("decision_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            change["decision"] = {}
         return change
 
     def agent_sweep_progress(
@@ -2663,7 +2866,12 @@ class ObsyncService:
                     "WHERE status = 'synced' AND title != '' ORDER BY updated_at DESC LIMIT 1000"
                 )
             ]
-        return rank_notes(source_path, text, catalog, limit=profile.candidate_limit)
+        adaptive = AdaptiveVaultIndex(catalog)
+        return adaptive.candidates(
+            source_path,
+            text,
+            maximum=min(profile.candidate_limit, 50),
+        )
 
     def _new_destination(
         self,
@@ -2676,12 +2884,11 @@ class ObsyncService:
         candidates: list[dict[str, Any]] | None = None,
     ) -> str:
         segments: list[str]
-        best = (candidates or [None])[0]
-        best_path = str(best.get("path", "")) if isinstance(best, dict) else ""
-        best_score = float(best.get("score", 0)) if isinstance(best, dict) else 0
-        existing_folder = Path(best_path).parent if best_path else Path()
-        if profile.organize_folders and best_score >= 30 and str(existing_folder) not in {"", "."}:
-            segments = list(existing_folder.parts)
+        learned_folder = (
+            Path(analysis.destination_folder) if analysis.destination_folder else Path()
+        )
+        if profile.organize_folders and str(learned_folder) not in {"", "."}:
+            segments = list(learned_folder.parts)
         else:
             segments = [
                 str(root["destination"]),
@@ -3037,22 +3244,31 @@ class ObsyncService:
                 mime_type=extracted.mime_type,
                 candidates=vault_candidates,
                 review_feedback=review_feedback,
+                vault_model=self.vault_model_status().get("model", {}),
             )
-            validated_links = list(analysis.related_notes)
-            minimum_link_score = float(self.db.get_setting("vault_link_minimum_score", "24"))
-            maximum_links = min(
-                active_profile.related_notes_limit,
-                int(self.db.get_setting("vault_link_limit", "100")),
-            )
-            for candidate in vault_candidates:
-                if float(candidate.get("score", 0)) < minimum_link_score:
-                    continue
-                target = str(candidate.get("link_target", "")).strip()
-                if target and target not in validated_links:
-                    validated_links.append(target)
-                if len(validated_links) >= maximum_links:
-                    break
-            analysis.related_notes = validated_links[:maximum_links]
+            try:
+                minimum_relationship_confidence = float(
+                    self.db.get_setting("vault_relationship_min_confidence", "0.72")
+                )
+                maximum_links = min(
+                    active_profile.related_notes_limit,
+                    int(self.db.get_setting("vault_link_limit", "20")),
+                    50,
+                )
+            except ValueError:
+                minimum_relationship_confidence, maximum_links = (
+                    0.72,
+                    min(active_profile.related_notes_limit, 20),
+                )
+            analysis.relationships = [
+                relationship
+                for relationship in analysis.relationships
+                if relationship.get("evidence")
+                and float(relationship.get("confidence", 0.0)) >= minimum_relationship_confidence
+            ][:maximum_links]
+            analysis.related_notes = [
+                str(relationship["target"]) for relationship in analysis.relationships
+            ]
             if activity:
                 activity["ai_active"] = False
             self._update_activity(
@@ -3876,7 +4092,8 @@ class ObsyncService:
             "vault_maintenance_change_mode": False,
             "vault_schedule_timezone": False,
             "vault_maintenance_categories": False,
-            "vault_link_minimum_score": False,
+            "vault_relationship_candidate_limit": False,
+            "vault_relationship_min_confidence": False,
             "vault_link_limit": False,
         }
         values: dict[str, tuple[str, bool]] = {}
@@ -3936,7 +4153,8 @@ class ObsyncService:
             "vault_maintenance_schedule_month_day": (1, 28),
             "vault_index_schedule_interval_hours": (1, 8760),
             "vault_maintenance_schedule_interval_hours": (1, 8760),
-            "vault_link_limit": (1, 250),
+            "vault_relationship_candidate_limit": (5, 50),
+            "vault_link_limit": (1, 50),
         }
         for key, (minimum, maximum) in numeric_ranges.items():
             if key in payload:
@@ -3946,13 +4164,13 @@ class ObsyncService:
                     raise ValueError(f"{key} must be a whole number") from None
                 if not minimum <= number <= maximum:
                     raise ValueError(f"{key} must be between {minimum} and {maximum}")
-        if "vault_link_minimum_score" in payload:
+        if "vault_relationship_min_confidence" in payload:
             try:
-                score = float(payload["vault_link_minimum_score"])
+                score = float(payload["vault_relationship_min_confidence"])
             except (TypeError, ValueError):
-                raise ValueError("Link relevance score must be a number") from None
-            if not 5 <= score <= 200:
-                raise ValueError("Link relevance score must be between 5 and 200")
+                raise ValueError("AI relationship confidence must be a number") from None
+            if not 0.5 <= score <= 1:
+                raise ValueError("AI relationship confidence must be between 0.5 and 1")
         if "vault_maintenance_categories" in payload:
             categories = payload["vault_maintenance_categories"]
             if isinstance(categories, str):

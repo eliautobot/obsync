@@ -41,7 +41,9 @@ Obsync is a one-way, continuously reconciled knowledge pipeline from arbitrary f
 - Per-profile Obsidian controls for vault context, `[[wikilinks]]`, tags, properties, folders, and source details
 - Persistent whole-vault indexing of full note content, headings, aliases, properties, tags, folders, links, backlinks, named entities, stable identifiers, hashes, and modification times
 - Whole-vault relevance ranking with bounded full-content context and exact path-qualified link validation
-- Entity-driven links to every materially relevant validated note, with configurable relevance and link limits up to 250
+- Adaptive per-vault Local AI organization models with no compiled business taxonomy or folder convention
+- Corpus-adaptive candidate retrieval separated from relationship decisions, so similarity alone never creates a link
+- Evidence-gated links requiring an exact target, specific relationship, grounded source/target facts, configurable confidence, and a safety ceiling up to 50
 
 ## Obsidian output
 
@@ -79,7 +81,7 @@ Ordinary existing notes may be adopted after an exact match or explicit review. 
 - Searchable, compact document table with bounded panel scrolling and responsive mobile cards
 - Error retry commands
 - Complete review workflow with Approve, Disregard, feedback-driven Redo AI review, and explicit separate-note creation for possible duplicates
-- Combined Review queue for document decisions and whole-vault recommendations, with evidence, confidence, before/after diffs, and individual or bulk approval
+- Combined Review queue for document decisions and whole-vault recommendations, with relationship descriptions, source/target evidence, confidence, before/after diffs, and individual or bulk approval
 - Manual and scheduled Index and Maintenance Sweeps with live progress, safe Stop, daily/weekly/monthly/custom timing, review/automatic modes, audit history, concurrent-edit protection, and Undo Sweep
 - Complete Local AI connection, profile, prompt, parameter, and Obsidian behavior configuration
 - Fast model discovery that does not start inference

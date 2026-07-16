@@ -17,8 +17,10 @@ async def test_desktop_whole_vault_index_and_reviewed_maintenance_write(
     app,
     enrolled_agent,
     tmp_path: Path,
+    adaptive_ai,
 ) -> None:
     service = app.state.service
+    adaptive_ai(service)
     vault = tmp_path / "desktop-vault"
     (vault / "Companies").mkdir(parents=True)
     (vault / "Clients").mkdir()

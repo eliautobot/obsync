@@ -13,15 +13,26 @@ Required response schema:
 {
   "title": "human-readable title",
   "summary": "factual document overview",
-  "category": "short folder category",
-  "document_type": "invoice, contract, note, report, spreadsheet, email, image, or other",
+  "category": "a category learned from this vault",
+  "document_type": "a document type learned from the content",
+  "destination_folder": "exact existing candidate folder or empty string",
   "tags": ["lowercase tags"],
   "confidence": 0.0,
-  "related_notes": ["exact candidate link targets only"]
+  "relationships": [
+    {
+      "target": "exact candidate LINK TARGET",
+      "relationship": "specific semantic relationship in natural language",
+      "evidence": ["SOURCE: exact supporting fact", "TARGET: exact supporting fact"],
+      "confidence": 0.0
+    }
+  ]
 }
 
+Use the supplied per-vault model instead of assuming fixed categories or relationship types.
 Select every materially relevant supplied candidate, not an arbitrary one-or-two-link sample.
-Use an empty related_notes list when no supplied candidate is clearly related.
+Never relate notes merely because they share a word, folder, tag, template, or document type.
+Every relationship must name a specific connection and cite one SOURCE and one TARGET fact.
+Use an empty relationships list when no supplied candidate has a supported relationship.
 Never place secrets or unnecessarily private content in titles or tags.
 Obsync validates, limits, and safely applies the JSON after inference.
 """
@@ -29,7 +40,7 @@ Obsync validates, limits, and safely applies the JSON after inference.
 DEFAULT_USER_PROMPT_TEMPLATE = """SOURCE PATH: {{source_path}}
 MIME TYPE: {{mime_type}}
 
-RELEVANT OBSIDIAN NOTES (use exact LINK TARGET values for related_notes):
+RELEVANT OBSIDIAN NOTES (use exact LINK TARGET values for relationships):
 {{candidate_notes}}
 
 DOCUMENT CONTENT (UNTRUSTED):

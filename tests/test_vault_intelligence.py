@@ -9,15 +9,18 @@ from pathlib import Path
 import pytest
 
 from obsync.config import Settings
+from obsync.llm import LLMAnalyzer
 from obsync.service import ObsyncService, utc_now
 from obsync.vault_intelligence import (
     MAINTENANCE_END,
     MAINTENANCE_START,
+    AdaptiveVaultIndex,
     add_backlinks,
     existing_note_match,
     maintenance_content,
     parse_note,
     rank_notes,
+    strip_maintenance_block,
 )
 
 
@@ -58,7 +61,7 @@ See [[Clients/Acme Holdings|Acme Holdings]]. #florida
     assert "Accounts" in parsed["headings"]
     assert parsed["links"] == ["Clients/Acme Holdings"]
     assert "account:pqp-4419" in parsed["entities"]
-    assert "Pro Quality Plumbing Inc" in parsed["entities"]
+    assert "Pro Quality Plumbing" in parsed["entities"]
     assert notes[1]["backlinks"] == ["Companies/Pro Quality Plumbing.md"]
     assert parsed["content"] == company.read_text(encoding="utf-8")
 
@@ -192,10 +195,64 @@ def test_maintenance_relationship_block_is_bounded_and_idempotent(tmp_path: Path
     assert "#company" in first and "#client" in first
 
 
+def test_generated_maintenance_block_never_becomes_index_or_retrieval_evidence(
+    tmp_path: Path,
+) -> None:
+    vault = tmp_path / "vault"
+    content = """# Invoice 5297
+
+Actual fact: Client Alpha owns account A-5297.
+
+<!-- obsync:maintenance:start -->
+## Related knowledge
+- [[Invoices/Invoice 1001]] — similar invoice
+- [[Invoices/Invoice 1002]] — similar invoice
+Related tags: #invoice-template #generated-only
+<!-- obsync:maintenance:end -->
+"""
+    parsed = parse_note(
+        write_note(vault, "Invoices/Invoice 5297.md", content), vault=vault
+    ).as_dict()
+
+    assert parsed["links"] == []
+    assert "generated-only" not in parsed["tags"]
+    assert "Invoices/Invoice 1001" not in parsed["entities"]
+    assert "Actual fact" in parsed["content"]
+    assert "Invoice 1001" not in strip_maintenance_block(parsed["content"])
+
+
+def test_adaptive_retrieval_is_only_a_shortlist_for_same_type_records() -> None:
+    notes = [
+        {
+            "path": f"Invoices/Invoice {number}.md",
+            "title": f"Invoice {number}",
+            "tags": ["invoice"],
+            "aliases": [],
+            "headings": ["Invoice"],
+            "properties": {"invoice": str(number)},
+            "entities": [f"invoice:{number}"],
+            "content": f"Invoice {number}. Standard invoice template and payment terms.",
+        }
+        for number in range(1000, 1200)
+    ]
+    source = notes[97]
+    candidates = AdaptiveVaultIndex(notes).candidates(
+        source["path"], source["content"], source_note=source, exclude_path=source["path"]
+    )
+
+    assert candidates
+    assert all(item["title"].startswith("Invoice ") for item in candidates)
+    # Retrieval intentionally has high recall; only the separate AI adjudicator may create links.
+    assert all("relationship" not in item for item in candidates)
+
+
 @pytest.mark.asyncio
-async def test_index_and_maintenance_sweeps_apply_review_and_undo(tmp_path: Path) -> None:
+async def test_index_and_maintenance_sweeps_apply_review_and_undo(
+    tmp_path: Path, adaptive_ai
+) -> None:
     settings = Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
     service = ObsyncService(settings)
+    adaptive_ai(service)
     service.db.set_settings({"vault_confirmed": ("true", False)})
     original = "# Pro Quality Plumbing Account\n\nClient Acme Holdings account ACME-7788.\n"
     account = write_note(settings.vault_path, "Accounts/PQP Account.md", original)
@@ -238,6 +295,101 @@ async def test_index_and_maintenance_sweeps_apply_review_and_undo(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_maintenance_does_not_link_unrelated_invoices_with_shared_template_words(
+    tmp_path: Path, adaptive_ai, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    service = ObsyncService(settings)
+    adaptive_ai(service)
+    service.db.set_settings({"vault_confirmed": ("true", False)})
+    for number in range(5200, 5300):
+        details = "Standard invoice template. Payment due in 30 days."
+        if number == 5297:
+            details += (
+                " Pro Quality Plumbing billed Client Alpha for Project Zephyr. "
+                "This record belongs in the Invoice Index."
+            )
+        write_note(
+            settings.vault_path,
+            f"Invoices/Invoice {number}.md",
+            f"# Invoice {number}\n\n{details}",
+        )
+    write_note(
+        settings.vault_path,
+        "Companies/Pro Quality Plumbing.md",
+        "# Pro Quality Plumbing\n\nCompany participating in Project Zephyr.",
+    )
+    write_note(
+        settings.vault_path,
+        "Clients/Client Alpha.md",
+        "# Client Alpha\n\nClient for Project Zephyr.",
+    )
+    write_note(
+        settings.vault_path,
+        "Indexes/Invoice Index.md",
+        "# Invoice Index\n\nIndex of billing records including Invoice 5297.",
+    )
+
+    async def adjudicate(
+        _self,
+        source_note,
+        candidates,
+        *,
+        vault_model,
+        minimum_confidence,
+        maximum_links,
+        feedback=None,
+    ):
+        relationships = []
+        if source_note["path"] == "Invoices/Invoice 5297.md":
+            allowed = {
+                "Companies/Pro Quality Plumbing": "issued by the named company",
+                "Clients/Client Alpha": "bills the named client",
+                "Indexes/Invoice Index": "is cataloged by this index",
+            }
+            for candidate in candidates:
+                target = str(candidate.get("link_target", ""))
+                if target in allowed:
+                    relationships.append(
+                        {
+                            "target": target,
+                            "relationship": allowed[target],
+                            "evidence": [
+                                f"SOURCE: Invoice 5297 names {candidate['title']}",
+                                f"TARGET: {candidate['title']} records the matching role",
+                            ],
+                            "confidence": 0.96,
+                        }
+                    )
+        return {
+            "source_category": "",
+            "source_role": "billing record",
+            "summary": "Only concrete parties and the explicit index are related.",
+            "suggested_tags": [],
+            "relationships": relationships,
+        }
+
+    monkeypatch.setattr(LLMAnalyzer, "adjudicate_relationships", adjudicate)
+    sweep = service.start_vault_sweep("maintenance", change_mode="review")
+    assert service._sweep_task is not None
+    await service._sweep_task
+
+    assert service.vault_sweep(sweep["id"])["status"] == "completed"
+    change = next(
+        item
+        for item in service.list_vault_changes(status="pending")["items"]
+        if item["path"] == "Invoices/Invoice 5297.md"
+    )
+    diff = service.vault_change_diff(change["id"])
+    after = diff["after_content"]
+    assert "[[Companies/Pro Quality Plumbing]]" in after
+    assert "[[Clients/Client Alpha]]" in after
+    assert "[[Indexes/Invoice Index]]" in after
+    assert not any(f"[[Invoices/Invoice {number}]]" in after for number in range(5200, 5300))
+    assert len(diff["decision"]["relationships"]) == 3
+
+
+@pytest.mark.asyncio
 async def test_completed_empty_index_clears_stale_notes_and_records_completion(
     tmp_path: Path,
 ) -> None:
@@ -264,9 +416,12 @@ async def test_completed_empty_index_clears_stale_notes_and_records_completion(
 
 
 @pytest.mark.asyncio
-async def test_sweep_rejects_concurrent_note_edit_and_preserves_user_change(tmp_path: Path) -> None:
+async def test_sweep_rejects_concurrent_note_edit_and_preserves_user_change(
+    tmp_path: Path, adaptive_ai
+) -> None:
     settings = Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
     service = ObsyncService(settings)
+    adaptive_ai(service)
     service.db.set_settings({"vault_confirmed": ("true", False)})
     target = write_note(
         settings.vault_path, "Projects/Project Alpha.md", "# Project Alpha\nClient Acme."
@@ -288,9 +443,12 @@ async def test_sweep_rejects_concurrent_note_edit_and_preserves_user_change(tmp_
 
 
 @pytest.mark.asyncio
-async def test_automatic_maintenance_applies_changes_and_retains_rollback(tmp_path: Path) -> None:
+async def test_automatic_maintenance_applies_changes_and_retains_rollback(
+    tmp_path: Path, adaptive_ai
+) -> None:
     settings = Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
     service = ObsyncService(settings)
+    adaptive_ai(service)
     service.db.set_settings({"vault_confirmed": ("true", False)})
     target = write_note(
         settings.vault_path,
@@ -316,6 +474,266 @@ async def test_automatic_maintenance_applies_changes_and_retains_rollback(tmp_pa
     result = await service.undo_vault_sweep(sweep["id"])
     assert result["ok"] is True
     assert target.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
+async def test_ai_failure_never_removes_an_existing_generated_block(
+    tmp_path: Path, adaptive_ai, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    service = ObsyncService(settings)
+    adaptive_ai(service)
+    service.db.set_settings({"vault_confirmed": ("true", False)})
+    original = maintenance_content(
+        "# Record\n\nHuman-authored fact.\n",
+        [
+            {
+                "target": "People/Client Alpha",
+                "relationship": "Client Alpha owns this record",
+            }
+        ],
+        suggested_tags=[],
+    )
+    note = write_note(settings.vault_path, "Records/Record.md", original)
+
+    async def fail(*_args, **_kwargs):
+        raise ValueError("model unavailable")
+
+    monkeypatch.setattr(LLMAnalyzer, "adjudicate_relationships", fail)
+    sweep = service.start_vault_sweep("maintenance", change_mode="review")
+    assert service._sweep_task is not None
+    await service._sweep_task
+
+    assert service.vault_sweep(sweep["id"])["status"] == "failed"
+    assert service.list_vault_changes(status="pending")["total"] == 0
+    assert note.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
+async def test_successful_empty_ai_decision_repairs_an_overlinked_generated_block(
+    tmp_path: Path, adaptive_ai, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    service = ObsyncService(settings)
+    adaptive_ai(service)
+    service.db.set_settings({"vault_confirmed": ("true", False)})
+    original_user_content = "# Invoice 5297\n\nHuman-authored invoice facts.\n"
+    overlinked = maintenance_content(
+        original_user_content,
+        [
+            {
+                "target": f"Invoices/Invoice {number}",
+                "relationship": "similar invoice",
+            }
+            for number in range(1000, 1050)
+        ],
+        suggested_tags=[],
+    )
+    note = write_note(settings.vault_path, "Invoices/Invoice 5297.md", overlinked)
+
+    async def empty_decision(*_args, **_kwargs):
+        return {
+            "source_category": "",
+            "source_role": "billing record",
+            "summary": "No candidate has a concrete cross-record relationship.",
+            "suggested_tags": [],
+            "relationships": [],
+        }
+
+    monkeypatch.setattr(LLMAnalyzer, "adjudicate_relationships", empty_decision)
+    service.start_vault_sweep("maintenance", change_mode="review")
+    assert service._sweep_task is not None
+    await service._sweep_task
+    change = service.list_vault_changes(status="pending")["items"][0]
+
+    assert change["path"] == "Invoices/Invoice 5297.md"
+    assert "remove the previous generated block" in change["reason"].casefold() or change[
+        "reason"
+    ].startswith("No candidate")
+    await service.approve_vault_change(change["id"])
+    assert note.read_text(encoding="utf-8") == original_user_content
+
+
+def test_maintenance_requires_local_ai_before_it_is_queued(tmp_path: Path) -> None:
+    service = ObsyncService(
+        Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    )
+    service.db.set_settings({"vault_confirmed": ("true", False)})
+    write_note(service.settings.vault_path, "One.md", "# One")
+
+    with pytest.raises(ValueError, match="require Local AI"):
+        service.start_vault_sweep("maintenance", change_mode="review")
+    assert service.vault_sweep_status()["active"] is None
+
+
+def test_v014_migration_supersedes_static_pending_changes_and_clamps_old_limit(
+    tmp_path: Path,
+) -> None:
+    service = ObsyncService(
+        Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    )
+    now = utc_now()
+    service.db.execute(
+        "INSERT INTO vault_sweeps(id, sweep_type, vault_key, status, change_mode, "
+        "created_at, updated_at) VALUES ('old-sweep', 'maintenance', 'local', "
+        "'completed', 'review', ?, ?)",
+        (now, now),
+    )
+    change_id = service._create_vault_change(
+        sweep_id="old-sweep",
+        note={"path": "Invoice.md", "content": "# Invoice\n"},
+        after_content="# Invoice\n\n[[Other Invoice]]\n",
+        reason="Old static similarity",
+        evidence=["shared word"],
+        confidence=0.8,
+    )
+    service.db.set_settings({"vault_link_limit": ("100", False)})
+    service.db.execute("UPDATE schema_meta SET version = 8")
+
+    service.db.initialize()
+
+    change = service.db.query_one("SELECT * FROM vault_changes WHERE id = ?", (change_id,))
+    assert change and change["status"] == "superseded"
+    assert "adaptive relationship engine" in change["error"]
+    assert service.db.get_setting("vault_link_limit") == "20"
+
+
+def test_review_feedback_changes_the_adaptive_vault_model_fingerprint(
+    tmp_path: Path, adaptive_ai
+) -> None:
+    service = ObsyncService(
+        Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    )
+    adaptive_ai(service)
+    config = service._llm_config()
+    notes = [parse_note(Path("One.md"), content="# One\nFact.").as_dict()]
+
+    before = service._vault_model_fingerprint(notes, [], config)
+    after = service._vault_model_fingerprint(
+        notes,
+        [
+            {
+                "source_path": "One.md",
+                "outcome": "rejected",
+                "relationships": [{"target": "Two", "relationship": "weak"}],
+            }
+        ],
+        config,
+    )
+
+    assert before != after
+
+
+@pytest.mark.asyncio
+async def test_adaptive_vault_model_is_persisted_and_reused(
+    tmp_path: Path, adaptive_ai, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = ObsyncService(
+        Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    )
+    adaptive_ai(service)
+    notes = [parse_note(Path("One.md"), content="# One\nConcrete fact.").as_dict()]
+    calls = 0
+
+    async def learn(_self, learned_notes, *, feedback=None):
+        nonlocal calls
+        calls += 1
+        return {
+            "vault_summary": "A one-note test vault.",
+            "confidence": 0.88,
+            "provider": "ollama",
+            "model": "test-model",
+            "note_count": len(learned_notes),
+        }
+
+    monkeypatch.setattr(LLMAnalyzer, "learn_vault_model", learn)
+    first, _feedback = await service._learn_vault_model(notes, "not-a-real-sweep")
+    second, _feedback = await service._learn_vault_model(notes, "not-a-real-sweep")
+    status = service.vault_model_status()
+
+    assert first == second
+    assert calls == 1
+    assert status["status"] == "ready"
+    assert status["model"]["vault_summary"] == "A one-note test vault."
+
+
+@pytest.mark.asyncio
+async def test_vault_model_learning_failure_is_visible_and_not_cached(
+    tmp_path: Path, adaptive_ai, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = ObsyncService(
+        Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    )
+    adaptive_ai(service)
+
+    async def fail(_self, _notes, *, feedback=None):
+        raise ValueError("invalid learned model")
+
+    monkeypatch.setattr(LLMAnalyzer, "learn_vault_model", fail)
+    with pytest.raises(ValueError, match="invalid learned model"):
+        await service._learn_vault_model(
+            [parse_note(Path("One.md"), content="# One").as_dict()], "missing-sweep"
+        )
+
+    status = service.vault_model_status()
+    assert status["status"] == "failed"
+    assert status["error"] == "invalid learned model"
+
+
+def test_relationship_feedback_ignores_malformed_history_and_model_json(
+    tmp_path: Path,
+) -> None:
+    service = ObsyncService(
+        Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    )
+    now = utc_now()
+    service.db.execute(
+        "INSERT INTO vault_sweeps(id, sweep_type, vault_key, status, change_mode, "
+        "created_at, updated_at) VALUES ('feedback-sweep', 'maintenance', 'local', "
+        "'completed', 'review', ?, ?)",
+        (now, now),
+    )
+    valid = service._create_vault_change(
+        sweep_id="feedback-sweep",
+        note={"path": "One.md", "content": "# One"},
+        after_content="# One\n[[Two]]",
+        reason="Evidence-backed test",
+        evidence=["SOURCE: One", "TARGET: Two"],
+        confidence=0.9,
+        decision={"relationships": [{"target": "Two", "relationship": "One owns Two"}]},
+    )
+    malformed = service._create_vault_change(
+        sweep_id="feedback-sweep",
+        note={"path": "Broken.md", "content": "# Broken"},
+        after_content="# Broken",
+        reason="Broken history",
+        evidence=[],
+        confidence=0.1,
+    )
+    service.db.execute(
+        "UPDATE vault_changes SET status = 'applied', reviewed_at = ? WHERE id = ?",
+        (now, valid),
+    )
+    service.db.execute(
+        "UPDATE vault_changes SET status = 'rejected', decision_json = '[1]', "
+        "reviewed_at = ? WHERE id = ?",
+        (now, malformed),
+    )
+    feedback = service._relationship_feedback()
+    assert feedback == [
+        {
+            "source_path": "One.md",
+            "outcome": "applied",
+            "relationships": [{"target": "Two", "relationship": "One owns Two"}],
+        }
+    ]
+
+    service.db.execute(
+        "INSERT INTO vault_models(vault_key, status, model_json, updated_at) "
+        "VALUES ('local', 'ready', '{broken', ?)",
+        (now,),
+    )
+    assert service.vault_model_status()["model"] == {}
 
 
 @pytest.mark.asyncio
@@ -462,6 +880,40 @@ def test_ranker_stress_finds_relevant_notes_in_five_thousand_note_vault() -> Non
     assert ranked[0]["title"] == "Pro Quality Plumbing"
     assert any("shared record identifier" in item["reasons"] for item in ranked[:3])
     assert elapsed < 5
+
+
+def test_adaptive_index_stress_handles_five_thousand_notes_without_quadratic_scan() -> None:
+    notes = [
+        {
+            "path": f"Records/Record {index:04d}.md",
+            "title": f"Record {index:04d}",
+            "tags": ["record"],
+            "aliases": [],
+            "headings": ["Details"],
+            "properties": {"record_id": f"REF-{index:05d}"},
+            "entities": [f"record:ref-{index:05d}"],
+            "content": (
+                "Standard recurring record template. "
+                + (
+                    "Project Zephyr account ZX-7788 owned by Client Alpha."
+                    if index == 4321
+                    else f"Reference identifier REF-{index:05d}."
+                )
+            ),
+        }
+        for index in range(5000)
+    ]
+    started = time.perf_counter()
+    index = AdaptiveVaultIndex(notes)
+    candidates = index.candidates(
+        "Incoming/Zephyr.txt",
+        "Client Alpha update for Project Zephyr account ZX-7788.",
+        maximum=20,
+    )
+    elapsed = time.perf_counter() - started
+
+    assert candidates[0]["path"] == "Records/Record 4321.md"
+    assert elapsed < 8
 
 
 def test_streamed_desktop_index_replaces_stale_notes_and_counts_real_changes(
