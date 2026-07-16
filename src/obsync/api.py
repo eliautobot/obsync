@@ -789,7 +789,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/v1/agent/commands")
     async def commands(agent: AgentDependency) -> dict[str, Any]:
         service.heartbeat(agent["id"])
-        return {"items": service.pending_commands(agent["id"])}
+        return {
+            "items": service.pending_commands(agent["id"]),
+            "sync_enabled": service.pipeline_enabled(),
+        }
 
     @app.post("/api/v1/agent/commands/{command_id}/complete")
     async def command_complete(

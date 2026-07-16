@@ -769,7 +769,9 @@ class AgentRuntime:
 
     async def process_commands_once(self) -> None:
         response = await self._request("GET", "/api/v1/agent/commands")
-        for command in response.json()["items"]:
+        payload = response.json()
+        self._server_sync_enabled = bool(payload.get("sync_enabled", self._server_sync_enabled))
+        for command in payload["items"]:
             ok = True
             result = ""
             try:
@@ -937,7 +939,7 @@ class AgentRuntime:
             except httpx.HTTPError:
                 pass
             with suppress(TimeoutError):
-                await asyncio.wait_for(self._stop.wait(), timeout=3)
+                await asyncio.wait_for(self._stop.wait(), timeout=1)
 
     async def _reconcile_loop(self) -> None:
         first_pass = True

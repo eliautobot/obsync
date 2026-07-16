@@ -501,6 +501,50 @@ async def test_agent_heartbeat_obeys_global_pipeline_state(
 
 
 @pytest.mark.asyncio
+async def test_command_poll_refreshes_pipeline_state_before_resume_reconcile(
+    app,
+    client,
+    admin_headers,
+    enrolled_agent,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "resume-source"
+    source.mkdir()
+    root = RootConfig(root_key="resume-root", name="Resume", path=str(source))
+    config = AgentConfig(
+        server_url="http://testserver",
+        agent_id=enrolled_agent["agent_id"],
+        agent_token=enrolled_agent["agent_token"],
+        name="Test PC",
+        roots=[root],
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+        headers={"Authorization": f"Bearer {enrolled_agent['agent_token']}"},
+    ) as async_client:
+        runtime = AgentRuntime(config, client=async_client)
+        await runtime.register_roots()
+        client.post("/api/v1/admin/pipeline/stop", headers=admin_headers)
+        assert (await runtime.heartbeat_once())["sync_enabled"] is False
+
+        started = client.post("/api/v1/admin/pipeline/start", headers=admin_headers).json()
+        assert started["enabled"] is True
+        assert started["reconciliations"] == 1
+        assert runtime._server_sync_enabled is False
+
+        await runtime.process_commands_once()
+        assert runtime._server_sync_enabled is True
+
+    command = app.state.service.db.query_one(
+        "SELECT * FROM commands WHERE command = 'reconcile' ORDER BY created_at DESC LIMIT 1"
+    )
+    assert command is not None
+    assert command["status"] == "completed"
+
+
+@pytest.mark.asyncio
 async def test_desktop_vault_audit_reports_matching_modified_and_missing_notes(
     app,
     client,
