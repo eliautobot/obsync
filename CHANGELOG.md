@@ -2,6 +2,24 @@
 
 All notable changes to Obsync will be documented here.
 
+## 0.15.1 - 2026-07-17
+
+### Changed
+
+- Increased the default Local AI inference timeout from 120 seconds to 600 seconds
+- Made the per-request timeout editable from 5 to 3,600 seconds in Local AI settings
+- Upgrades using the former 120-second default move to 600 seconds; custom timeout values remain unchanged
+
+### Fixed
+
+- Timeout failures now identify the configured duration and the AI operation that timed out
+- Maintenance Sweep history, adaptive-model status, activity events, and connection checks no longer show blank timeout errors
+- When every relationship decision fails, the sweep error now includes the final underlying Local AI failure
+
+### Validation
+
+- Added regression coverage for defaults, custom timeout validation, upgrade migration, connection-check timeouts, vault-model timeouts, and persisted Maintenance Sweep errors
+
 ## 0.15.0 - 2026-07-16
 
 ### Added

@@ -19,7 +19,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .config import Settings
 from .db import Database, utc_now
 from .extractors import extract_document
-from .llm import Analysis, LLMAnalyzer, LLMConfig
+from .llm import (
+    DEFAULT_LLM_TIMEOUT_SECONDS,
+    MAX_LLM_TIMEOUT_SECONDS,
+    MIN_LLM_TIMEOUT_SECONDS,
+    Analysis,
+    LLMAnalyzer,
+    LLMConfig,
+)
 from .markdown import (
     adopt_preserving_original,
     is_managed_note,
@@ -74,7 +81,7 @@ DEFAULT_SETTINGS: dict[str, tuple[str, bool]] = {
     "llm_base_url": ("", False),
     "llm_model": ("", False),
     "llm_api_key": ("", True),
-    "llm_timeout_seconds": ("120", False),
+    "llm_timeout_seconds": (str(DEFAULT_LLM_TIMEOUT_SECONDS), False),
     "llm_instructions": ("", False),
     "llm_vault_context": ("true", False),
     "ai_active_profile_id": ("", False),
@@ -730,6 +737,7 @@ class ObsyncService:
         analyzer = LLMAnalyzer(self._llm_config())
         search_index = await asyncio.to_thread(AdaptiveVaultIndex, notes)
         failures = 0
+        failure_messages: list[str] = []
         attempted = 0
         for index, note in enumerate(notes, start=1):
             if self._sweep_stop.is_set():
@@ -761,9 +769,12 @@ class ObsyncService:
                 )
             except Exception as exc:
                 failures += 1
+                failure_message = str(exc).strip() or type(exc).__name__
+                failure_messages.append(failure_message)
                 self.db.add_event(
                     "vault.relationship_decision_failed",
-                    f"Skipped {note['path']}; Local AI relationship decision failed: {exc}",
+                    "Skipped "
+                    f"{note['path']}; Local AI relationship decision failed: {failure_message}",
                     level="error",
                     details={"sweep_id": sweep_id, "path": note["path"]},
                 )
@@ -815,8 +826,10 @@ class ObsyncService:
             )
             await asyncio.sleep(0)
         if attempted and failures == attempted:
+            detail = failure_messages[-1] if failure_messages else "Unknown Local AI error"
             raise ValueError(
-                "Local AI failed every relationship decision; no vault changes were generated"
+                "Local AI failed every relationship decision; no vault changes were generated. "
+                f"Last error: {detail}"
             )
         self.db.execute(
             "UPDATE vault_sweeps SET recommendations = ?, updated_at = ? WHERE id = ?",
@@ -983,14 +996,15 @@ class ObsyncService:
                 details={"sweep_id": sweep_id},
             )
         except Exception as exc:
+            error = str(exc).strip() or f"{type(exc).__name__}: vault sweep stopped unexpectedly"
             self.db.execute(
                 "UPDATE vault_sweeps SET status = 'failed', error = ?, current_note = '', "
                 "finished_at = ?, updated_at = ? WHERE id = ?",
-                (str(exc)[:2000], utc_now(), utc_now(), sweep_id),
+                (error[:2000], utc_now(), utc_now(), sweep_id),
             )
             self.db.add_event(
                 "vault.sweep_failed",
-                f"Vault sweep failed: {exc}",
+                f"Vault sweep failed: {error}",
                 level="error",
                 details={"sweep_id": sweep_id},
             )
@@ -2893,16 +2907,18 @@ class ObsyncService:
     def _llm_config(self) -> LLMConfig:
         enabled = self.db.get_setting("llm_enabled", "false").lower() == "true"
         try:
-            timeout = int(self.db.get_setting("llm_timeout_seconds", "120"))
+            timeout = int(
+                self.db.get_setting("llm_timeout_seconds", str(DEFAULT_LLM_TIMEOUT_SECONDS))
+            )
         except ValueError:
-            timeout = 120
+            timeout = DEFAULT_LLM_TIMEOUT_SECONDS
         return LLMConfig(
             enabled=enabled,
             provider=self.db.get_setting("llm_provider", "ollama"),
             base_url=self.db.get_setting("llm_base_url", ""),
             model=self.db.get_setting("llm_model", ""),
             api_key=self.db.get_setting("llm_api_key", ""),
-            timeout_seconds=max(5, min(timeout, 600)),
+            timeout_seconds=max(MIN_LLM_TIMEOUT_SECONDS, min(timeout, MAX_LLM_TIMEOUT_SECONDS)),
             profile=self.active_ai_profile(),
         )
 
@@ -4241,6 +4257,7 @@ class ObsyncService:
             except ZoneInfoNotFoundError:
                 raise ValueError("Sweep timezone is invalid") from None
         numeric_ranges = {
+            "llm_timeout_seconds": (MIN_LLM_TIMEOUT_SECONDS, MAX_LLM_TIMEOUT_SECONDS),
             "vault_index_schedule_weekday": (0, 6),
             "vault_maintenance_schedule_weekday": (0, 6),
             "vault_index_schedule_month_day": (1, 28),
@@ -4313,5 +4330,8 @@ class ObsyncService:
                 config.api_key = str(key)
             if "llm_timeout_seconds" in overrides:
                 with suppress(TypeError, ValueError):
-                    config.timeout_seconds = max(5, min(int(overrides["llm_timeout_seconds"]), 600))
+                    config.timeout_seconds = max(
+                        MIN_LLM_TIMEOUT_SECONDS,
+                        min(int(overrides["llm_timeout_seconds"]), MAX_LLM_TIMEOUT_SECONDS),
+                    )
         return await LLMAnalyzer(config).test_connection()

@@ -6,8 +6,10 @@ import httpx
 import pytest
 
 from obsync.llm import (
+    DEFAULT_LLM_TIMEOUT_SECONDS,
     LLMAnalyzer,
     LLMConfig,
+    LLMRequestTimeoutError,
     _extract_json,
     _normalize_relationship_decision,
     fallback_analysis,
@@ -22,6 +24,11 @@ def test_fallback_analysis_uses_path_and_text() -> None:
     assert result.category == "Acme"
     assert "txt" in result.tags
     assert result.provider == "rules"
+
+
+def test_llm_timeout_defaults_to_ten_minutes() -> None:
+    assert DEFAULT_LLM_TIMEOUT_SECONDS == 600
+    assert LLMConfig().timeout_seconds == 600
 
 
 def test_fallback_analysis_bounds_long_preview_and_tag_count() -> None:
@@ -157,8 +164,9 @@ async def test_vault_model_accepts_vault_specific_patterns_without_fixed_categor
         )
     )
 
-    async def complete(_system, user):
+    async def complete(_system, user, *, operation):
         assert "Mycelium Specimen" in user
+        assert operation == "learning the adaptive vault model"
         return {
             "vault_summary": "A field-research vault organized by specimen and expedition.",
             "organization_principles": ["Specimen notes belong with their expedition."],
@@ -649,6 +657,57 @@ async def test_disabled_llm_connection_test() -> None:
     result = await LLMAnalyzer(LLMConfig()).test_connection()
     assert result["ok"] is False
     assert "disabled" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_vault_model_timeout_has_actionable_error(monkeypatch) -> None:
+    analyzer = LLMAnalyzer(
+        LLMConfig(
+            enabled=True,
+            provider="ollama",
+            base_url="http://ollama:11434",
+            model="slow-model",
+            timeout_seconds=600,
+        )
+    )
+
+    async def timeout(*_args, **_kwargs):
+        raise httpx.ReadTimeout("")
+
+    monkeypatch.setattr(analyzer, "_call_ollama", timeout)
+    with pytest.raises(
+        LLMRequestTimeoutError,
+        match="timed out after 600 seconds while learning the adaptive vault model",
+    ):
+        await analyzer.learn_vault_model(
+            [{"path": "One.md", "title": "One", "content": "# One\nFact."}]
+        )
+
+
+@pytest.mark.asyncio
+async def test_connection_timeout_never_returns_a_blank_error(monkeypatch) -> None:
+    class TimeoutClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            raise httpx.ReadTimeout("")
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *_args, **_kwargs: TimeoutClient())
+    result = await LLMAnalyzer(
+        LLMConfig(
+            enabled=True,
+            provider="ollama",
+            base_url="http://ollama:11434",
+            model="slow-model",
+        )
+    ).test_connection()
+
+    assert result["ok"] is False
+    assert result["message"].startswith("Connection check timed out after 15 seconds")
 
 
 @pytest.mark.asyncio

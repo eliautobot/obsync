@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from obsync.config import Settings
-from obsync.llm import LLMAnalyzer
+from obsync.llm import LLMAnalyzer, LLMRequestTimeoutError
 from obsync.service import ObsyncService, utc_now
 from obsync.vault_intelligence import (
     MAINTENANCE_END,
@@ -598,6 +598,24 @@ def test_v014_migration_supersedes_static_pending_changes_and_clamps_old_limit(
     assert service.db.get_setting("vault_link_limit") == "20"
 
 
+def test_v0151_migration_raises_only_the_legacy_default_ai_timeout(tmp_path: Path) -> None:
+    service = ObsyncService(
+        Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    )
+    service.db.set_settings({"llm_timeout_seconds": ("120", False)})
+    service.db.execute("UPDATE schema_meta SET version = 9")
+
+    service.db.initialize()
+
+    assert service.db.get_setting("llm_timeout_seconds") == "600"
+    assert service.db.query_one("SELECT version FROM schema_meta")["version"] == 10
+
+    service.db.set_settings({"llm_timeout_seconds": ("900", False)})
+    service.db.execute("UPDATE schema_meta SET version = 9")
+    service.db.initialize()
+    assert service.db.get_setting("llm_timeout_seconds") == "900"
+
+
 def test_review_feedback_changes_the_adaptive_vault_model_fingerprint(
     tmp_path: Path, adaptive_ai
 ) -> None:
@@ -678,6 +696,40 @@ async def test_vault_model_learning_failure_is_visible_and_not_cached(
     status = service.vault_model_status()
     assert status["status"] == "failed"
     assert status["error"] == "invalid learned model"
+
+
+@pytest.mark.asyncio
+async def test_maintenance_timeout_is_visible_in_model_and_sweep_errors(
+    tmp_path: Path, adaptive_ai, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = ObsyncService(
+        Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    )
+    adaptive_ai(service)
+    service.db.set_settings(
+        {
+            "vault_confirmed": ("true", False),
+            "llm_timeout_seconds": ("600", False),
+        }
+    )
+    write_note(service.settings.vault_path, "One.md", "# One\nConcrete fact.")
+
+    async def timeout(_self, _notes, *, feedback=None):
+        raise LLMRequestTimeoutError(
+            "Local AI timed out after 600 seconds while learning the adaptive vault model. "
+            "Increase Model timeout in Local AI settings."
+        )
+
+    monkeypatch.setattr(LLMAnalyzer, "learn_vault_model", timeout)
+    sweep = service.start_vault_sweep("maintenance", change_mode="review")
+    assert service._sweep_task is not None
+    await service._sweep_task
+
+    status = service.vault_sweep(sweep["id"])
+    assert status["status"] == "failed"
+    assert "timed out after 600 seconds" in status["error"]
+    assert "Local AI settings" in status["error"]
+    assert "timed out after 600 seconds" in service.vault_model_status()["error"]
 
 
 def test_relationship_feedback_ignores_malformed_history_and_model_json(

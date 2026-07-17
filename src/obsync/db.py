@@ -394,8 +394,10 @@ class Database:
                 connection.execute("ALTER TABLE enrollments ADD COLUMN agent_id TEXT")
             row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
-                connection.execute("INSERT INTO schema_meta(version) VALUES (9)")
-            elif int(row["version"]) < 9:
+                connection.execute("INSERT INTO schema_meta(version) VALUES (10)")
+            else:
+                schema_version = int(row["version"])
+            if row is not None and schema_version < 9:
                 connection.execute(
                     "UPDATE vault_changes SET status = 'superseded', reviewed_at = ?, "
                     "error = 'Superseded by the adaptive relationship engine; run a new "
@@ -408,6 +410,14 @@ class Database:
                     (utc_now(),),
                 )
                 connection.execute("UPDATE schema_meta SET version = 9")
+                schema_version = 9
+            if row is not None and schema_version < 10:
+                connection.execute(
+                    "UPDATE settings SET value = '600', updated_at = ? "
+                    "WHERE key = 'llm_timeout_seconds' AND value = '120'",
+                    (utc_now(),),
+                )
+                connection.execute("UPDATE schema_meta SET version = 10")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

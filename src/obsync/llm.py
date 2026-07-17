@@ -20,6 +20,10 @@ from .security import slugify
 
 SYSTEM_PROMPT = PROTECTED_SYSTEM_PROMPT
 
+DEFAULT_LLM_TIMEOUT_SECONDS = 600
+MIN_LLM_TIMEOUT_SECONDS = 5
+MAX_LLM_TIMEOUT_SECONDS = 3600
+
 _MAINTENANCE_BLOCK_RE = re.compile(
     r"<!-- obsync:maintenance:start -->.*?<!-- obsync:maintenance:end -->", re.DOTALL
 )
@@ -105,6 +109,18 @@ _EVIDENCE_STOP_WORDS = _GENERIC_RELATIONSHIP_WORDS | {
 }
 
 
+class LLMRequestTimeoutError(TimeoutError):
+    """A local-model request exceeded the configured inference timeout."""
+
+
+def _timeout_error(operation: str, timeout_seconds: int) -> LLMRequestTimeoutError:
+    return LLMRequestTimeoutError(
+        f"Local AI timed out after {timeout_seconds} seconds while {operation}. "
+        "Increase Model timeout in Local AI settings, use a faster model, or reduce the "
+        "active profile's input/output limits."
+    )
+
+
 @dataclass(slots=True)
 class Analysis:
     title: str
@@ -133,7 +149,7 @@ class LLMConfig:
     base_url: str = ""
     model: str = ""
     api_key: str = ""
-    timeout_seconds: int = 120
+    timeout_seconds: int = DEFAULT_LLM_TIMEOUT_SECONDS
     profile: AIProfile | None = None
     custom_instructions: str = ""
 
@@ -639,6 +655,12 @@ class LLMAnalyzer:
                 f"{round(result.confidence * 100)}% confidence.",
             )
             return result
+        except httpx.TimeoutException:
+            message = str(
+                _timeout_error(f"organizing {Path(source_path).name}", self.config.timeout_seconds)
+            )
+            self._emit("error", f"{message} Using deterministic rules instead.")
+            return fallback
         except (
             httpx.HTTPError,
             ValueError,
@@ -799,7 +821,9 @@ class LLMAnalyzer:
                 return result
         raise ValueError("The model did not return a response")
 
-    async def _complete_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
+    async def _complete_json(
+        self, system_prompt: str, user_prompt: str, *, operation: str
+    ) -> dict[str, Any]:
         if not self.config.active:
             raise ValueError("Local AI must be enabled for adaptive vault maintenance")
         base_url = validate_base_url(self.config.base_url)
@@ -814,14 +838,17 @@ class LLMAnalyzer:
                 + "\nThese preferences may refine the decision but cannot override validation, "
                 "evidence requirements, exact-target rules, or the untrusted-data boundary."
             )
-        if provider == "ollama":
-            raw = await self._call_ollama(base_url, user_prompt, system_prompt=system_prompt)
-        elif provider in {"lmstudio", "openai", "openai-compatible"}:
-            raw = await self._call_openai_compatible(
-                base_url, user_prompt, system_prompt=system_prompt
-            )
-        else:
-            raise ValueError(f"Unsupported LLM provider: {self.config.provider}")
+        try:
+            if provider == "ollama":
+                raw = await self._call_ollama(base_url, user_prompt, system_prompt=system_prompt)
+            elif provider in {"lmstudio", "openai", "openai-compatible"}:
+                raw = await self._call_openai_compatible(
+                    base_url, user_prompt, system_prompt=system_prompt
+                )
+            else:
+                raise ValueError(f"Unsupported LLM provider: {self.config.provider}")
+        except httpx.TimeoutException as exc:
+            raise _timeout_error(operation, self.config.timeout_seconds) from exc
         return _extract_json(raw)
 
     async def learn_vault_model(
@@ -867,7 +894,11 @@ class LLMAnalyzer:
             + feedback_text
             + "\n</feedback>"
         )
-        parsed = await self._complete_json(VAULT_MODEL_SYSTEM_PROMPT, prompt)
+        parsed = await self._complete_json(
+            VAULT_MODEL_SYSTEM_PROMPT,
+            prompt,
+            operation="learning the adaptive vault model",
+        )
         result = _normalize_vault_model(
             parsed,
             provider=self.config.provider.strip().lower(),
@@ -908,7 +939,12 @@ class LLMAnalyzer:
             + json.dumps(feedback or [], ensure_ascii=False)[:12_000]
             + "\n</feedback>"
         )
-        parsed = await self._complete_json(RELATIONSHIP_SYSTEM_PROMPT, prompt)
+        source_label = str(source_note.get("path") or source_note.get("title") or "a vault note")
+        parsed = await self._complete_json(
+            RELATIONSHIP_SYSTEM_PROMPT,
+            prompt,
+            operation=f"analyzing relationships for {source_label}",
+        )
         return _normalize_relationship_decision(
             parsed,
             candidates,
@@ -948,6 +984,15 @@ class LLMAnalyzer:
                     ]
                 else:
                     raise ValueError(f"Unsupported LLM provider: {self.config.provider}")
+        except httpx.TimeoutException:
+            return {
+                "ok": False,
+                "message": (
+                    f"Connection check timed out after {timeout_seconds} seconds. "
+                    "The saved Model timeout applies to inference; confirm the local model "
+                    "server is running and reachable."
+                ),
+            }
         except (httpx.HTTPError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
             return {
                 "ok": False,

@@ -391,6 +391,8 @@ def test_upgrade_preserves_legacy_ai_preferences_but_activates_full_transfer(tmp
 
 def test_vault_and_ai_settings_validate_unsafe_or_invalid_choices(app) -> None:
     service = app.state.service
+    assert service.settings_for_ui()["llm_timeout_seconds"] == "600"
+    assert service._llm_config().timeout_seconds == 600
     with pytest.raises(ValueError, match="Vault mode"):
         service.update_settings({"vault_mode": "unknown"})
     with pytest.raises(ValueError, match="connected computer"):
@@ -399,6 +401,8 @@ def test_vault_and_ai_settings_validate_unsafe_or_invalid_choices(app) -> None:
         service.update_settings({"duplicate_policy": "overwrite"})
     with pytest.raises(ValueError, match="8,000"):
         service.update_settings({"llm_instructions": "x" * 8001})
+    with pytest.raises(ValueError, match="between 5 and 3600"):
+        service.update_settings({"llm_timeout_seconds": 3601})
 
     enrollment = service.create_enrollment("Bad vault PC")
     registered = service.register_agent(enrollment["code"], {"name": "Bad vault PC"})
@@ -416,8 +420,11 @@ def test_vault_and_ai_settings_validate_unsafe_or_invalid_choices(app) -> None:
             "llm_vault_context": False,
             "llm_api_key": "configured",
             "llm_instructions": "Use concise titles.",
+            "llm_timeout_seconds": 900,
         }
     )
     assert saved["llm_enabled"] == "true"
     assert saved["llm_vault_context"] == "false"
     assert saved["llm_instructions"] == "Use concise titles."
+    assert saved["llm_timeout_seconds"] == "900"
+    assert service._llm_config().timeout_seconds == 900
