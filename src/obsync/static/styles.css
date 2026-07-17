@@ -288,7 +288,9 @@ tr:last-child td { border-bottom: 0; }
 .info-box { padding: 15px; border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border)); border-radius: 10px; background: var(--accent-soft); }
 .info-box strong { font-size: 13px; }
 .info-box p { margin: 5px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
-#ai-live-host { display: grid; gap: 18px; min-width: 0; overflow-anchor: none; }
+.ai-live-host { display: grid; gap: 18px; min-width: 0; overflow-anchor: none; }
+.sweep-ai-host { margin: 16px 0; }
+.sweep-ai-host .ai-live-card { box-shadow: none; }
 .ai-live-card { min-width: 0; padding: 0; overflow: hidden; }
 .ai-live-card.active { border-color: color-mix(in srgb, var(--accent) 42%, var(--border)); }
 .ai-live-head { display: flex; align-items: flex-start; gap: 16px; padding: 18px 20px; border-bottom: 1px solid var(--border); }

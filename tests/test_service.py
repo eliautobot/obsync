@@ -159,6 +159,62 @@ async def test_ai_activity_stream_pushes_each_inference_update_and_cleans_up(app
 
 
 @pytest.mark.asyncio
+async def test_ai_activity_stream_includes_live_and_last_sweep_inference(app) -> None:
+    service = app.state.service
+    stream = service.stream_ai_activity(keepalive_seconds=1)
+    initial = await anext(stream)
+    assert initial is not None
+
+    service._start_sweep_inference("sweep-live", "maintenance")
+    started = await asyncio.wait_for(anext(stream), timeout=1)
+    assert started is not None
+    session = started["sweeps"]["maintenance"]["active"][0]
+    assert session["document_id"] == "sweep:sweep-live"
+    assert session["cancellable"] is False
+
+    service._update_sweep_inference(
+        "sweep-live",
+        "reasoning",
+        "Reviewing this note against its candidate records.",
+        phase="relationships",
+        phase_label="Analyzing note 7 of 20",
+        current_note="Projects/Current.md",
+    )
+    updated = await asyncio.wait_for(anext(stream), timeout=1)
+    assert updated is not None
+    session = updated["sweeps"]["maintenance"]["active"][0]
+    assert session["current_note"] == "Projects/Current.md"
+    assert session["events"][-1]["kind"] == "reasoning"
+
+    service._finish_sweep_inference("sweep-live", outcome="stopped")
+    finished = await asyncio.wait_for(anext(stream), timeout=1)
+    assert finished is not None
+    maintenance = finished["sweeps"]["maintenance"]
+    assert maintenance["active"] == []
+    assert maintenance["last"]["outcome"] == "stopped"
+    await stream.aclose()
+    assert service.ai_activity_subscriber_count == 0
+
+
+def test_sweep_inference_trace_stays_bounded_under_rapid_updates(app) -> None:
+    service = app.state.service
+    service._start_sweep_inference("sweep-stress", "index")
+    for index in range(2_000):
+        service._update_sweep_inference(
+            "sweep-stress",
+            "stage" if index % 2 == 0 else "reasoning",
+            f"Update {index}: " + ("evidence " * 50),
+            current_note=f"Notes/{index}.md",
+        )
+
+    session = service.ai_activity()["sweeps"]["index"]["active"][0]
+    assert len(session["events"]) == 80
+    assert all(len(event["message"]) <= 20_000 for event in session["events"])
+    assert session["current_note"] == "Notes/1999.md"
+    service._finish_sweep_inference("sweep-stress", outcome="completed")
+
+
+@pytest.mark.asyncio
 async def test_gateway_stream_disconnect_stress_leaves_zero_subscribers(app) -> None:
     service = app.state.service
 

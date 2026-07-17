@@ -18,7 +18,7 @@ uv run coverage run -m pytest
 uv run coverage report
 ```
 
-The test suite covers local-only temporary Admin, remote and cross-site setup rejection, password hashing, account changes, first-run and legacy auth migration, sessions, CSRF, login throttling, device enrollment, concurrent idempotent pairing, pair/disconnect cleanup, native folder selection, source inventories, source-to-vault comparisons, layered existing-note adoption and in-place updates, local and remote vault writers, streamed whole-vault indexing, Index/Maintenance scheduling and interruption, reviewed and automatic maintenance writes, concurrent-edit rejection, rollback, large-vault ranking, Obsync Desktop installation/startup/stop/repair, global pipeline cancellation, independent AI cancellation, streamed model activity, authenticated activity events, repeated gateway subscriber cleanup, review approval/disregard/feedback-driven re-review, safe folder removal, path security, extractors, LLM normalization, generated-note preservation, updates, tombstones, rename identity, and UI delivery.
+The test suite covers local-only temporary Admin, remote and cross-site setup rejection, password hashing, account changes, first-run and legacy auth migration, sessions, CSRF, login throttling, device enrollment, concurrent idempotent pairing, pair/disconnect cleanup, native folder selection, source inventories, source-to-vault comparisons, layered existing-note adoption and in-place updates, local and remote vault writers, streamed whole-vault indexing, Index/Maintenance scheduling and interruption, live sweep inference traces, reviewed and automatic maintenance writes, concurrent-edit rejection, rollback, large-vault ranking, Obsync Desktop installation/startup/stop/repair, global pipeline cancellation, independent AI cancellation, streamed model activity, authenticated activity events, repeated gateway subscriber cleanup, review approval/disregard/feedback-driven re-review, safe folder removal, path security, extractors, LLM normalization, generated-note preservation, updates, tombstones, rename identity, and UI delivery.
 
 The CLI and windowed Desktop entry module are excluded from the aggregate coverage denominator because their process, Tk, and Windows-shell boundaries are validated through parser/unit tests, real Windows packaging, scheduled-task lifecycle checks, and launch smoke tests.
 
@@ -53,6 +53,7 @@ Use temporary directories for source, data, and vault:
 15. Exercise Approve, Disregard, and forced Redo AI review with feedback.
 16. Load a large document inventory and verify bounded panel scrolling, scroll retention across live refreshes, and no horizontal overflow at desktop or mobile widths.
 17. Stream rapid updates for two simultaneous AI documents; verify sub-second rendering, independent follow/manual-scroll state, return-to-live controls, stable page position, and zero subscriber/timer leaks after repeated reload and sign-out cycles.
+18. Run AI-assisted Index and Maintenance Sweeps; verify vault-model and per-note provider streams, decisions/errors, cooperative stop behavior, independent panel following, bounded traces, and index-only/waiting states.
 
 ## Release builds
 

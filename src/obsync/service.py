@@ -151,6 +151,8 @@ class ObsyncService:
         self._active_processing: dict[str, tuple[str, asyncio.Task[Any]]] = {}
         self._processing_activity: dict[str, dict[str, Any]] = {}
         self._last_inference: dict[str, Any] | None = None
+        self._sweep_inference_activity: dict[str, dict[str, Any]] = {}
+        self._last_sweep_inference: dict[str, dict[str, Any]] = {}
         self._ai_activity_revision = 0
         self._ai_activity_subscribers: set[asyncio.Queue[int]] = set()
         self._cancel_reasons: dict[str, str] = {}
@@ -662,6 +664,14 @@ class ObsyncService:
             except (TypeError, json.JSONDecodeError):
                 cached = {}
             if cached:
+                self._update_sweep_inference(
+                    sweep_id,
+                    "stage",
+                    "Using the current adaptive vault model because the indexed knowledge and "
+                    "review feedback have not changed.",
+                    phase="learning",
+                    phase_label="Loading adaptive vault model",
+                )
                 return cached, feedback
         now = utc_now()
         self.db.execute(
@@ -684,8 +694,32 @@ class ObsyncService:
             (now, sweep_id),
         )
         try:
-            model = await LLMAnalyzer(config).learn_vault_model(notes, feedback=feedback)
+            analyzer = LLMAnalyzer(
+                config,
+                progress=lambda kind, message: self._update_sweep_inference(
+                    sweep_id,
+                    kind,
+                    message,
+                    phase="learning",
+                    phase_label="Learning adaptive vault model",
+                ),
+            )
+            model = await analyzer.learn_vault_model(notes, feedback=feedback)
+            self._update_sweep_inference(
+                sweep_id,
+                "decision",
+                f"Learned the vault model from {len(notes)} indexed notes.",
+                phase="learning",
+                phase_label="Adaptive vault model ready",
+            )
         except Exception as exc:
+            self._update_sweep_inference(
+                sweep_id,
+                "error",
+                str(exc).strip() or type(exc).__name__,
+                phase="failed",
+                phase_label="Vault model learning failed",
+            )
             self.db.execute(
                 "UPDATE vault_models SET status = 'failed', error = ?, updated_at = ? "
                 "WHERE vault_key = ?",
@@ -708,6 +742,9 @@ class ObsyncService:
                 (utc_now(), sweep_id),
             )
             return []
+        sweep = self.db.query_one("SELECT sweep_type FROM vault_sweeps WHERE id = ?", (sweep_id,))
+        sweep_type = str(sweep.get("sweep_type") if sweep else "maintenance")
+        self._start_sweep_inference(sweep_id, sweep_type)
         try:
             maximum = max(1, min(int(self.db.get_setting("vault_link_limit", "20")), 50))
             candidate_limit = max(
@@ -734,7 +771,16 @@ class ObsyncService:
         change_ids: list[str] = []
         total = len(notes)
         vault_model, feedback = await self._learn_vault_model(notes, sweep_id)
-        analyzer = LLMAnalyzer(self._llm_config())
+        analyzer = LLMAnalyzer(
+            self._llm_config(),
+            progress=lambda kind, message: self._update_sweep_inference(
+                sweep_id,
+                kind,
+                message,
+                phase="relationships",
+                phase_label="Analyzing note relationships",
+            ),
+        )
         search_index = await asyncio.to_thread(AdaptiveVaultIndex, notes)
         failures = 0
         failure_messages: list[str] = []
@@ -746,6 +792,14 @@ class ObsyncService:
                 "UPDATE vault_sweeps SET total_notes = ?, processed_notes = ?, current_note = ?, "
                 "updated_at = ? WHERE id = ?",
                 (total, index, note["path"], utc_now(), sweep_id),
+            )
+            self._update_sweep_inference(
+                sweep_id,
+                "stage",
+                f"Analyzing note {index} of {total}: {note['path']}",
+                phase="relationships",
+                phase_label=f"Analyzing note {index} of {total}",
+                current_note=str(note["path"]),
             )
             if not ({"links", "tags"} & categories):
                 continue
@@ -771,6 +825,14 @@ class ObsyncService:
                 failures += 1
                 failure_message = str(exc).strip() or type(exc).__name__
                 failure_messages.append(failure_message)
+                self._update_sweep_inference(
+                    sweep_id,
+                    "error",
+                    f"Skipped {note['path']}: {failure_message}",
+                    phase="relationships",
+                    phase_label=f"Analyzing note {index} of {total}",
+                    current_note=str(note["path"]),
+                )
                 self.db.add_event(
                     "vault.relationship_decision_failed",
                     "Skipped "
@@ -781,6 +843,16 @@ class ObsyncService:
                 continue
             relationships = decision.get("relationships", []) if "links" in categories else []
             tags = decision.get("suggested_tags", []) if "tags" in categories else []
+            self._update_sweep_inference(
+                sweep_id,
+                "decision",
+                f"{note['path']}: {len(relationships)} evidence-backed relationship(s), "
+                f"{len(tags)} suggested tag(s). "
+                f"{str(decision.get('summary') or '').strip()}",
+                phase="relationships",
+                phase_label=f"Analyzing note {index} of {total}",
+                current_note=str(note["path"]),
+            )
             after = maintenance_content(
                 str(note.get("content", "")),
                 relationships,
@@ -834,6 +906,14 @@ class ObsyncService:
         self.db.execute(
             "UPDATE vault_sweeps SET recommendations = ?, updated_at = ? WHERE id = ?",
             (len(change_ids), utc_now(), sweep_id),
+        )
+        self._update_sweep_inference(
+            sweep_id,
+            "decision",
+            f"AI analysis finished with {len(change_ids)} recommendation(s) for Review or "
+            "automatic handling, according to the selected sweep mode.",
+            phase="complete",
+            phase_label="AI analysis complete",
         )
         return change_ids
 
@@ -997,6 +1077,13 @@ class ObsyncService:
             )
         except Exception as exc:
             error = str(exc).strip() or f"{type(exc).__name__}: vault sweep stopped unexpectedly"
+            self._update_sweep_inference(
+                sweep_id,
+                "error",
+                error,
+                phase="failed",
+                phase_label="Sweep AI analysis failed",
+            )
             self.db.execute(
                 "UPDATE vault_sweeps SET status = 'failed', error = ?, current_note = '', "
                 "finished_at = ?, updated_at = ? WHERE id = ?",
@@ -1009,6 +1096,13 @@ class ObsyncService:
                 details={"sweep_id": sweep_id},
             )
         finally:
+            finished = self.db.query_one(
+                "SELECT status FROM vault_sweeps WHERE id = ?", (sweep_id,)
+            )
+            self._finish_sweep_inference(
+                sweep_id,
+                outcome=str(finished.get("status") if finished else "unknown"),
+            )
             if self._sweep_task is asyncio.current_task():
                 self._sweep_task = None
 
@@ -1076,6 +1170,14 @@ class ObsyncService:
         if not sweep:
             return {"ok": True, "stopped": False}
         self._sweep_stop.set()
+        self._update_sweep_inference(
+            str(sweep["id"]),
+            "stage",
+            "Stop requested. The current model request will finish or time out; no additional "
+            "notes will be analyzed afterward.",
+            phase="stopping",
+            phase_label="Stopping sweep safely",
+        )
         now = utc_now()
         self.db.execute(
             "UPDATE vault_sweeps SET status = 'stopping', updated_at = ? WHERE id = ?",
@@ -1416,7 +1518,7 @@ class ObsyncService:
         result["elapsed_seconds"] = self._elapsed_seconds(
             str(activity.get("started_at", "")), str(activity.get("finished_at", ""))
         )
-        result["cancellable"] = bool(activity.get("ai_active"))
+        result["cancellable"] = bool(activity.get("cancellable", activity.get("ai_active")))
         return result
 
     def active_work(self) -> list[dict[str, Any]]:
@@ -1431,9 +1533,24 @@ class ObsyncService:
             if item.get("used_ai")
         ]
         active.sort(key=lambda item: str(item.get("started_at", "")))
+        sweeps: dict[str, dict[str, Any]] = {}
+        for sweep_type in ("index", "maintenance"):
+            sweep_active = [
+                self._public_activity(item)
+                for item in self._sweep_inference_activity.values()
+                if item.get("sweep_type") == sweep_type
+            ]
+            sweep_active.sort(key=lambda item: str(item.get("started_at", "")))
+            sweeps[sweep_type] = {
+                "active": sweep_active,
+                "last": dict(self._last_sweep_inference[sweep_type])
+                if sweep_type in self._last_sweep_inference
+                else None,
+            }
         return {
             "active": active,
             "last": dict(self._last_inference) if self._last_inference else None,
+            "sweeps": sweeps,
             "provider": self.db.get_setting("llm_provider", "ollama"),
             "model": self.db.get_setting("llm_model", ""),
             "profile_id": profile.id,
@@ -1549,6 +1666,87 @@ class ObsyncService:
         if activity.get("used_ai"):
             self._last_inference = self._public_activity(activity)
             self._notify_ai_activity()
+
+    def _start_sweep_inference(self, sweep_id: str, sweep_type: str) -> None:
+        config = self._llm_config()
+        now = utc_now()
+        label = "Index Sweep" if sweep_type == "index" else "Maintenance Sweep"
+        self._sweep_inference_activity[sweep_id] = {
+            "document_id": f"sweep:{sweep_id}",
+            "activity_kind": "sweep",
+            "sweep_id": sweep_id,
+            "sweep_type": sweep_type,
+            "source_name": label,
+            "source_path": "Preparing AI-assisted vault analysis",
+            "agent_name": "Whole vault",
+            "root_name": "Obsidian intelligence",
+            "phase": "preparing",
+            "phase_label": "Preparing AI analysis",
+            "started_at": now,
+            "updated_at": now,
+            "provider": config.provider,
+            "model": config.model,
+            "profile_id": config.active_profile.id,
+            "profile_name": config.active_profile.name,
+            "events": [
+                {
+                    "kind": "stage",
+                    "message": f"Starting AI-assisted {label} analysis.",
+                    "created_at": now,
+                }
+            ],
+            "used_ai": True,
+            "ai_active": True,
+            "cancellable": False,
+        }
+        self._notify_ai_activity()
+
+    def _update_sweep_inference(
+        self,
+        sweep_id: str,
+        kind: str,
+        message: str,
+        *,
+        phase: str = "",
+        phase_label: str = "",
+        current_note: str = "",
+    ) -> None:
+        activity = self._sweep_inference_activity.get(sweep_id)
+        if not activity:
+            return
+        now = utc_now()
+        raw = str(message)
+        clean = raw if kind in {"reasoning", "output"} else raw.strip()
+        if clean:
+            events = activity["events"]
+            if kind in {"reasoning", "output"} and events and events[-1]["kind"] == kind:
+                events[-1]["message"] = (events[-1]["message"] + clean)[-20000:]
+                events[-1]["created_at"] = now
+            else:
+                events.append({"kind": kind, "message": clean[:20000], "created_at": now})
+            activity["events"] = events[-80:]
+        if phase:
+            activity["phase"] = phase
+        if phase_label:
+            activity["phase_label"] = phase_label
+        if current_note:
+            activity["source_path"] = current_note
+            activity["current_note"] = current_note
+        activity["updated_at"] = now
+        self._notify_ai_activity()
+
+    def _finish_sweep_inference(self, sweep_id: str, *, outcome: str) -> None:
+        activity = self._sweep_inference_activity.get(sweep_id)
+        if not activity:
+            return
+        activity["ai_active"] = False
+        activity["outcome"] = outcome
+        activity["finished_at"] = utc_now()
+        activity["updated_at"] = activity["finished_at"]
+        sweep_type = str(activity.get("sweep_type", "maintenance"))
+        self._last_sweep_inference[sweep_type] = self._public_activity(activity)
+        self._sweep_inference_activity.pop(sweep_id, None)
+        self._notify_ai_activity()
 
     def stop_inference(self, document_id: str = "") -> dict[str, Any]:
         stopped: list[str] = []

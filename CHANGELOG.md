@@ -2,6 +2,27 @@
 
 All notable changes to Obsync will be documented here.
 
+## 0.16.0 - 2026-07-17
+
+### Added
+
+- Added live model inference panels directly beneath the Index Sweep and Maintenance Sweep controls
+- Added streamed provider reasoning, model output, Obsync processing stages, validated decisions, errors, current note, provider/model, AI profile, and elapsed time to sweep activity
+- Added independent follow-latest behavior, manual-scroll takeover, and return-to-live controls to each sweep trace
+- Preserved the most recent Index and Maintenance Sweep AI session after completion, failure, or a safe stop
+
+### Changed
+
+- Sweep inference updates now use the same authenticated server-sent event stream and read-only trace component as ordinary Local AI document processing
+- Index-only sweeps explicitly report that no AI is used, while AI-assisted sweeps distinguish indexing from the later model-analysis phase
+- **Stop Sweep** remains the single safe cancellation control; the live inference panel explains that the current model request may finish or time out before the sweep stops
+
+### Validation
+
+- Added API, activity-stream, completion, stop, provider-output, decision, and browser rendering coverage for Index and Maintenance Sweep inference
+- Added a 2,000-update trace stress test verifying bounded memory and event sizes
+- Verified independent trace following and narrow/mobile layout without horizontal overflow
+
 ## 0.15.1 - 2026-07-17
 
 ### Changed

@@ -25,7 +25,7 @@ The source stays untouched. Obsync is not a copy-for-copy file mirror; it is a l
 - Indexes the complete Markdown vault—content, folders, headings, aliases, properties, tags, links, backlinks, entities, and stable record identifiers—for whole-vault matching
 - Updates a matching existing note in place instead of creating a duplicate, while preserving the original note and later manual additions
 - Learns each vault's own organization model and adds only evidence-backed, materially relevant relationships—never links based on a shared word or document type alone
-- Runs manual or scheduled Index and Maintenance Sweeps with live progress, safe Stop, Review/automatic modes, complete diffs, and Undo Sweep
+- Runs manual or scheduled Index and Maintenance Sweeps with live model reasoning/output, progress, safe Stop, Review/automatic modes, complete diffs, and Undo Sweep
 - Falls back to deterministic rules whenever the LLM is unavailable
 - Generates Obsidian properties, summaries, tags, categories, and `[[wikilinks]]`
 - Preserves everything written below the generated note's **My notes** heading
@@ -147,12 +147,12 @@ Update Python-based desktop agents to the same release as the server, then verif
 
 ```bash
 python -m pip install --upgrade \
-  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.15.0"
+  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.16.0"
 obsync --version
 obsync agent scan
 ```
 
-Replace `v0.15.0` with the release you are installing. For Windows, use **Sources → Add another computer → Download Obsync Desktop**, right-click it, choose **Run as administrator**, and then choose **Connect and install**. Elevation is required only for setup; the watcher runs with limited permissions and no visible terminal. Command-line Windows and Linux agents remain available for advanced installations.
+Replace `v0.16.0` with the release you are installing. For Windows, use **Sources → Add another computer → Download Obsync Desktop**, right-click it, choose **Run as administrator**, and then choose **Connect and install**. Elevation is required only for setup; the watcher runs with limited permissions and no visible terminal. Command-line Windows and Linux agents remain available for advanced installations.
 
 Before any update, back up the Obsidian vault and Obsync `/data` volume. The full [Updating and rollback guide](docs/UPDATING.md) includes copy-and-paste backup commands for Linux and Windows, fixed-version installs, every agent type, verification, and safe rollback instructions.
 
@@ -260,6 +260,8 @@ If an ordinary destination is not a verified exact match or an explicitly approv
 - [Supported files](docs/SUPPORTED_FILES.md)
 - [Security model](docs/SECURITY.md)
 - [Development and testing](docs/DEVELOPMENT.md)
+- [v0.16.0 release notes](docs/releases/v0.16.0.md)
+- [v0.15.1 release notes](docs/releases/v0.15.1.md)
 - [v0.15.0 release notes](docs/releases/v0.15.0.md)
 - [v0.14.0 release notes](docs/releases/v0.14.0.md)
 - [v0.13.1 release notes](docs/releases/v0.13.1.md)

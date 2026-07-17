@@ -22,6 +22,7 @@ const state = {
   aiFollow: new Map(),
   aiScrollPositions: new Map(),
   aiScrollTimers: new Map(),
+  vaultSweeps: null,
 };
 
 function captureScrollState() {
@@ -394,6 +395,7 @@ function startAiActivityStream() {
       state.aiStreamRevision = revision;
       state.aiActivity = activity;
       if (state.view === "local-ai") updateAiActivity(activity);
+      if (state.view === "vault") updateSweepAiActivities(activity);
     } catch (_error) {
       // Ignore a malformed event. EventSource keeps the last valid activity visible.
     }
@@ -1188,10 +1190,14 @@ function sweepFailure(recent, type) {
 }
 
 async function renderVault() {
-  const [settings, agentData, sweeps] = await Promise.all([
+  const [settings, agentData, sweeps, activity] = await Promise.all([
     api("/api/v1/admin/settings"), api("/api/v1/admin/agents"), api("/api/v1/admin/vault/sweeps"),
+    api("/api/v1/admin/ai/activity"),
   ]);
   state.agents = agentData.items;
+  state.vaultSweeps = sweeps;
+  state.aiActivity = activity;
+  state.aiStreamRevision = Math.max(state.aiStreamRevision, Number(activity.revision || 0));
   const vaultMode = settings.vault_mode || "local";
   const confirmed = settings.vault_confirmed === "true";
   const vaultOptions = state.agents.map((agent) => `<option value="${agent.id}" ${agent.id === settings.vault_agent_id ? "selected" : ""}>${escapeHtml(agent.name)} — ${agent.status}${agent.vault_ready ? ` — ${escapeHtml(agent.vault_path)}` : ""}</option>`).join("");
@@ -1226,12 +1232,14 @@ async function renderVault() {
       <section class="settings-card full-width sweep-overview"><div class="section-head"><div><span class="eyebrow">WHOLE-VAULT INTELLIGENCE</span><h3>Vault index</h3><p>Vault cache: <strong>${sweeps.indexed_notes}</strong> Markdown notes. Last successful Index Sweep: <strong>${sweeps.last_indexed_at ? relativeTime(sweeps.last_indexed_at) : "Never"}</strong>.</p></div><div class="settings-actions compact"><button class="secondary start-sweep" data-type="index" type="button">Start Index Sweep</button><button class="quiet start-sweep" data-type="index" data-full="true" type="button">Rebuild Whole Index</button></div></div>
         ${sweepProgress(sweeps.active, "index")}
         ${sweepFailure(sweeps.recent, "index")}
+        <div class="sweep-ai-host ai-live-host" data-ai-live-host data-sweep-ai-host="index">${aiActivityMarkup(sweepAiActivity(activity, "index", sweeps.active))}</div>
         <div class="field"><label for="vault-index-change-mode">Index sweep changes</label><select id="vault-index-change-mode"><option value="index-only">Index only — do not recommend changes</option><option value="review">Send all recommended changes to Review</option><option value="auto">Allow AI Agent to apply all recommended changes</option></select><small class="danger-copy">Automatic mode can change existing entries without human approval. Every change is logged and can be undone.</small></div>
         ${sweepScheduleFields("vault-index", settings)}
       </section>
       <section class="settings-card full-width sweep-overview"><div class="section-head"><div><span class="eyebrow">ACTIVE VAULT CARE</span><h3>Maintenance Sweep</h3><p>Uses Local AI and this vault's learned organization model to recommend only specific, evidence-backed relationships and tags. Retrieval similarity alone can never create a link.</p></div><div class="settings-actions compact"><button class="secondary start-sweep" data-type="maintenance" type="button">Start Maintenance Sweep</button></div></div>
         ${sweepProgress(sweeps.active, "maintenance")}
         ${sweepFailure(sweeps.recent, "maintenance")}
+        <div class="sweep-ai-host ai-live-host" data-ai-live-host data-sweep-ai-host="maintenance">${aiActivityMarkup(sweepAiActivity(activity, "maintenance", sweeps.active))}</div>
         <div class="field"><label for="vault-maintenance-change-mode">Maintenance sweep changes</label><select id="vault-maintenance-change-mode"><option value="review">Send all recommended changes to Review</option><option value="auto">Allow AI Agent to apply all recommended changes</option></select><small class="danger-copy">Warning: automatic mode may modify existing notes, links, tags, and organization without human approval.</small></div>
         <div class="behavior-grid maintenance-categories">
           ${[["links", "Relationship links and backlinks"], ["tags", "Shared relationship tags"]].map(([value, label]) => `<label class="check-row"><input class="maintenance-category" type="checkbox" value="${value}"> ${label}</label>`).join("")}
@@ -1243,6 +1251,9 @@ async function renderVault() {
       <section class="settings-card full-width"><h3>Sweep history and rollback</h3>${recentSweeps ? `<div class="table-wrap sweep-history"><table><thead><tr><th>Type</th><th>Status</th><th>Notes</th><th>Recommendations</th><th>Applied</th><th>Finished</th><th>Rollback</th></tr></thead><tbody>${recentSweeps}</tbody></table></div>` : '<p class="inline-status">No vault sweeps have run yet.</p>'}</section>
       <section class="settings-card"><h3>Vault safety</h3><p>Obsync never writes inside <code>.obsidian</code>. Document adoption preserves the entire prior note outside the managed section. Sweeps use expected hashes, stop on concurrent edits, keep before/after content, and never auto-delete or auto-merge notes.</p></section>
     </form>`;
+  wireAiActivityControls();
+  initializeAiActivityPanels();
+  pruneAiPanelState($$("[data-ai-session-id]").map((card) => card.dataset.aiSessionId));
   const updateVaultMode = () => {
     const mode = $('input[name="vault-mode"]:checked').value;
     $("#local-vault-settings").hidden = mode !== "local";
@@ -1327,6 +1338,33 @@ function aiSessions(activity) {
   return activity.active?.length ? activity.active : activity.last ? [activity.last] : [];
 }
 
+function sweepAiActivity(activity, type, activeSweep) {
+  const source = activity?.sweeps?.[type] || { active: [], last: null };
+  const matching = activeSweep?.sweep_type === type ? activeSweep : null;
+  const isIndexOnly = type === "index" && matching?.change_mode === "index-only";
+  const active = isIndexOnly ? [] : (source.active || []);
+  const waitingForAi = Boolean(matching && !isIndexOnly && !active.length);
+  return {
+    ...source,
+    active,
+    last: matching ? null : source.last,
+    provider: activity?.provider || "",
+    model: activity?.model || "",
+    profile_id: activity?.profile_id || "",
+    profile_name: activity?.profile_name || "",
+    scope: "sweep",
+    sweep_type: type,
+    idle_title: isIndexOnly
+      ? "Index-only sweep does not use AI"
+      : waitingForAi ? "Waiting for the AI phase" : `No ${type} sweep inference is active`,
+    idle_message: isIndexOnly
+      ? "This sweep only refreshes the vault index. Choose Review or automatic changes before starting an Index Sweep to run Local AI inference."
+      : waitingForAi
+        ? "Obsync is indexing the vault first. Live model thinking and output will appear here when AI analysis begins."
+        : `Start an AI-assisted ${type === "index" ? "Index" : "Maintenance"} Sweep to follow model thinking, streamed output, and validated decisions here.`,
+  };
+}
+
 function aiSessionIsActive(activity, documentId) {
   return Boolean((activity.active || []).find((item) => item.document_id === documentId));
 }
@@ -1348,7 +1386,14 @@ function aiTraceMarkup(session) {
 }
 
 function aiSessionHeadMarkup(session, isActive) {
-  return `<div><span class="eyebrow">${isActive ? "LIVE AI SESSION" : "LAST AI SESSION"}</span><h3>${escapeHtml(session.source_name)}</h3><p title="${escapeHtml(session.source_path)}">${escapeHtml(session.agent_name)} · ${escapeHtml(session.root_name)} · ${escapeHtml(session.source_path)}</p></div><span class="status-pill ${isActive ? "" : "offline"}">${isActive ? "working" : escapeHtml(session.outcome || "finished")}</span>`;
+  const sweep = session.activity_kind === "sweep";
+  const eyebrow = sweep
+    ? `${isActive ? "LIVE" : "LAST"} ${String(session.sweep_type || "VAULT").toUpperCase()} SWEEP AI`
+    : `${isActive ? "LIVE" : "LAST"} AI SESSION`;
+  const details = sweep
+    ? `${session.phase_label || session.phase || "AI analysis"} · ${session.current_note || session.source_path || "Whole vault"}`
+    : `${session.agent_name} · ${session.root_name} · ${session.source_path}`;
+  return `<div><span class="eyebrow">${escapeHtml(eyebrow)}</span><h3>${escapeHtml(session.source_name)}</h3><p title="${escapeHtml(session.source_path)}">${escapeHtml(details)}</p></div><span class="status-pill ${isActive ? "" : "offline"}">${isActive ? "working" : escapeHtml(session.outcome || "finished")}</span>`;
 }
 
 function aiSessionMetaMarkup(session, activity) {
@@ -1356,13 +1401,16 @@ function aiSessionMetaMarkup(session, activity) {
 }
 
 function aiSessionActionsMarkup(session, isActive) {
-  return `<small>This is a read-only view of model-emitted activity and Obsync's processing stages.</small>${isActive && session.cancellable ? `<button class="danger stop-inference" type="button" data-document="${escapeHtml(session.document_id)}">Stop inference</button>` : ""}`;
+  const sweepText = session.activity_kind === "sweep"
+    ? "This is a read-only live view. Use Stop Sweep above to stop safely after the current model request."
+    : "This is a read-only view of model-emitted activity and Obsync's processing stages.";
+  return `<small>${sweepText}</small>${isActive && session.cancellable ? `<button class="danger stop-inference" type="button" data-document="${escapeHtml(session.document_id)}">Stop inference</button>` : ""}`;
 }
 
 function aiActivityMarkup(activity) {
   const sessions = aiSessions(activity);
   if (!sessions.length) {
-    return `<section class="settings-card ai-live-card"><div class="ai-live-head"><div><span class="eyebrow">LIVE AI SESSION</span><h3>Local AI is idle</h3></div><span class="status-pill offline">idle</span></div><div class="ai-idle"><span>✦</span><p>No model inference is active. Start a folder sync or request a re-review to see the file, model activity, streamed response, and decision here.</p></div></section>`;
+    return `<section class="settings-card ai-live-card"><div class="ai-live-head"><div><span class="eyebrow">LIVE AI SESSION</span><h3>${escapeHtml(activity.idle_title || "Local AI is idle")}</h3></div><span class="status-pill offline">idle</span></div><div class="ai-idle"><span>✦</span><p>${escapeHtml(activity.idle_message || "No model inference is active. Start a folder sync or request a re-review to see the file, model activity, streamed response, and decision here.")}</p></div></section>`;
   }
   return sessions.map((session) => {
     const isActive = aiSessionIsActive(activity, session.document_id);
@@ -1379,9 +1427,7 @@ function aiActivityMarkup(activity) {
 }
 
 function updateAiJumpButton(documentId) {
-  const host = $("#ai-live-host");
-  if (!host) return;
-  $$(".ai-jump-latest", host).forEach((button) => {
+  $$(".ai-jump-latest").forEach((button) => {
     if (button.dataset.document === documentId) button.hidden = state.aiFollow.get(documentId) !== false;
   });
 }
@@ -1425,10 +1471,8 @@ function wireAiTrace(trace) {
   }, { passive: true });
 }
 
-function initializeAiActivityPanels() {
-  const host = $("#ai-live-host");
-  if (!host) return;
-  $$(".ai-trace", host).forEach((trace) => {
+function initializeAiActivityPanels(root = document) {
+  $$("[data-ai-live-host] .ai-trace", root).forEach((trace) => {
     const documentId = trace.dataset.document;
     wireAiTrace(trace);
     if (!state.aiFollow.has(documentId)) state.aiFollow.set(documentId, true);
@@ -1482,10 +1526,14 @@ function updateAiActivity(activity) {
   state.aiActivity = activity;
   const host = $("#ai-live-host");
   if (!host) return;
+  updateAiActivityHost(host, activity);
+  pruneAiPanelState(aiSessions(activity).map((session) => String(session.document_id)));
+}
+
+function updateAiActivityHost(host, activity) {
   const sessions = aiSessions(activity);
   const currentIds = $$("[data-ai-session-id]", host).map((card) => card.dataset.aiSessionId);
   const nextIds = sessions.map((session) => String(session.document_id));
-  pruneAiPanelState(nextIds);
   if (currentIds.join("\u0000") !== nextIds.join("\u0000")) {
     host.innerHTML = aiActivityMarkup(activity);
     initializeAiActivityPanels();
@@ -1503,11 +1551,21 @@ function updateAiActivity(activity) {
   });
 }
 
+function updateSweepAiActivities(activity) {
+  state.aiActivity = activity;
+  ["index", "maintenance"].forEach((type) => {
+    const host = $(`[data-sweep-ai-host="${type}"]`);
+    if (!host) return;
+    updateAiActivityHost(host, sweepAiActivity(activity, type, state.vaultSweeps?.active));
+  });
+  pruneAiPanelState($$("[data-ai-session-id]").map((card) => card.dataset.aiSessionId));
+}
+
 function wireAiActivityControls() {
-  const host = $("#ai-live-host");
-  if (!host || host.dataset.controlsWired === "true") return;
-  host.dataset.controlsWired = "true";
-  host.addEventListener("click", async (event) => {
+  $$("[data-ai-live-host]").forEach((host) => {
+    if (host.dataset.controlsWired === "true") return;
+    host.dataset.controlsWired = "true";
+    host.addEventListener("click", async (event) => {
     const jumpButton = event.target.closest(".ai-jump-latest");
     if (jumpButton) {
       const trace = $(`.ai-trace[data-document="${CSS.escape(jumpButton.dataset.document)}"]`, host);
@@ -1524,14 +1582,16 @@ function wireAiActivityControls() {
       await refreshAiActivity();
       await refreshReviewBadge();
     } catch (error) { toast(error.message, true); button.disabled = false; button.textContent = "Stop inference"; }
+    });
   });
 }
 
 async function refreshAiActivity() {
-  if (!$("#ai-live-host")) return;
+  if (!$("[data-ai-live-host]")) return;
   const activity = await api("/api/v1/admin/ai/activity");
   state.aiStreamRevision = Math.max(state.aiStreamRevision, Number(activity.revision || 0));
-  updateAiActivity(activity);
+  if (state.view === "vault") updateSweepAiActivities(activity);
+  else updateAiActivity(activity);
 }
 
 function aiProfileCard(profile, activeId, selectedId) {
@@ -1627,7 +1687,7 @@ async function renderLocalAI() {
   state.aiStreamRevision = Math.max(state.aiStreamRevision, Number(activity.revision || 0));
   pruneAiPanelState(aiSessions(activity).map((session) => String(session.document_id)));
   const profileCards = profiles.items.map((profile) => aiProfileCard(profile, profiles.active_profile_id, selectedProfile.id)).join("");
-  $("#content").innerHTML = `<div class="settings-layout"><div id="ai-live-host">${aiActivityMarkup(activity)}</div>
+  $("#content").innerHTML = `<div class="settings-layout"><div id="ai-live-host" class="ai-live-host" data-ai-live-host>${aiActivityMarkup(activity)}</div>
     <section class="settings-card"><div class="section-head compact"><div><h3>${headingWithHelp("AI profiles", "The active profile controls the role, prompt template, note content, inference parameters, and Obsidian behaviors.")}</h3><p>Choose a protected default or copy one into a fully editable custom profile.</p></div><button class="primary" type="button" id="new-ai-profile">+ New custom from active</button></div><div class="ai-profile-grid">${profileCards}</div></section>
     ${profileEditorMarkup(selectedProfile, profiles)}
     <form class="settings-layout" id="ai-settings-form">

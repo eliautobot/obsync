@@ -44,6 +44,7 @@ Obsync is a one-way, continuously reconciled knowledge pipeline from arbitrary f
 - Adaptive per-vault Local AI organization models with no compiled business taxonomy or folder convention
 - Corpus-adaptive candidate retrieval separated from relationship decisions, so similarity alone never creates a link
 - Evidence-gated links requiring an exact target, specific relationship, grounded source/target facts, configurable confidence, and a safety ceiling up to 50
+- Live Index and Maintenance Sweep inference panels with streamed provider reasoning/output, processing stages, validated decisions, errors, current-note context, and independent follow-latest controls
 
 ## Obsidian output
 
@@ -82,7 +83,7 @@ Ordinary existing notes may be adopted after an exact match or explicit review. 
 - Error retry commands
 - Complete review workflow with Approve, Disregard, feedback-driven Redo AI review, and explicit separate-note creation for possible duplicates
 - Combined Review queue for document decisions and whole-vault recommendations, with relationship descriptions, source/target evidence, confidence, before/after diffs, and individual or bulk approval
-- Manual and scheduled Index and Maintenance Sweeps with live progress, safe Stop, daily/weekly/monthly/custom timing, review/automatic modes, audit history, concurrent-edit protection, and Undo Sweep
+- Manual and scheduled Index and Maintenance Sweeps with live progress and model inference, safe Stop, daily/weekly/monthly/custom timing, review/automatic modes, audit history, concurrent-edit protection, and Undo Sweep
 - Complete Local AI connection, profile, prompt, parameter, and Obsidian behavior configuration
 - Fast model discovery that does not start inference
 - Automatic server computer plus optional paired desktops

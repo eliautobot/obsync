@@ -127,6 +127,12 @@ def test_ui_includes_guided_help_and_obsync_desktop(client: TestClient) -> None:
     assert "state.aiEventSource.close()" in app_js
     assert 'window.addEventListener("pagehide", stopLiveUpdates)' in app_js
     assert 'if (state.view === "local-ai") updateAiActivity(activity)' in app_js
+    assert 'if (state.view === "vault") updateSweepAiActivities(activity)' in app_js
+    assert 'data-sweep-ai-host="index"' in app_js
+    assert 'data-sweep-ai-host="maintenance"' in app_js
+    assert "MODEL THINKING" in app_js
+    assert "Waiting for the AI phase" in app_js
+    assert "Index-only sweep does not use AI" in app_js
     assert "await refreshAiActivity();\n    } else if" not in app_js
     assert "ai-jump-latest" in app_js
     assert "state.aiFollow" in app_js
@@ -144,6 +150,7 @@ def test_ui_includes_guided_help_and_obsync_desktop(client: TestClient) -> None:
     assert "overflow-anchor: none" in styles
     assert "backdrop-filter: blur(3px)" not in styles
     assert ".sweep-progress" in styles
+    assert ".sweep-ai-host" in styles
     assert ".diff-grid" in styles
 
 

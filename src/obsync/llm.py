@@ -919,6 +919,11 @@ class LLMAnalyzer:
         maximum_links: int,
         feedback: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        source_label = str(source_note.get("path") or source_note.get("title") or "a vault note")
+        self._emit(
+            "stage",
+            f"Comparing {source_label} with {len(candidates)} retrieved candidate note(s).",
+        )
         source = {
             "path": str(source_note.get("path", "")),
             "title": str(source_note.get("title", "")),
@@ -939,19 +944,24 @@ class LLMAnalyzer:
             + json.dumps(feedback or [], ensure_ascii=False)[:12_000]
             + "\n</feedback>"
         )
-        source_label = str(source_note.get("path") or source_note.get("title") or "a vault note")
         parsed = await self._complete_json(
             RELATIONSHIP_SYSTEM_PROMPT,
             prompt,
             operation=f"analyzing relationships for {source_label}",
         )
-        return _normalize_relationship_decision(
+        result = _normalize_relationship_decision(
             parsed,
             candidates,
             minimum_confidence=max(0.0, min(1.0, minimum_confidence)),
             maximum_links=max(0, min(maximum_links, 50)),
             source_note=source_note,
         )
+        self._emit(
+            "decision",
+            f"Validated {len(result['relationships'])} evidence-backed relationship(s) and "
+            f"{len(result['suggested_tags'])} suggested tag(s) for {source_label}.",
+        )
+        return result
 
     async def test_connection(self) -> dict[str, Any]:
         provider = self.config.provider.strip().lower()

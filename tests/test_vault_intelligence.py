@@ -295,6 +295,71 @@ async def test_index_and_maintenance_sweeps_apply_review_and_undo(
 
 
 @pytest.mark.asyncio
+async def test_maintenance_sweep_streams_model_thinking_output_and_decisions(
+    tmp_path: Path, adaptive_ai, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    service = ObsyncService(settings)
+    adaptive_ai(service)
+    service.db.set_settings({"vault_confirmed": ("true", False)})
+    write_note(settings.vault_path, "Companies/Example.md", "# Example\n\nNamed company record.")
+
+    async def learn(analyzer, notes, *, feedback=None):
+        analyzer._emit("reasoning", "I am learning the observed vault structure.")
+        analyzer._emit("output", '{"vault_summary":"Example vault"}')
+        return {
+            "vault_summary": "Example vault",
+            "confidence": 0.9,
+            "provider": "ollama",
+            "model": "test-model",
+            "note_count": len(notes),
+        }
+
+    async def adjudicate(
+        analyzer,
+        source_note,
+        candidates,
+        *,
+        vault_model,
+        minimum_confidence,
+        maximum_links,
+        feedback=None,
+    ):
+        analyzer._emit("reasoning", f"Checking evidence for {source_note['path']}.")
+        analyzer._emit("output", '{"relationships":[]}')
+        return {
+            "source_category": "",
+            "source_role": "company record",
+            "summary": "No supported cross-note relationships.",
+            "suggested_tags": [],
+            "relationships": [],
+        }
+
+    monkeypatch.setattr(LLMAnalyzer, "learn_vault_model", learn)
+    monkeypatch.setattr(LLMAnalyzer, "adjudicate_relationships", adjudicate)
+
+    sweep = service.start_vault_sweep("maintenance", change_mode="review")
+    assert service._sweep_task is not None
+    await service._sweep_task
+
+    activity = service.ai_activity()
+    maintenance = activity["sweeps"]["maintenance"]
+    session = maintenance["last"]
+    assert maintenance["active"] == []
+    assert session["sweep_id"] == sweep["id"]
+    assert session["activity_kind"] == "sweep"
+    assert session["outcome"] == "completed"
+    assert session["cancellable"] is False
+    assert session["current_note"] == "Companies/Example.md"
+    event_kinds = [event["kind"] for event in session["events"]]
+    event_text = "\n".join(event["message"] for event in session["events"])
+    assert {"stage", "reasoning", "output", "decision"} <= set(event_kinds)
+    assert "learning the observed vault structure" in event_text
+    assert "No supported cross-note relationships" in event_text
+    assert activity["sweeps"]["index"] == {"active": [], "last": None}
+
+
+@pytest.mark.asyncio
 async def test_maintenance_does_not_link_unrelated_invoices_with_shared_template_words(
     tmp_path: Path, adaptive_ai, monkeypatch: pytest.MonkeyPatch
 ) -> None:
