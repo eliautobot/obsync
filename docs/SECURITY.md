@@ -39,7 +39,8 @@ Do not publish Ollama or LM Studio directly to the Internet. The Obsync server s
 - Disconnecting a computer removes only the server-side device ledger. Source files and existing Obsidian notes are retained.
 - Desktop vault writers accept only server-authenticated commands, use atomic writes, validate expected content hashes, and refuse unapproved non-Obsync collisions.
 - Whole-vault sweeps skip symlinks and `.obsidian`, reject unsafe paths, allow only one active sweep, and cooperatively stop between notes.
-- Maintenance changes retain complete before/after content, evidence, confidence, and an audit state. Undo refuses to overwrite a note changed after the original sweep.
+- Index Sweeps are read-only and cannot queue or apply vault changes.
+- Maintenance changes retain complete before/after content, evidence, confidence, operation ownership, and an audit state. They only wrap safe existing phrases as inline wikilinks or merge native YAML tags; ambiguous YAML/comment structures fail closed. Undo refuses to overwrite a note changed after the original sweep.
 - Automatic maintenance never permanently deletes or automatically merges notes.
 
 Mount source directories read-only when running an agent in Docker.

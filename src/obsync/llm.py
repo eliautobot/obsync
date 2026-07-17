@@ -43,6 +43,13 @@ Required schema:
   "vault_summary": "short description of how this vault is actually organized",
   "organization_principles": ["observed principle"],
   "note_patterns": [{"name": "learned role", "signals": ["observed signal"]}],
+  "category_hierarchy": [{
+    "name": "observed category",
+    "parent": "observed parent or empty",
+    "signals": ["observed signal"]
+  }],
+  "entity_types": [{"name": "durable entity type", "signals": ["observed signal"]}],
+  "low_value_patterns": ["repeated detail that should not drive direct links"],
   "relationship_guidance": ["when a link is substantively useful"],
   "negative_relationship_guidance": ["when similar notes must not be linked"],
   "folder_guidance": ["observed placement rule"],
@@ -65,8 +72,20 @@ Required schema:
   "suggested_tags": ["only strongly supported tags"],
   "relationships": [{
     "target": "EXACT LINK TARGET copied from a candidate",
+    "anchor": "EXACT ALLOWED INLINE ANCHOR copied from that candidate",
+    "relationship_type": "one allowed relationship type",
     "relationship": "specific factual relationship between the two records",
     "evidence": ["SOURCE: exact supporting fact", "TARGET: exact supporting fact"],
+    "confidence": 0.0
+  }],
+  "obsolete_owned_links": [{
+    "target": "EXACT CURRENT OWNED TARGET",
+    "reason": "why it is no longer supported",
+    "confidence": 0.0
+  }],
+  "obsolete_owned_tags": [{
+    "tag": "EXACT CURRENT OWNED TAG",
+    "reason": "why it is no longer supported",
     "confidence": 0.0
   }]
 }
@@ -76,7 +95,14 @@ share a word, tag, folder, template, category, document type, or broad subject. 
 same type are not related unless a concrete fact shown in both notes explains how those specific
 records connect. Prefer no link over a weak link. Use only exact candidate LINK TARGET values. Every
 accepted relationship needs one SOURCE and one TARGET evidence item grounded in the supplied text.
-Empty relationships are valid and expected."""
+Allowed relationship types: entity, specific-record, category-hub, sequence, dependency, reference.
+An inline link is valid only when a candidate supplies a natural ALLOWED INLINE ANCHOR already
+present in the source note. Never invent prose, append a relationship section, or force a link when
+no anchor exists. Existing category hubs organize broad classes; ordinary members of a category do
+not all link to one another. Only mark a current Obsync-owned edit obsolete when the supplied
+evidence no longer supports it. Prefer the shortest complete entity, title, alias, or identifier;
+never include surrounding verbs, articles, or punctuation in an anchor. Empty relationships and
+cleanup arrays are valid and expected."""
 
 _GENERIC_RELATIONSHIP_WORDS = frozenset(
     {
@@ -107,6 +133,16 @@ _EVIDENCE_STOP_WORDS = _GENERIC_RELATIONSHIP_WORDS | {
     "the",
     "this",
 }
+
+
+def _normalize_tag(value: Any) -> str:
+    return "/".join(
+        part
+        for part in (
+            slugify(segment, fallback="", max_length=40) for segment in str(value).split("/")
+        )
+        if part
+    )[:80].strip("/")
 
 
 class LLMRequestTimeoutError(TimeoutError):
@@ -401,6 +437,16 @@ def _candidate_prompt_line(candidate: str | dict[str, Any]) -> str:
         "; ".join(str(value) for value in reasons[:6]) if isinstance(reasons, list) else ""
     )
     excerpt = str(candidate.get("content_excerpt", "")).strip()[:3000]
+    raw_anchors = candidate.get("anchor_options", [])
+    anchors = (
+        [
+            str(item.get("text", ""))
+            for item in raw_anchors[:8]
+            if isinstance(item, dict) and str(item.get("text", "")).strip()
+        ]
+        if isinstance(raw_anchors, list)
+        else []
+    )
     details = [
         value
         for value in (
@@ -410,6 +456,12 @@ def _candidate_prompt_line(candidate: str | dict[str, Any]) -> str:
             f"headings: {headings}" if headings else "",
             f"entities: {entities}" if entities else "",
             f"match evidence: {reason_text}" if reason_text else "",
+            f"structural role: {candidate.get('structural_role', 'note')}",
+            (
+                f"ALLOWED INLINE ANCHORS: {json.dumps(anchors, ensure_ascii=False)}"
+                if anchors
+                else "NO SAFE INLINE ANCHOR"
+            ),
         )
         if value
     ]
@@ -445,6 +497,25 @@ def _normalize_vault_model(
             signals = _bounded_strings(pattern.get("signals", []), maximum=12, length=240)
             if name and signals:
                 patterns.append({"name": name, "signals": signals})
+    hierarchy: list[dict[str, Any]] = []
+    raw_hierarchy = value.get("category_hierarchy", [])
+    for category in raw_hierarchy[:50] if isinstance(raw_hierarchy, list) else []:
+        if not isinstance(category, dict):
+            continue
+        name = re.sub(r"\s+", " ", str(category.get("name", ""))).strip()[:120]
+        parent = re.sub(r"\s+", " ", str(category.get("parent", ""))).strip()[:120]
+        signals = _bounded_strings(category.get("signals", []), maximum=12, length=240)
+        if name and signals:
+            hierarchy.append({"name": name, "parent": parent, "signals": signals})
+    entity_types: list[dict[str, Any]] = []
+    raw_entity_types = value.get("entity_types", [])
+    for entity in raw_entity_types[:40] if isinstance(raw_entity_types, list) else []:
+        if not isinstance(entity, dict):
+            continue
+        name = re.sub(r"\s+", " ", str(entity.get("name", ""))).strip()[:120]
+        signals = _bounded_strings(entity.get("signals", []), maximum=12, length=240)
+        if name and signals:
+            entity_types.append({"name": name, "signals": signals})
     try:
         confidence = max(0.0, min(1.0, float(value.get("confidence", 0.0))))
     except (TypeError, ValueError):
@@ -455,6 +526,11 @@ def _normalize_vault_model(
             value.get("organization_principles", []), maximum=30, length=500
         ),
         "note_patterns": patterns,
+        "category_hierarchy": hierarchy,
+        "entity_types": entity_types,
+        "low_value_patterns": _bounded_strings(
+            value.get("low_value_patterns", []), maximum=50, length=300
+        ),
         "relationship_guidance": _bounded_strings(
             value.get("relationship_guidance", []), maximum=30, length=500
         ),
@@ -498,6 +574,7 @@ def _normalize_relationship_decision(
     minimum_confidence: float,
     maximum_links: int,
     source_note: dict[str, Any] | None = None,
+    owned_operations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     allowed = {
         _candidate_link_target(candidate).casefold(): candidate
@@ -519,7 +596,24 @@ def _normalize_relationship_decision(
                 continue
             candidate = allowed.get(str(raw.get("target", "")).strip().casefold())
             target = _candidate_link_target(candidate) if candidate else ""
+            allowed_anchor_options = [
+                str(option.get("text", ""))
+                for option in (candidate or {}).get("anchor_options", [])
+                if isinstance(option, dict) and str(option.get("text", "")).strip()
+            ]
+            allowed_anchors = {anchor.casefold(): anchor for anchor in allowed_anchor_options}
+            requested_anchor = allowed_anchors.get(
+                str(raw.get("anchor", "")).strip().casefold(), ""
+            )
+            # Anchor scoring is deterministic and Markdown-aware. The model decides whether the
+            # relationship exists; Obsync chooses the highest-quality exact phrase for the edit.
+            anchor = (
+                allowed_anchor_options[0] if requested_anchor and allowed_anchor_options else ""
+            )
             label = re.sub(r"\s+", " ", str(raw.get("relationship", ""))).strip()[:240]
+            relationship_type = re.sub(
+                r"[^a-z-]", "", str(raw.get("relationship_type", "specific-record")).casefold()
+            )[:40]
             evidence = _bounded_strings(raw.get("evidence", []), maximum=6, length=600)
             source_evidence = any(item.casefold().startswith("source:") for item in evidence)
             target_evidence = any(item.casefold().startswith("target:") for item in evidence)
@@ -544,6 +638,7 @@ def _normalize_relationship_decision(
                 confidence = 0.0
             if (
                 not target
+                or not anchor
                 or not _specific_relationship(label)
                 or not source_evidence
                 or not target_evidence
@@ -554,6 +649,8 @@ def _normalize_relationship_decision(
             relationships.append(
                 {
                     "target": target,
+                    "anchor": anchor,
+                    "relationship_type": relationship_type or "specific-record",
                     "relationship": label,
                     "evidence": evidence,
                     "confidence": round(confidence, 4),
@@ -561,16 +658,56 @@ def _normalize_relationship_decision(
             )
             if len(relationships) >= max(0, min(maximum_links, 50)):
                 break
+    owned = owned_operations or []
+    owned_links = {
+        str(item.get("target", "")).casefold(): item
+        for item in owned
+        if item.get("kind") == "inline-link" and item.get("target")
+    }
+    owned_tags = {
+        str(item.get("tag") or item.get("key", "")).casefold(): item
+        for item in owned
+        if item.get("kind") == "frontmatter-tag" and (item.get("tag") or item.get("key"))
+    }
+
+    def normalized_cleanup(
+        raw_items: Any, allowed_items: dict[str, dict[str, Any]], field: str
+    ) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        if not isinstance(raw_items, list):
+            return result
+        for raw in raw_items[:50]:
+            if not isinstance(raw, dict):
+                continue
+            requested = str(raw.get(field, "")).strip()
+            owned_item = allowed_items.get(requested.casefold())
+            reason = re.sub(r"\s+", " ", str(raw.get("reason", ""))).strip()[:500]
+            try:
+                confidence = max(0.0, min(1.0, float(raw.get("confidence", 0.0))))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            if owned_item and reason and confidence >= minimum_confidence:
+                result.append(
+                    {field: requested, "reason": reason, "confidence": round(confidence, 4)}
+                )
+        return result
+
     return {
         "source_category": re.sub(r"\s+", " ", str(value.get("source_category", ""))).strip()[:120],
         "source_role": re.sub(r"\s+", " ", str(value.get("source_role", ""))).strip()[:240],
         "summary": re.sub(r"\s+", " ", str(value.get("summary", ""))).strip()[:1500],
         "suggested_tags": [
-            slugify(tag, fallback="", max_length=40)
+            _normalize_tag(tag)
             for tag in _bounded_strings(value.get("suggested_tags", []), maximum=20, length=80)
-            if slugify(tag, fallback="", max_length=40)
+            if _normalize_tag(tag)
         ],
         "relationships": relationships,
+        "obsolete_owned_links": normalized_cleanup(
+            value.get("obsolete_owned_links", []), owned_links, "target"
+        ),
+        "obsolete_owned_tags": normalized_cleanup(
+            value.get("obsolete_owned_tags", []), owned_tags, "tag"
+        ),
     }
 
 
@@ -721,6 +858,9 @@ class LLMAnalyzer:
                     "model": self.config.model,
                     "stream": True,
                     "format": "json",
+                    # Structured vault work needs concise JSON, not minutes of hidden reasoning.
+                    # Ollama ignores this for models without a thinking mode.
+                    "think": False,
                     "messages": [
                         {"role": "system", "content": system_prompt or self._system_prompt()},
                         {"role": "user", "content": prompt},
@@ -852,7 +992,11 @@ class LLMAnalyzer:
         return _extract_json(raw)
 
     async def learn_vault_model(
-        self, notes: list[dict[str, Any]], *, feedback: list[dict[str, Any]] | None = None
+        self,
+        notes: list[dict[str, Any]],
+        *,
+        feedback: list[dict[str, Any]] | None = None,
+        corpus_profile: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self._emit("stage", "Learning this vault's organization model from indexed notes.")
         lines: list[str] = []
@@ -888,6 +1032,9 @@ class LLMAnalyzer:
         feedback_text = json.dumps(feedback or [], ensure_ascii=False)[:20_000]
         prompt = (
             f"INDEXED NOTE COUNT: {len(notes)}\n"
+            "DETERMINISTIC CORPUS PROFILE (UNTRUSTED REFERENCE DATA):\n<corpus-profile>\n"
+            + json.dumps(corpus_profile or {}, ensure_ascii=False)[:40_000]
+            + "\n</corpus-profile>\n\n"
             "VAULT NOTE SAMPLE (one untrusted JSON record per line):\n<vault-notes>\n"
             + "\n".join(lines)
             + "\n</vault-notes>\n\nHUMAN REVIEW OUTCOMES (UNTRUSTED DATA):\n<feedback>\n"
@@ -918,6 +1065,8 @@ class LLMAnalyzer:
         minimum_confidence: float,
         maximum_links: int,
         feedback: list[dict[str, Any]] | None = None,
+        owned_operations: list[dict[str, Any]] | None = None,
+        tag_vocabulary: list[str] | None = None,
     ) -> dict[str, Any]:
         source_label = str(source_note.get("path") or source_note.get("title") or "a vault note")
         self._emit(
@@ -942,7 +1091,12 @@ class LLMAnalyzer:
             + (candidate_text or "(none)")
             + "\n</candidates>\n\nHUMAN REVIEW OUTCOMES (UNTRUSTED DATA):\n<feedback>\n"
             + json.dumps(feedback or [], ensure_ascii=False)[:12_000]
-            + "\n</feedback>"
+            + "\n</feedback>\n\nCURRENT OBSYNC-OWNED EDITS "
+            "(UNTRUSTED; only these may be removed):\n<owned-edits>\n"
+            + json.dumps(owned_operations or [], ensure_ascii=False)[:12_000]
+            + "\n</owned-edits>\n\nALLOWED NATIVE TAG VOCABULARY (UNTRUSTED):\n<tag-vocabulary>\n"
+            + json.dumps(tag_vocabulary or [], ensure_ascii=False)[:8_000]
+            + "\n</tag-vocabulary>"
         )
         parsed = await self._complete_json(
             RELATIONSHIP_SYSTEM_PROMPT,
@@ -955,7 +1109,22 @@ class LLMAnalyzer:
             minimum_confidence=max(0.0, min(1.0, minimum_confidence)),
             maximum_links=max(0, min(maximum_links, 50)),
             source_note=source_note,
+            owned_operations=owned_operations,
         )
+        learned_category_tags = {
+            _normalize_tag(item.get("name", ""))
+            for item in vault_model.get("category_hierarchy", [])
+            if isinstance(item, dict) and _normalize_tag(item.get("name", ""))
+        }
+        allowed_tags = {
+            _normalize_tag(tag) for tag in (tag_vocabulary or []) if _normalize_tag(tag)
+        } | learned_category_tags
+        result["suggested_tags"] = [
+            tag
+            for tag in result["suggested_tags"]
+            if tag.casefold() != "obsync"
+            and tag.casefold() in {item.casefold() for item in allowed_tags}
+        ]
         self._emit(
             "decision",
             f"Validated {len(result['relationships'])} evidence-backed relationship(s) and "

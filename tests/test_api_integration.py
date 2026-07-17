@@ -9,6 +9,8 @@ from fastapi.testclient import TestClient
 
 from obsync.agent import AgentConfig, AgentRuntime, AgentState
 from obsync.llm import Analysis
+from obsync.service import utc_now
+from obsync.vault_intelligence import change_native_tag, native_maintenance_content, parse_note
 
 
 def sync_text(
@@ -166,7 +168,7 @@ def test_vault_sweep_settings_are_validated_and_saved(
             "vault_index_schedule_time": "01:30",
             "vault_index_schedule_weekday": 5,
             "vault_index_schedule_interval_hours": 72,
-            "vault_index_change_mode": "review",
+            "vault_index_change_mode": "index-only",
             "vault_maintenance_schedule_enabled": True,
             "vault_maintenance_schedule_frequency": "monthly",
             "vault_maintenance_schedule_time": "03:15",
@@ -176,7 +178,7 @@ def test_vault_sweep_settings_are_validated_and_saved(
             "vault_maintenance_categories": ["links", "tags"],
             "vault_relationship_candidate_limit": 30,
             "vault_relationship_min_confidence": 0.8,
-            "vault_link_limit": 25,
+            "vault_link_limit": 8,
             "existing_note_policy": "review",
         },
     )
@@ -187,12 +189,24 @@ def test_vault_sweep_settings_are_validated_and_saved(
     assert saved["vault_maintenance_categories"] == '["links", "tags"]'
     assert saved["vault_relationship_candidate_limit"] == "30"
     assert saved["vault_relationship_min_confidence"] == "0.8"
-    assert saved["vault_link_limit"] == "25"
+    assert saved["vault_link_limit"] == "8"
 
     invalid = client.put(
         "/api/v1/admin/settings",
         headers=admin_headers,
         json={"vault_index_schedule_time": "25:99"},
+    )
+    assert invalid.status_code == 400
+    invalid = client.put(
+        "/api/v1/admin/settings",
+        headers=admin_headers,
+        json={"vault_index_change_mode": "review"},
+    )
+    assert invalid.status_code == 400
+    invalid = client.put(
+        "/api/v1/admin/settings",
+        headers=admin_headers,
+        json={"vault_link_limit": 25},
     )
     assert invalid.status_code == 400
     invalid = client.put(
@@ -889,6 +903,107 @@ def test_full_sync_update_missing_and_rename(
     docs = client.get("/api/v1/admin/documents", headers=admin_headers).json()
     assert docs["total"] == 1
     assert docs["items"][0]["source_path"] == "Clients/Acme/signed-contract.txt"
+
+
+def test_global_sync_rebases_approved_native_edits_without_resurrecting_user_removals(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    agent_headers: dict[str, str],
+    registered_root: dict,
+    app_settings,
+) -> None:
+    service = app.state.service
+    first = sync_text(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "Projects/atlas.txt",
+        b"Orion Research commissioned Project Atlas.",
+    )
+    assert first.status_code == 200, first.text
+    document = first.json()
+    destination = document["destination_path"]
+    note = app_settings.vault_path / destination
+    original = note.read_text(encoding="utf-8")
+    maintained, operations = native_maintenance_content(
+        original,
+        [
+            {
+                "target": "Organizations/Orion Research",
+                "anchor": "Orion Research",
+                "relationship": "the organization commissioned the project",
+                "confidence": 0.97,
+            }
+        ],
+        suggested_tags=["projects/active"],
+    )
+    assert {operation["kind"] for operation in operations} == {
+        "inline-link",
+        "frontmatter-tag",
+    }
+    note.write_text(maintained, encoding="utf-8")
+
+    now = utc_now()
+    service.db.execute(
+        "INSERT INTO vault_sweeps(id, sweep_type, vault_key, status, change_mode, "
+        "created_at, updated_at) VALUES ('sync-rebase-sweep', 'maintenance', 'local', "
+        "'completed', 'review', ?, ?)",
+        (now, now),
+    )
+    change_id = service._create_vault_change(
+        sweep_id="sync-rebase-sweep",
+        note={"path": destination, "content": original},
+        after_content=maintained,
+        reason="Approved native maintenance operations",
+        evidence=["SOURCE: Orion Research", "TARGET: Project Atlas"],
+        confidence=0.97,
+        decision={"operations": operations},
+    )
+    change = service.db.query_one("SELECT * FROM vault_changes WHERE id = ?", (change_id,))
+    assert change is not None
+    service._update_edit_ownership(change)
+
+    second = sync_text(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "Projects/atlas.txt",
+        b"Orion Research commissioned the revised Project Atlas brief.",
+        mtime=200,
+    )
+    assert second.status_code == 200, second.text
+    preserved = note.read_text(encoding="utf-8")
+    assert "[[Organizations/Orion Research|Orion Research]]" in preserved
+    assert "projects/active" in parse_note(note, vault=app_settings.vault_path).tags
+    assert "revised Project Atlas brief" in preserved
+
+    human_changed = preserved.replace(
+        "[[Organizations/Orion Research|Orion Research]]", "Orion Research"
+    )
+    human_changed, tag_removal = change_native_tag(
+        human_changed, tag="projects/active", remove=True
+    )
+    assert tag_removal is not None
+    note.write_text(human_changed, encoding="utf-8")
+
+    third = sync_text(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "Projects/atlas.txt",
+        b"Orion Research commissioned the final Project Atlas brief.",
+        mtime=300,
+    )
+    assert third.status_code == 200, third.text
+    final = note.read_text(encoding="utf-8")
+    assert "final Project Atlas brief" in final
+    assert "[[Organizations/Orion Research|Orion Research]]" not in final
+    assert "projects/active" not in parse_note(note, vault=app_settings.vault_path).tags
+    statuses = service.db.query_all(
+        "SELECT status FROM vault_edit_ownership WHERE path = ? ORDER BY kind", (destination,)
+    )
+    assert [row["status"] for row in statuses] == ["modified", "modified"]
 
 
 def test_inventory_compares_new_synced_modified_and_missing_states(

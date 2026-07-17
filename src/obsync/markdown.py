@@ -259,15 +259,16 @@ def note_title_from_path(path: Path) -> str:
 
 def note_title(content: str, path: Path) -> str:
     """Read a human title without requiring a note to be managed by Obsync."""
-    if content.startswith("---\n"):
+    normalized = content.replace("\r\n", "\n")
+    if normalized.startswith("---\n"):
         try:
-            frontmatter, _body = content[4:].split("\n---", 1)
+            frontmatter, _body = normalized[4:].split("\n---", 1)
             values = yaml.safe_load(frontmatter) or {}
             if isinstance(values, dict) and str(values.get("title", "")).strip():
                 return str(values["title"]).strip()[:200]
         except (ValueError, yaml.YAMLError):
             pass
-    heading = re.search(r"(?m)^#\s+(.+?)\s*$", content[:20_000])
+    heading = re.search(r"(?m)^#\s+(.+?)\s*$", normalized[:20_000])
     if heading:
         return heading.group(1).strip()[:200]
     return note_title_from_path(path)[:200]
@@ -275,10 +276,11 @@ def note_title(content: str, path: Path) -> str:
 
 def note_tags(content: str) -> list[str]:
     """Read searchable tags from ordinary Obsidian YAML frontmatter."""
-    if not content.startswith("---\n"):
+    normalized = content.replace("\r\n", "\n")
+    if not normalized.startswith("---\n"):
         return []
     try:
-        frontmatter, _body = content[4:].split("\n---", 1)
+        frontmatter, _body = normalized[4:].split("\n---", 1)
         values = yaml.safe_load(frontmatter) or {}
     except (ValueError, yaml.YAMLError):
         return []

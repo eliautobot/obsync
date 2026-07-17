@@ -10,16 +10,20 @@ import pytest
 
 from obsync.config import Settings
 from obsync.llm import LLMAnalyzer, LLMRequestTimeoutError
+from obsync.markdown import note_tags, note_title
 from obsync.service import ObsyncService, utc_now
 from obsync.vault_intelligence import (
-    MAINTENANCE_END,
     MAINTENANCE_START,
     AdaptiveVaultIndex,
     add_backlinks,
+    change_native_tag,
     existing_note_match,
+    explicit_category_hub_relationships,
     maintenance_content,
+    native_maintenance_content,
     parse_note,
     rank_notes,
+    reapply_owned_operations,
     strip_maintenance_block,
 )
 
@@ -166,33 +170,200 @@ def test_existing_note_match_distinguishes_exact_strong_and_ambiguous(tmp_path: 
     assert ambiguous and ambiguous["strength"] == "ambiguous"
 
 
-def test_maintenance_relationship_block_is_bounded_and_idempotent(tmp_path: Path) -> None:
-    vault = tmp_path / "vault"
-    related = [
-        parse_note(
-            write_note(
-                vault,
-                "Companies/Pro Quality Plumbing.md",
-                "---\ntags: [company]\n---\n# Pro Quality Plumbing",
-            ),
-            vault=vault,
-        ).as_dict(),
-        parse_note(
-            write_note(vault, "Clients/Acme.md", "---\ntags: [client]\n---\n# Acme"),
-            vault=vault,
-        ).as_dict(),
+def test_native_maintenance_uses_inline_links_and_frontmatter_without_visible_block() -> None:
+    original = "# Account Application\n\nClient Pro Quality Plumbing manages Acme.\n"
+    relationships = [
+        {
+            "target": "Companies/Pro Quality Plumbing",
+            "anchor": "Pro Quality Plumbing",
+            "relationship": "the named company manages this account",
+            "confidence": 0.94,
+        },
+        {
+            "target": "Clients/Acme",
+            "anchor": "Acme",
+            "relationship": "the named client owns this account",
+            "confidence": 0.93,
+        },
     ]
-    original = "# Account Application\n\nOriginal user-authored content.\n"
-    first = maintenance_content(original, related)
-    second = maintenance_content(first, related)
+
+    first, operations = native_maintenance_content(
+        original, relationships, suggested_tags=["accounts/active"]
+    )
+    second, repeated = native_maintenance_content(
+        first, relationships, suggested_tags=["accounts/active"]
+    )
 
     assert first == second
-    assert first.count(MAINTENANCE_START) == 1
-    assert first.count(MAINTENANCE_END) == 1
-    assert "[[Companies/Pro Quality Plumbing]]" in first
-    assert "[[Clients/Acme]]" in first
-    assert "Original user-authored content." in first
-    assert "#company" in first and "#client" in first
+    assert repeated == []
+    assert MAINTENANCE_START not in first and "Related knowledge" not in first
+    assert "[[Companies/Pro Quality Plumbing|Pro Quality Plumbing]]" in first
+    assert "[[Clients/Acme|Acme]]" in first
+    assert parse_note(Path("Account.md"), content=first).tags == ["accounts/active"]
+    assert [item["kind"] for item in operations] == [
+        "inline-link",
+        "inline-link",
+        "frontmatter-tag",
+    ]
+
+
+def test_native_inline_links_only_touch_safe_existing_body_phrases() -> None:
+    original = """---
+aliases: [Orion Research]
+---
+# Orion Research
+
+Already linked: [[Archives/Orion Research Archive|Orion Research Archive]].
+Inline code: `Orion Research`
+
+| Organization | Status |
+| --- | --- |
+| Orion Research | Active |
+
+```text
+Orion Research
+```
+
+Orion Researcher is a different phrase.
+The work was commissioned by Orion Research for Project Atlas.
+"""
+    relationship = {
+        "target": "Organizations/Orion Research",
+        "anchor": "Orion Research",
+        "relationship": "the named organization commissioned the work",
+        "confidence": 0.97,
+    }
+
+    updated, operations = native_maintenance_content(original, [relationship])
+
+    assert len(operations) == 1
+    assert operations[0]["rendered"] == "[[Organizations/Orion Research|Orion Research]]"
+    assert "# Orion Research" in updated
+    assert "`Orion Research`" in updated
+    assert "| Orion Research | Active |" in updated
+    assert "```text\nOrion Research\n```" in updated
+    assert (
+        "commissioned by [[Organizations/Orion Research|Orion Research]] for Project Atlas"
+        in updated
+    )
+    assert "Orion Researcher is a different phrase" in updated
+    assert "[[Archives/Orion Research Archive|Orion Research Archive]]" in updated
+    assert updated.count("[[Organizations/Orion Research|Orion Research]]") == 1
+
+
+def test_native_hierarchical_tags_preserve_unrelated_frontmatter_and_human_comments() -> None:
+    original = """---
+title: Project Atlas
+owner: Eli
+tags: [project, status/active]
+reviewed: false
+---
+# Project Atlas
+"""
+
+    added, operation = change_native_tag(original, tag="Knowledge/Research")
+    assert operation and operation["tag"] == "knowledge/research"
+    parsed = parse_note(Path("Project Atlas.md"), content=added)
+    assert parsed.tags == ["project", "status/active", "knowledge/research"]
+    assert parsed.properties["owner"] == "Eli"
+    assert parsed.properties["reviewed"] is False
+
+    removed, removal = change_native_tag(added, tag="knowledge/research", remove=True)
+    assert removal and removal["action"] == "remove"
+    assert parse_note(Path("Project Atlas.md"), content=removed).tags == [
+        "project",
+        "status/active",
+    ]
+    assert "owner: Eli" in removed and "reviewed: false" in removed
+
+    pyyaml_style = """---
+title: Project Atlas
+tags:
+- project
+- status/active
+owner: Eli
+---
+# Project Atlas
+"""
+    updated_pyyaml, pyyaml_operation = change_native_tag(pyyaml_style, tag="knowledge/research")
+    assert pyyaml_operation is not None
+    assert parse_note(Path("Project Atlas.md"), content=updated_pyyaml).tags == [
+        "project",
+        "status/active",
+        "knowledge/research",
+    ]
+    assert "owner: Eli" in updated_pyyaml
+
+    commented = """---
+title: Project Atlas
+tags:
+  # Human grouping that must not be rewritten
+  - project
+---
+# Project Atlas
+"""
+    unchanged, refused = change_native_tag(commented, tag="knowledge/research")
+    assert unchanged == commented
+    assert refused is None
+
+    inline_comment = """---
+title: Project Atlas
+tags: [project] # Human explanation that must be preserved
+---
+# Project Atlas
+"""
+    unchanged, refused = change_native_tag(inline_comment, tag="knowledge/research")
+    assert unchanged == inline_comment
+    assert refused is None
+
+
+def test_native_frontmatter_edits_preserve_windows_crlf_notes() -> None:
+    original = (
+        "---\r\n"
+        "title: Project Atlas\r\n"
+        "tags: [project, status/active]\r\n"
+        "owner: Eli\r\n"
+        "---\r\n"
+        "# Project Atlas\r\n"
+    )
+
+    added, operation = change_native_tag(original, tag="knowledge/research")
+
+    assert operation and operation["tag"] == "knowledge/research"
+    assert "\n" not in added.replace("\r\n", "")
+    assert note_title(added, Path("Project Atlas.md")) == "Project Atlas"
+    assert note_tags(added) == ["project", "status/active", "knowledge/research"]
+    assert parse_note(Path("Project Atlas.md"), content=added).properties["owner"] == "Eli"
+
+
+def test_owned_operations_rebase_only_edits_still_present_in_the_current_note() -> None:
+    current, operations = native_maintenance_content(
+        "# Project Atlas\n\nOrion Research commissioned the work.\n",
+        [
+            {
+                "target": "Organizations/Orion Research",
+                "anchor": "Orion Research",
+                "relationship": "the organization commissioned the project",
+                "confidence": 0.97,
+            }
+        ],
+        suggested_tags=["projects/active"],
+    )
+    regenerated = "# Project Atlas\n\nOrion Research commissioned the revised work.\n"
+
+    preserved = reapply_owned_operations(current, regenerated, operations)
+    assert "[[Organizations/Orion Research|Orion Research]]" in preserved
+    assert "projects/active" in parse_note(Path("Project Atlas.md"), content=preserved).tags
+
+    human_removed = current.replace(
+        "[[Organizations/Orion Research|Orion Research]]", "Orion Research"
+    )
+    human_removed, _operation = change_native_tag(human_removed, tag="projects/active", remove=True)
+    not_resurrected = reapply_owned_operations(human_removed, regenerated, operations)
+    assert "[[Organizations/Orion Research|Orion Research]]" not in not_resurrected
+    assert (
+        "projects/active" not in parse_note(Path("Project Atlas.md"), content=not_resurrected).tags
+    )
 
 
 def test_generated_maintenance_block_never_becomes_index_or_retrieval_evidence(
@@ -246,6 +417,92 @@ def test_adaptive_retrieval_is_only_a_shortlist_for_same_type_records() -> None:
     assert all("relationship" not in item for item in candidates)
 
 
+def test_sync_candidate_retrieval_excludes_the_note_currently_being_updated(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    service = ObsyncService(settings)
+    current = write_note(
+        settings.vault_path,
+        "Projects/Project Atlas.md",
+        "# Project Atlas\n\nOrion Research commissioned Project Atlas.\n",
+    )
+    other = write_note(
+        settings.vault_path,
+        "Organizations/Orion Research.md",
+        "# Orion Research\n\nOrion Research commissioned Project Atlas.\n",
+    )
+    service._store_vault_index(
+        "local",
+        [
+            parse_note(current, vault=settings.vault_path).as_dict(),
+            parse_note(other, vault=settings.vault_path).as_dict(),
+        ],
+        full_rebuild=True,
+    )
+
+    candidates = service._candidate_notes(
+        "Projects/atlas.txt",
+        "Orion Research commissioned the revised Project Atlas.",
+        service._llm_config().active_profile,
+        exclude_path="Projects/Project Atlas.md",
+    )
+
+    assert candidates
+    assert all(candidate["path"] != "Projects/Project Atlas.md" for candidate in candidates)
+    assert candidates[0]["path"] == "Organizations/Orion Research.md"
+
+
+def test_explicit_category_hub_membership_requires_proof_in_both_directions() -> None:
+    source = {
+        "path": "Reports/Field Report 003.md",
+        "title": "Field Report 003",
+        "content": "The category home is the Field Report Index.",
+    }
+    proven = {
+        "path": "Indexes/Field Report Index.md",
+        "title": "Field Report Index",
+        "links": ["Reports/Field Report 003"],
+        "structural_role": "category-hub",
+        "anchor_options": [
+            {
+                "text": "Field Report Index",
+                "reason": "exact target title, alias, or identifier",
+                "score": 105,
+            }
+        ],
+    }
+    unproven = {
+        **proven,
+        "path": "Indexes/Unrelated Index.md",
+        "title": "Unrelated Index",
+        "links": [],
+        "anchor_options": [
+            {
+                "text": "Unrelated Index",
+                "reason": "exact target title, alias, or identifier",
+                "score": 105,
+            }
+        ],
+    }
+
+    relationships = explicit_category_hub_relationships(source, [proven, unproven])
+
+    assert relationships == [
+        {
+            "target": "Indexes/Field Report Index",
+            "anchor": "Field Report Index",
+            "relationship_type": "category-hub",
+            "relationship": "This category hub explicitly catalogs the source note",
+            "evidence": [
+                "SOURCE: the note explicitly names Field Report Index",
+                "TARGET: the hub directly links to Field Report 003",
+            ],
+            "confidence": 0.99,
+        }
+    ]
+
+
 @pytest.mark.asyncio
 async def test_index_and_maintenance_sweeps_apply_review_and_undo(
     tmp_path: Path, adaptive_ai
@@ -288,10 +545,64 @@ async def test_index_and_maintenance_sweeps_apply_review_and_undo(
     assert diff["before_content"] == original
 
     await service.approve_vault_change(account_change["id"])
-    assert MAINTENANCE_START in account.read_text(encoding="utf-8")
+    applied = account.read_text(encoding="utf-8")
+    assert MAINTENANCE_START not in applied
+    assert "[[Clients/Acme Holdings|Acme Holdings]]" in applied
+    ownership = service.db.query_all(
+        "SELECT * FROM vault_edit_ownership WHERE path = ? AND status = 'active'",
+        ("Accounts/PQP Account.md",),
+    )
+    assert ownership and all(item["kind"] == "inline-link" for item in ownership)
     undo = await service.undo_vault_sweep(maintenance["id"])
     assert undo["reverted"] >= 1
     assert account.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
+async def test_index_sweep_is_read_only_and_persists_adaptive_corpus_intelligence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    service = ObsyncService(settings)
+    service.db.set_settings({"vault_confirmed": ("true", False)})
+    write_note(
+        settings.vault_path,
+        "Indexes/Field Report Index.md",
+        "# Field Report Index\n\n[[Reports/Field Report 001]]\n[[Reports/Field Report 002]]\n",
+    )
+    for number in range(1, 7):
+        write_note(
+            settings.vault_path,
+            f"Reports/Field Report {number:03d}.md",
+            "---\ntags: [field-report]\n---\n"
+            f"# Field Report {number:03d}\n\nStandard observations for Sector {number}.\n",
+        )
+    before = {
+        path.relative_to(settings.vault_path).as_posix(): path.read_bytes()
+        for path in settings.vault_path.rglob("*.md")
+    }
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("Index Sweep must not invoke Local AI")
+
+    monkeypatch.setattr(LLMAnalyzer, "learn_vault_model", forbidden)
+    monkeypatch.setattr(LLMAnalyzer, "adjudicate_relationships", forbidden)
+    sweep = service.start_vault_sweep("index", change_mode="index-only", full_rebuild=True)
+    assert service._sweep_task is not None
+    await service._sweep_task
+
+    after = {
+        path.relative_to(settings.vault_path).as_posix(): path.read_bytes()
+        for path in settings.vault_path.rglob("*.md")
+    }
+    assert service.vault_sweep(sweep["id"])["status"] == "completed"
+    assert after == before
+    assert service.list_vault_changes()["total"] == 0
+    corpus = service.vault_model_status()["corpus"]
+    assert corpus["note_count"] == 7
+    assert {item["path"] for item in corpus["folders"]} >= {"Indexes", "Reports"}
+    assert corpus["tag_vocabulary"] == [{"tag": "field-report", "notes": 6}]
+    assert corpus["existing_category_hubs"][0]["path"] == "Indexes/Field Report Index.md"
 
 
 @pytest.mark.asyncio
@@ -304,7 +615,7 @@ async def test_maintenance_sweep_streams_model_thinking_output_and_decisions(
     service.db.set_settings({"vault_confirmed": ("true", False)})
     write_note(settings.vault_path, "Companies/Example.md", "# Example\n\nNamed company record.")
 
-    async def learn(analyzer, notes, *, feedback=None):
+    async def learn(analyzer, notes, *, feedback=None, corpus_profile=None):
         analyzer._emit("reasoning", "I am learning the observed vault structure.")
         analyzer._emit("output", '{"vault_summary":"Example vault"}')
         return {
@@ -324,6 +635,8 @@ async def test_maintenance_sweep_streams_model_thinking_output_and_decisions(
         minimum_confidence,
         maximum_links,
         feedback=None,
+        owned_operations=None,
+        tag_vocabulary=None,
     ):
         analyzer._emit("reasoning", f"Checking evidence for {source_note['path']}.")
         analyzer._emit("output", '{"relationships":[]}')
@@ -357,6 +670,54 @@ async def test_maintenance_sweep_streams_model_thinking_output_and_decisions(
     assert "learning the observed vault structure" in event_text
     assert "No supported cross-note relationships" in event_text
     assert activity["sweeps"]["index"] == {"active": [], "last": None}
+
+
+@pytest.mark.asyncio
+async def test_invalid_maintenance_limits_use_the_safe_eight_link_fallback(
+    tmp_path: Path, adaptive_ai, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    service = ObsyncService(settings)
+    adaptive_ai(service)
+    service.db.set_settings(
+        {
+            "vault_confirmed": ("true", False),
+            "vault_link_limit": ("not-a-number", False),
+        }
+    )
+    write_note(settings.vault_path, "Records/Example.md", "# Example\n\nNamed record.\n")
+    observed: dict[str, int] = {}
+
+    async def adjudicate(
+        _self,
+        source_note,
+        candidates,
+        *,
+        vault_model,
+        minimum_confidence,
+        maximum_links,
+        feedback=None,
+        owned_operations=None,
+        tag_vocabulary=None,
+    ):
+        observed["maximum_links"] = maximum_links
+        return {
+            "source_category": "",
+            "source_role": "record",
+            "summary": "No supported relationship.",
+            "suggested_tags": [],
+            "relationships": [],
+            "obsolete_owned_links": [],
+            "obsolete_owned_tags": [],
+        }
+
+    monkeypatch.setattr(LLMAnalyzer, "adjudicate_relationships", adjudicate)
+    sweep = service.start_vault_sweep("maintenance", change_mode="review")
+    assert service._sweep_task is not None
+    await service._sweep_task
+
+    assert service.vault_sweep(sweep["id"])["status"] == "completed"
+    assert observed["maximum_links"] == 8
 
 
 @pytest.mark.asyncio
@@ -404,6 +765,8 @@ async def test_maintenance_does_not_link_unrelated_invoices_with_shared_template
         minimum_confidence,
         maximum_links,
         feedback=None,
+        owned_operations=None,
+        tag_vocabulary=None,
     ):
         relationships = []
         if source_note["path"] == "Invoices/Invoice 5297.md":
@@ -418,6 +781,10 @@ async def test_maintenance_does_not_link_unrelated_invoices_with_shared_template
                     relationships.append(
                         {
                             "target": target,
+                            "anchor": candidate["anchor_options"][0]["text"],
+                            "relationship_type": "category-hub"
+                            if target == "Indexes/Invoice Index"
+                            else "entity",
                             "relationship": allowed[target],
                             "evidence": [
                                 f"SOURCE: Invoice 5297 names {candidate['title']}",
@@ -447,11 +814,105 @@ async def test_maintenance_does_not_link_unrelated_invoices_with_shared_template
     )
     diff = service.vault_change_diff(change["id"])
     after = diff["after_content"]
-    assert "[[Companies/Pro Quality Plumbing]]" in after
-    assert "[[Clients/Client Alpha]]" in after
-    assert "[[Indexes/Invoice Index]]" in after
-    assert not any(f"[[Invoices/Invoice {number}]]" in after for number in range(5200, 5300))
+    assert "[[Companies/Pro Quality Plumbing|Pro Quality Plumbing]]" in after
+    assert "[[Clients/Client Alpha|Client Alpha]]" in after
+    assert "[[Indexes/Invoice Index|Invoice Index]]" in after
+    assert not any(f"[[Invoices/Invoice {number}|" in after for number in range(5200, 5300))
     assert len(diff["decision"]["relationships"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_category_hubs_prevent_same_type_link_floods_without_domain_hardcoding(
+    tmp_path: Path, adaptive_ai, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    service = ObsyncService(settings)
+    adaptive_ai(service)
+    service.db.set_settings({"vault_confirmed": ("true", False)})
+    for number in range(1, 61):
+        detail = "Routine field report with observations, status, and follow-up actions."
+        if number == 37:
+            detail += " Orion Research commissioned Project Atlas. See the Field Report Index."
+        write_note(
+            settings.vault_path,
+            f"Reports/Field Report {number:03d}.md",
+            f"# Field Report {number:03d}\n\n{detail}\n",
+        )
+    write_note(
+        settings.vault_path,
+        "Organizations/Orion Research.md",
+        "# Orion Research\n\nOrganization responsible for Project Atlas.\n",
+    )
+    write_note(
+        settings.vault_path,
+        "Indexes/Field Report Index.md",
+        "# Field Report Index\n\nCatalog for Project Atlas field reports.\n",
+    )
+
+    async def adjudicate(
+        _self,
+        source_note,
+        candidates,
+        *,
+        vault_model,
+        minimum_confidence,
+        maximum_links,
+        feedback=None,
+        owned_operations=None,
+        tag_vocabulary=None,
+    ):
+        relationships = []
+        if source_note["path"] == "Reports/Field Report 037.md":
+            allowed = {
+                "Organizations/Orion Research": (
+                    "entity",
+                    "the named organization commissioned it",
+                ),
+                "Indexes/Field Report Index": ("category-hub", "the explicit index organizes it"),
+            }
+            for candidate in candidates:
+                target = str(candidate.get("link_target", ""))
+                if target not in allowed:
+                    continue
+                relation_type, explanation = allowed[target]
+                relationships.append(
+                    {
+                        "target": target,
+                        "anchor": candidate["anchor_options"][0]["text"],
+                        "relationship_type": relation_type,
+                        "relationship": explanation,
+                        "evidence": [
+                            f"SOURCE: explicitly names {candidate['title']}",
+                            "TARGET: describes its role for Project Atlas",
+                        ],
+                        "confidence": 0.96,
+                    }
+                )
+        return {
+            "source_category": "field-report",
+            "source_role": "recurring observation record",
+            "summary": "Use the category hub and durable entity, not peer records.",
+            "suggested_tags": [],
+            "relationships": relationships,
+            "obsolete_owned_links": [],
+            "obsolete_owned_tags": [],
+        }
+
+    monkeypatch.setattr(LLMAnalyzer, "adjudicate_relationships", adjudicate)
+    sweep = service.start_vault_sweep("maintenance", change_mode="review")
+    assert service._sweep_task is not None
+    await service._sweep_task
+
+    assert service.vault_sweep(sweep["id"])["status"] == "completed"
+    change = next(
+        item
+        for item in service.list_vault_changes(status="pending")["items"]
+        if item["path"] == "Reports/Field Report 037.md"
+    )
+    after = service.vault_change_diff(change["id"])["after_content"]
+    assert "[[Organizations/Orion Research|Orion Research]]" in after
+    assert "[[Indexes/Field Report Index|Field Report Index]]" in after
+    assert not any(f"[[Reports/Field Report {number:03d}|" in after for number in range(1, 61))
 
 
 @pytest.mark.asyncio
@@ -534,7 +995,10 @@ async def test_automatic_maintenance_applies_changes_and_retains_rollback(
     finished = service.vault_sweep(sweep["id"])
     assert finished["status"] == "completed"
     assert finished["applied_changes"] >= 1
-    assert MAINTENANCE_START in target.read_text(encoding="utf-8")
+    assert MAINTENANCE_START not in target.read_text(encoding="utf-8")
+    assert "[[Companies/Pro Quality Plumbing|Pro Quality Plumbing]]" in target.read_text(
+        encoding="utf-8"
+    )
     assert service.list_vault_changes(status="applied")["total"] >= 1
     result = await service.undo_vault_sweep(sweep["id"])
     assert result["ok"] is True
@@ -612,9 +1076,7 @@ async def test_successful_empty_ai_decision_repairs_an_overlinked_generated_bloc
     change = service.list_vault_changes(status="pending")["items"][0]
 
     assert change["path"] == "Invoices/Invoice 5297.md"
-    assert "remove the previous generated block" in change["reason"].casefold() or change[
-        "reason"
-    ].startswith("No candidate")
+    assert "1 cleanup operation" in change["reason"]
     await service.approve_vault_change(change["id"])
     assert note.read_text(encoding="utf-8") == original_user_content
 
@@ -660,7 +1122,7 @@ def test_v014_migration_supersedes_static_pending_changes_and_clamps_old_limit(
     change = service.db.query_one("SELECT * FROM vault_changes WHERE id = ?", (change_id,))
     assert change and change["status"] == "superseded"
     assert "adaptive relationship engine" in change["error"]
-    assert service.db.get_setting("vault_link_limit") == "20"
+    assert service.db.get_setting("vault_link_limit") == "8"
 
 
 def test_v0151_migration_raises_only_the_legacy_default_ai_timeout(tmp_path: Path) -> None:
@@ -673,12 +1135,53 @@ def test_v0151_migration_raises_only_the_legacy_default_ai_timeout(tmp_path: Pat
     service.db.initialize()
 
     assert service.db.get_setting("llm_timeout_seconds") == "600"
-    assert service.db.query_one("SELECT version FROM schema_meta")["version"] == 10
+    assert service.db.query_one("SELECT version FROM schema_meta")["version"] == 11
 
     service.db.set_settings({"llm_timeout_seconds": ("900", False)})
     service.db.execute("UPDATE schema_meta SET version = 9")
     service.db.initialize()
     assert service.db.get_setting("llm_timeout_seconds") == "900"
+
+
+def test_v011_migration_supersedes_block_recommendations_and_forces_read_only_index(
+    tmp_path: Path,
+) -> None:
+    service = ObsyncService(
+        Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    )
+    now = utc_now()
+    service.db.execute(
+        "INSERT INTO vault_sweeps(id, sweep_type, vault_key, status, change_mode, "
+        "created_at, updated_at) VALUES ('block-sweep', 'maintenance', 'local', "
+        "'completed', 'review', ?, ?)",
+        (now, now),
+    )
+    change_id = service._create_vault_change(
+        sweep_id="block-sweep",
+        note={"path": "Record.md", "content": "# Record\n"},
+        after_content=maintenance_content(
+            "# Record\n", [{"target": "Other", "relationship": "old block link"}]
+        ),
+        reason="Legacy bottom block",
+        evidence=["shared category"],
+        confidence=0.8,
+    )
+    service.db.set_settings(
+        {
+            "vault_index_change_mode": ("review", False),
+            "vault_link_limit": ("20", False),
+        }
+    )
+    service.db.execute("UPDATE schema_meta SET version = 10")
+
+    service.db.initialize()
+
+    change = service.db.query_one("SELECT * FROM vault_changes WHERE id = ?", (change_id,))
+    assert change and change["status"] == "superseded"
+    assert "native inline maintenance" in change["error"]
+    assert service.db.get_setting("vault_index_change_mode") == "index-only"
+    assert service.db.get_setting("vault_link_limit") == "8"
+    assert service.db.query_one("SELECT version FROM schema_meta")["version"] == 11
 
 
 def test_review_feedback_changes_the_adaptive_vault_model_fingerprint(
@@ -718,7 +1221,7 @@ async def test_adaptive_vault_model_is_persisted_and_reused(
     notes = [parse_note(Path("One.md"), content="# One\nConcrete fact.").as_dict()]
     calls = 0
 
-    async def learn(_self, learned_notes, *, feedback=None):
+    async def learn(_self, learned_notes, *, feedback=None, corpus_profile=None):
         nonlocal calls
         calls += 1
         return {
@@ -749,7 +1252,7 @@ async def test_vault_model_learning_failure_is_visible_and_not_cached(
     )
     adaptive_ai(service)
 
-    async def fail(_self, _notes, *, feedback=None):
+    async def fail(_self, _notes, *, feedback=None, corpus_profile=None):
         raise ValueError("invalid learned model")
 
     monkeypatch.setattr(LLMAnalyzer, "learn_vault_model", fail)
@@ -779,7 +1282,7 @@ async def test_maintenance_timeout_is_visible_in_model_and_sweep_errors(
     )
     write_note(service.settings.vault_path, "One.md", "# One\nConcrete fact.")
 
-    async def timeout(_self, _notes, *, feedback=None):
+    async def timeout(_self, _notes, *, feedback=None, corpus_profile=None):
         raise LLMRequestTimeoutError(
             "Local AI timed out after 600 seconds while learning the adaptive vault model. "
             "Increase Model timeout in Local AI settings."

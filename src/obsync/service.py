@@ -65,8 +65,11 @@ from .vault_intelligence import (
     content_hash,
     decode_db_note,
     existing_note_match,
-    maintenance_content,
+    explicit_category_hub_relationships,
+    native_maintenance_content,
+    normalize_obsidian_tag,
     parse_note,
+    reapply_owned_operations,
     serialize_note_for_db,
     strip_maintenance_block,
 )
@@ -106,7 +109,7 @@ DEFAULT_SETTINGS: dict[str, tuple[str, bool]] = {
     "vault_maintenance_categories": ('["links", "tags"]', False),
     "vault_relationship_candidate_limit": ("20", False),
     "vault_relationship_min_confidence": ("0.72", False),
-    "vault_link_limit": ("20", False),
+    "vault_link_limit": ("8", False),
 }
 
 PIPELINE_COMMANDS = frozenset(
@@ -555,7 +558,7 @@ class ObsyncService:
                 id, sweep_id, vault_key, path, change_type, status, before_hash, after_hash,
                 before_content, after_content, reason, evidence_json, confidence, created_at
                 , decision_json
-            ) VALUES (?, ?, ?, ?, 'organize-note', 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, 'native-maintenance', 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 change_id,
@@ -632,15 +635,178 @@ class ObsyncService:
                 "provider": "",
                 "model_name": "",
                 "error": "",
+                "corpus": {},
+                "profiled_at": "",
             }
         try:
             row["model"] = json.loads(row.pop("model_json") or "{}")
         except (TypeError, json.JSONDecodeError):
             row["model"] = {}
+        try:
+            row["corpus"] = json.loads(row.pop("corpus_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            row["corpus"] = {}
         return row
 
+    def _refresh_vault_corpus_profile(
+        self, notes: list[dict[str, Any]]
+    ) -> tuple[AdaptiveVaultIndex, dict[str, Any]]:
+        adaptive = AdaptiveVaultIndex(notes)
+        corpus = adaptive.corpus_profile()
+        serialized = json.dumps(corpus, sort_keys=True, ensure_ascii=False)
+        fingerprint = hashlib.sha256(serialized.encode()).hexdigest()
+        now = utc_now()
+        self.db.execute(
+            """
+            INSERT INTO vault_models(
+                vault_key, status, model_json, corpus_json, corpus_fingerprint,
+                note_count, profiled_at, updated_at
+            ) VALUES (?, 'not-learned', '{}', ?, ?, ?, ?, ?)
+            ON CONFLICT(vault_key) DO UPDATE SET corpus_json = excluded.corpus_json,
+                corpus_fingerprint = excluded.corpus_fingerprint,
+                note_count = excluded.note_count, profiled_at = excluded.profiled_at,
+                updated_at = excluded.updated_at
+            """,
+            (self._vault_key(), serialized, fingerprint, len(notes), now, now),
+        )
+        return adaptive, corpus
+
+    def _owned_operations(
+        self,
+        path: str,
+        *,
+        content: str | None = None,
+        vault_key: str | None = None,
+    ) -> list[dict[str, Any]]:
+        key = vault_key or self._vault_key()
+        rows = self.db.query_all(
+            "SELECT * FROM vault_edit_ownership WHERE vault_key = ? AND path = ? "
+            "AND status = 'active' ORDER BY created_at, id",
+            (key, path),
+        )
+        active: list[dict[str, Any]] = []
+        tags = (
+            {value.casefold() for value in parse_note(Path(path), content=content).tags}
+            if content is not None
+            else set()
+        )
+        for row in rows:
+            row["key"] = str(row.get("operation_key", ""))
+            row["tag"] = str(row.get("target", "")) if row.get("kind") == "frontmatter-tag" else ""
+            present = True
+            if content is not None and row.get("kind") == "inline-link":
+                present = bool(row.get("rendered") and str(row["rendered"]) in content)
+            elif content is not None and row.get("kind") == "frontmatter-tag":
+                present = str(row.get("target", "")).casefold() in tags
+            if not present:
+                self.db.execute(
+                    "UPDATE vault_edit_ownership SET status = 'modified', updated_at = ? "
+                    "WHERE id = ? AND status = 'active'",
+                    (utc_now(), row["id"]),
+                )
+                continue
+            active.append(row)
+        return active
+
+    @staticmethod
+    def _owned_removals(
+        decision: dict[str, Any], owned_operations: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        link_targets = {
+            str(item.get("target", "")).casefold()
+            for item in decision.get("obsolete_owned_links", [])
+        }
+        tags = {
+            str(item.get("tag", "")).casefold() for item in decision.get("obsolete_owned_tags", [])
+        }
+        return [
+            item
+            for item in owned_operations
+            if (
+                item.get("kind") == "inline-link"
+                and str(item.get("target", "")).casefold() in link_targets
+            )
+            or (
+                item.get("kind") == "frontmatter-tag"
+                and str(item.get("tag", "")).casefold() in tags
+            )
+        ]
+
+    def _update_edit_ownership(self, change: dict[str, Any], *, reverse: bool = False) -> None:
+        try:
+            decision = json.loads(change.get("decision_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return
+        operations = decision.get("operations", []) if isinstance(decision, dict) else []
+        if not isinstance(operations, list):
+            return
+        now = utc_now()
+        for operation in operations:
+            if not isinstance(operation, dict) or operation.get("kind") not in {
+                "inline-link",
+                "frontmatter-tag",
+            }:
+                continue
+            action = str(operation.get("action", ""))
+            if reverse:
+                action = "remove" if action == "add" else "add" if action == "remove" else action
+            kind = str(operation["kind"])
+            operation_key = str(operation.get("key", "")).casefold()
+            target = str(
+                operation.get("target", "")
+                if kind == "inline-link"
+                else operation.get("tag") or operation.get("key", "")
+            )
+            if not operation_key or not target:
+                continue
+            if action == "add":
+                self.db.execute(
+                    """
+                    INSERT INTO vault_edit_ownership(
+                        id, vault_key, path, kind, operation_key, target, anchor, rendered,
+                        status, source_change_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+                    ON CONFLICT(vault_key, path, kind, operation_key) DO UPDATE SET
+                        target = excluded.target, anchor = excluded.anchor,
+                        rendered = excluded.rendered, status = 'active',
+                        source_change_id = excluded.source_change_id,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        change["vault_key"],
+                        change["path"],
+                        kind,
+                        operation_key,
+                        target,
+                        str(operation.get("anchor", "")),
+                        str(operation.get("rendered", target)),
+                        change["id"],
+                        now,
+                        now,
+                    ),
+                )
+            elif action == "remove":
+                self.db.execute(
+                    "UPDATE vault_edit_ownership SET status = 'removed', "
+                    "source_change_id = ?, updated_at = ? WHERE vault_key = ? AND path = ? "
+                    "AND kind = ? AND operation_key = ? AND status IN ('active', 'modified')",
+                    (
+                        change["id"],
+                        now,
+                        change["vault_key"],
+                        change["path"],
+                        kind,
+                        operation_key,
+                    ),
+                )
+
     async def _learn_vault_model(
-        self, notes: list[dict[str, Any]], sweep_id: str
+        self,
+        notes: list[dict[str, Any]],
+        sweep_id: str,
+        *,
+        corpus_profile: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         config = self._llm_config()
         if not config.active:
@@ -704,7 +870,9 @@ class ObsyncService:
                     phase_label="Learning adaptive vault model",
                 ),
             )
-            model = await analyzer.learn_vault_model(notes, feedback=feedback)
+            model = await analyzer.learn_vault_model(
+                notes, feedback=feedback, corpus_profile=corpus_profile
+            )
             self._update_sweep_inference(
                 sweep_id,
                 "decision",
@@ -746,7 +914,7 @@ class ObsyncService:
         sweep_type = str(sweep.get("sweep_type") if sweep else "maintenance")
         self._start_sweep_inference(sweep_id, sweep_type)
         try:
-            maximum = max(1, min(int(self.db.get_setting("vault_link_limit", "20")), 50))
+            maximum = max(1, min(int(self.db.get_setting("vault_link_limit", "8")), 20))
             candidate_limit = max(
                 5,
                 min(
@@ -762,7 +930,7 @@ class ObsyncService:
                 ),
             )
         except ValueError:
-            maximum, candidate_limit, minimum_confidence = 20, 20, 0.72
+            maximum, candidate_limit, minimum_confidence = 8, 20, 0.72
         categories_raw = self.db.get_setting("vault_maintenance_categories", "[]")
         try:
             categories = set(json.loads(categories_raw))
@@ -770,7 +938,10 @@ class ObsyncService:
             categories = {"links", "tags"}
         change_ids: list[str] = []
         total = len(notes)
-        vault_model, feedback = await self._learn_vault_model(notes, sweep_id)
+        search_index, corpus_profile = self._refresh_vault_corpus_profile(notes)
+        vault_model, feedback = await self._learn_vault_model(
+            notes, sweep_id, corpus_profile=corpus_profile
+        )
         analyzer = LLMAnalyzer(
             self._llm_config(),
             progress=lambda kind, message: self._update_sweep_inference(
@@ -781,7 +952,6 @@ class ObsyncService:
                 phase_label="Analyzing note relationships",
             ),
         )
-        search_index = await asyncio.to_thread(AdaptiveVaultIndex, notes)
         failures = 0
         failure_messages: list[str] = []
         attempted = 0
@@ -808,8 +978,14 @@ class ObsyncService:
                 str(note.get("path", "")),
                 strip_maintenance_block(str(note.get("content", ""))),
                 exclude_path=str(note.get("path", "")),
-                maximum=candidate_limit,
+                maximum=min(50, candidate_limit * 3),
                 source_note=note,
+            )
+            candidates = [candidate for candidate in candidates if candidate.get("anchor_options")][
+                :candidate_limit
+            ]
+            owned_operations = self._owned_operations(
+                str(note.get("path", "")), content=str(note.get("content", ""))
             )
             attempted += 1
             try:
@@ -820,6 +996,8 @@ class ObsyncService:
                     minimum_confidence=minimum_confidence,
                     maximum_links=maximum,
                     feedback=feedback,
+                    owned_operations=owned_operations,
+                    tag_vocabulary=list(search_index.tag_counts),
                 )
             except Exception as exc:
                 failures += 1
@@ -842,7 +1020,38 @@ class ObsyncService:
                 )
                 continue
             relationships = decision.get("relationships", []) if "links" in categories else []
+            if "links" in categories:
+                existing_targets = {
+                    str(relationship.get("target", "")).casefold() for relationship in relationships
+                }
+                relationships.extend(
+                    relationship
+                    for relationship in explicit_category_hub_relationships(note, candidates)
+                    if str(relationship.get("target", "")).casefold() not in existing_targets
+                )
+                decision["relationships"] = relationships
             tags = decision.get("suggested_tags", []) if "tags" in categories else []
+            allowed_tag_keys = {
+                normalize_obsidian_tag(tag).casefold()
+                for tag in search_index.tag_counts
+                if normalize_obsidian_tag(tag)
+            } | {
+                normalize_obsidian_tag(item.get("name", "")).casefold()
+                for item in vault_model.get("category_hierarchy", [])
+                if isinstance(item, dict) and normalize_obsidian_tag(item.get("name", ""))
+            }
+            tags = [
+                normalize_obsidian_tag(tag)
+                for tag in tags
+                if normalize_obsidian_tag(tag).casefold() in allowed_tag_keys
+                and normalize_obsidian_tag(tag).casefold() != "obsync"
+            ]
+            decision["suggested_tags"] = tags
+            if "links" not in categories:
+                decision["obsolete_owned_links"] = []
+            if "tags" not in categories:
+                decision["obsolete_owned_tags"] = []
+            owned_removals = self._owned_removals(decision, owned_operations)
             self._update_sweep_inference(
                 sweep_id,
                 "decision",
@@ -853,12 +1062,13 @@ class ObsyncService:
                 phase_label=f"Analyzing note {index} of {total}",
                 current_note=str(note["path"]),
             )
-            after = maintenance_content(
+            after, operations = native_maintenance_content(
                 str(note.get("content", "")),
                 relationships,
-                include_tags="tags" in categories,
                 suggested_tags=tags,
+                owned_removals=owned_removals,
             )
+            decision["operations"] = operations
             if after == note.get("content"):
                 continue
             evidence = [
@@ -869,28 +1079,36 @@ class ObsyncService:
             relationship_confidences = [
                 float(item.get("confidence", 0.0)) for item in relationships
             ]
+            cleanup_confidences = [
+                float(item.get("confidence", 0.0))
+                for key in ("obsolete_owned_links", "obsolete_owned_tags")
+                for item in decision.get(key, [])
+            ]
             confidence = (
-                min(relationship_confidences)
-                if relationship_confidences
+                min([*relationship_confidences, *cleanup_confidences])
+                if relationship_confidences or cleanup_confidences
                 else float(vault_model.get("confidence", 0.75))
             )
-            if relationships:
-                reason = (
-                    f"AI selected {len(relationships)} evidence-backed relationship(s) "
-                    f"from {len(candidates)} retrieved candidates."
-                )
-            elif strip_maintenance_block(str(note.get("content", ""))) != str(
-                note.get("content", "")
-            ):
-                reason = "AI found no supported relationships; remove the previous generated block."
-            else:
-                reason = "AI recommended vault-specific tags supported by this note."
+            added_links = sum(
+                operation.get("kind") == "inline-link" and operation.get("action") == "add"
+                for operation in operations
+            )
+            added_tags = sum(
+                operation.get("kind") == "frontmatter-tag" and operation.get("action") == "add"
+                for operation in operations
+            )
+            removed = sum(operation.get("action") == "remove" for operation in operations)
+            reason = (
+                f"Native Obsidian maintenance proposes {added_links} inline link(s), "
+                f"{added_tags} frontmatter tag(s), and {removed} cleanup operation(s)."
+            )
+            summary = str(decision.get("summary") or "")
             change_ids.append(
                 self._create_vault_change(
                     sweep_id=sweep_id,
                     note=note,
                     after_content=after,
-                    reason=(decision.get("summary") or reason)[:1000],
+                    reason=(reason + (f" {summary}" if summary else ""))[:1000],
                     evidence=evidence,
                     confidence=confidence,
                     decision=decision,
@@ -966,6 +1184,7 @@ class ObsyncService:
                 (str(exc)[:2000], utc_now(), change_id),
             )
             raise
+        self._update_edit_ownership(change)
         now = utc_now()
         self.db.execute(
             "UPDATE vault_changes SET status = 'applied', error = '', applied_at = ?, "
@@ -1008,6 +1227,7 @@ class ObsyncService:
             except Exception as exc:
                 errors.append(f"{change['path']}: {exc}")
                 continue
+            self._update_edit_ownership(change, reverse=True)
             self.db.execute(
                 "UPDATE vault_changes SET status = 'reverted', reviewed_at = ? WHERE id = ?",
                 (utc_now(), change["id"]),
@@ -1049,7 +1269,10 @@ class ObsyncService:
                 )
                 return
             change_mode = str(sweep["change_mode"])
-            if sweep["sweep_type"] == "maintenance" or change_mode != "index-only":
+            if sweep["sweep_type"] == "index":
+                notes = self._indexed_vault_notes()
+                await asyncio.to_thread(self._refresh_vault_corpus_profile, notes)
+            else:
                 change_ids = await self._generate_maintenance_changes(sweep_id)
                 if change_mode == "auto":
                     for change_id in change_ids:
@@ -1124,15 +1347,16 @@ class ObsyncService:
             raise ValueError("Another vault sweep is already running")
         if not self.vault_status()["configured"] or not self.vault_status()["writable"]:
             raise ValueError("Choose an available Obsidian vault before starting a sweep")
-        default_mode = self.db.get_setting(
-            "vault_index_change_mode" if sweep_type == "index" else "vault_maintenance_change_mode",
-            "index-only" if sweep_type == "index" else "review",
+        default_mode = (
+            self.db.get_setting("vault_maintenance_change_mode", "review")
+            if sweep_type == "maintenance"
+            else "index-only"
         )
         mode = change_mode or default_mode
-        allowed = {"index-only", "review", "auto"} if sweep_type == "index" else {"review", "auto"}
+        allowed = {"index-only"} if sweep_type == "index" else {"review", "auto"}
         if mode not in allowed:
             raise ValueError("Sweep change handling is invalid")
-        if (sweep_type == "maintenance" or mode != "index-only") and not self._llm_config().active:
+        if sweep_type == "maintenance" and not self._llm_config().active:
             raise ValueError(
                 "Maintenance recommendations require Local AI. Enable and test a model first."
             )
@@ -3151,6 +3375,8 @@ class ObsyncService:
         source_path: str,
         text: str,
         profile: AIProfile,
+        *,
+        exclude_path: str = "",
     ) -> list[dict[str, Any]]:
         if not profile.use_vault_context or not profile.candidate_limit:
             return []
@@ -3178,6 +3404,7 @@ class ObsyncService:
         return adaptive.candidates(
             source_path,
             text,
+            exclude_path=exclude_path,
             maximum=min(profile.candidate_limit, 50),
         )
 
@@ -3437,7 +3664,12 @@ class ObsyncService:
             extracted = await asyncio.to_thread(
                 extract_document, staged_file, active_profile.input_char_limit
             )
-            vault_candidates = self._candidate_notes(source_rel, extracted.text, active_profile)
+            vault_candidates = self._candidate_notes(
+                source_rel,
+                extracted.text,
+                active_profile,
+                exclude_path=str(existing.get("destination_path", "")) if existing else "",
+            )
             match = None
             if not (existing and existing.get("destination_path")) and not (
                 existing and existing.get("duplicate_dismissed")
@@ -3560,13 +3792,13 @@ class ObsyncService:
                 )
                 maximum_links = min(
                     active_profile.related_notes_limit,
-                    int(self.db.get_setting("vault_link_limit", "20")),
+                    int(self.db.get_setting("vault_link_limit", "8")),
                     50,
                 )
             except ValueError:
                 minimum_relationship_confidence, maximum_links = (
                     0.72,
-                    min(active_profile.related_notes_limit, 20),
+                    min(active_profile.related_notes_limit, 8),
                 )
             analysis.relationships = [
                 relationship
@@ -3688,8 +3920,13 @@ class ObsyncService:
             processed_at = None if remote_vault else utc_now()
             if not remote_vault:
                 destination_path = safe_vault_path(self.settings.vault_path, destination)
+                current = ""
+                owned_operations: list[dict[str, Any]] = []
                 if destination_path.exists():
                     current = destination_path.read_text(encoding="utf-8")
+                    owned_operations = self._owned_operations(
+                        destination, content=current, vault_key="local"
+                    )
                     if not is_managed_note(current):
                         if existing and existing.get("vault_adopted"):
                             generated = adopt_preserving_original(current, generated)
@@ -3699,6 +3936,7 @@ class ObsyncService:
                             )
                     else:
                         generated = merge_preserving_manual(current, generated)
+                    generated = reapply_owned_operations(current, generated, owned_operations)
                 self._atomic_write(destination_path, generated)
                 self._upsert_indexed_note(
                     "local",
@@ -3737,6 +3975,9 @@ class ObsyncService:
                 ),
             )
             if remote_vault:
+                owned_operations = self._owned_operations(
+                    destination, vault_key=str(remote_vault["id"])
+                )
                 self.queue_command(
                     remote_vault["id"],
                     "write_note",
@@ -3745,6 +3986,7 @@ class ObsyncService:
                         "destination_path": destination,
                         "content": generated,
                         "allow_adopt": bool(existing and existing.get("vault_adopted")),
+                        "owned_operations": owned_operations,
                     },
                 )
             self.db.add_event(
@@ -4188,6 +4430,11 @@ class ObsyncService:
                             content = merge_preserving_manual(current, content)
                         elif payload.get("allow_adopt"):
                             content = adopt_preserving_original(current, content)
+                        content = reapply_owned_operations(
+                            current,
+                            content,
+                            list(payload.get("owned_operations", [])),
+                        )
                     parsed = parse_note(Path(destination), content=content, modified_ns=0).as_dict()
                     self._upsert_indexed_note(agent_id, parsed)
         elif command["command"] == "index_vault" and ok:
@@ -4433,9 +4680,7 @@ class ObsyncService:
             if key not in payload:
                 continue
             mode = str(payload[key]).strip()
-            allowed_modes = (
-                {"index-only", "review", "auto"} if "index" in key else {"review", "auto"}
-            )
+            allowed_modes = {"index-only"} if "index" in key else {"review", "auto"}
             if mode not in allowed_modes:
                 raise ValueError("Sweep change handling is invalid")
         for key in ("vault_index_schedule_frequency", "vault_maintenance_schedule_frequency"):
@@ -4463,7 +4708,7 @@ class ObsyncService:
             "vault_index_schedule_interval_hours": (1, 8760),
             "vault_maintenance_schedule_interval_hours": (1, 8760),
             "vault_relationship_candidate_limit": (5, 50),
-            "vault_link_limit": (1, 50),
+            "vault_link_limit": (1, 20),
         }
         for key, (minimum, maximum) in numeric_ranges.items():
             if key in payload:

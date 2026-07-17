@@ -68,6 +68,9 @@ CREATE TABLE IF NOT EXISTS vault_models (
     note_count INTEGER NOT NULL DEFAULT 0,
     learned_at TEXT,
     error TEXT NOT NULL DEFAULT '',
+    corpus_json TEXT NOT NULL DEFAULT '{}',
+    corpus_fingerprint TEXT NOT NULL DEFAULT '',
+    profiled_at TEXT,
     updated_at TEXT NOT NULL
 );
 
@@ -128,6 +131,25 @@ ON vault_changes(status, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_vault_changes_sweep
 ON vault_changes(sweep_id, status);
+
+CREATE TABLE IF NOT EXISTS vault_edit_ownership (
+    id TEXT PRIMARY KEY,
+    vault_key TEXT NOT NULL,
+    path TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    operation_key TEXT NOT NULL,
+    target TEXT NOT NULL DEFAULT '',
+    anchor TEXT NOT NULL DEFAULT '',
+    rendered TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    source_change_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(vault_key, path, kind, operation_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_edit_ownership_active
+ON vault_edit_ownership(vault_key, path, status);
 
 CREATE TABLE IF NOT EXISTS admin_users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -374,6 +396,17 @@ class Database:
                 connection.execute(
                     "ALTER TABLE vault_changes ADD COLUMN decision_json TEXT NOT NULL DEFAULT '{}'"
                 )
+            vault_model_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(vault_models)").fetchall()
+            }
+            for name, declaration in {
+                "corpus_json": "TEXT NOT NULL DEFAULT '{}'",
+                "corpus_fingerprint": "TEXT NOT NULL DEFAULT ''",
+                "profiled_at": "TEXT",
+            }.items():
+                if name not in vault_model_columns:
+                    connection.execute(f"ALTER TABLE vault_models ADD COLUMN {name} {declaration}")
             connection.execute(
                 """
                 UPDATE documents
@@ -394,7 +427,7 @@ class Database:
                 connection.execute("ALTER TABLE enrollments ADD COLUMN agent_id TEXT")
             row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
-                connection.execute("INSERT INTO schema_meta(version) VALUES (10)")
+                connection.execute("INSERT INTO schema_meta(version) VALUES (11)")
             else:
                 schema_version = int(row["version"])
             if row is not None and schema_version < 9:
@@ -418,6 +451,27 @@ class Database:
                     (utc_now(),),
                 )
                 connection.execute("UPDATE schema_meta SET version = 10")
+                schema_version = 10
+            if row is not None and schema_version < 11:
+                connection.execute(
+                    "UPDATE vault_changes SET status = 'superseded', reviewed_at = ?, "
+                    "error = 'Superseded by native inline maintenance; run a new Maintenance "
+                    "Sweep.' WHERE status = 'pending'",
+                    (utc_now(),),
+                )
+                connection.execute(
+                    "INSERT INTO settings(key, value, is_secret, updated_at) "
+                    "VALUES ('vault_index_change_mode', 'index-only', 0, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = 'index-only', "
+                    "updated_at = excluded.updated_at",
+                    (utc_now(),),
+                )
+                connection.execute(
+                    "UPDATE settings SET value = '8', updated_at = ? "
+                    "WHERE key = 'vault_link_limit' AND value = '20'",
+                    (utc_now(),),
+                )
+                connection.execute("UPDATE schema_meta SET version = 11")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

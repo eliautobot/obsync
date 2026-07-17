@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "obsync-app"
-version = "0.16.0"
+version = "0.17.0"
 description = "Continuously turn folders from any computer into organized Obsidian Markdown."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -64,6 +64,9 @@ packages = ["src/obsync"]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
 asyncio_mode = "auto"
+markers = [
+  "real_ai: opt-in end-to-end tests that call a configured local AI endpoint",
+]
 
 [tool.coverage.run]
 source = ["obsync"]

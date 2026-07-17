@@ -34,7 +34,7 @@ from .markdown import (
     set_source_status,
 )
 from .security import new_token, safe_vault_path
-from .vault_intelligence import content_hash, parse_note
+from .vault_intelligence import content_hash, parse_note, reapply_owned_operations
 
 
 def default_config_path() -> Path:
@@ -647,6 +647,11 @@ class AgentRuntime:
                     )
             else:
                 content = merge_preserving_manual(current, content)
+            content = reapply_owned_operations(
+                current,
+                content,
+                list(payload.get("owned_operations", [])),
+            )
         self._atomic_write(destination, content)
         return str(destination)
 

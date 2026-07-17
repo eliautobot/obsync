@@ -988,7 +988,8 @@ async function openVaultChangeDiff(changeId) {
   const modal = $("#modal");
   $("#modal-title").textContent = `Proposed vault change · ${change.path}`;
   const relationships = change.decision?.relationships || [];
-  $("#modal-body").innerHTML = `<p class="modal-note"><strong>Reason:</strong> ${escapeHtml(change.reason)}</p>${relationships.length ? `<h3>Evidence-backed relationships</h3><ul class="plain-list">${relationships.map((item) => `<li><strong>${escapeHtml(item.target)}</strong> — ${escapeHtml(item.relationship)} (${Math.round((item.confidence || 0) * 100)}%)<ul>${(item.evidence || []).map((fact) => `<li>${escapeHtml(fact)}</li>`).join("")}</ul></li>`).join("")}</ul>` : '<p class="modal-note">The AI found no supported relationships; this change removes or avoids a generated link block.</p>'}<div class="diff-grid"><section><h3>Before</h3><pre>${escapeHtml(change.before_content)}</pre></section><section><h3>After</h3><pre>${escapeHtml(change.after_content)}</pre></section></div><div class="modal-actions"><button class="secondary" id="diff-close" type="button">Close</button></div>`;
+  const operations = change.decision?.operations || [];
+  $("#modal-body").innerHTML = `<p class="modal-note"><strong>Reason:</strong> ${escapeHtml(change.reason)}</p>${operations.length ? `<h3>Native Obsidian edits</h3><ul class="plain-list">${operations.map((item) => `<li><strong>${escapeHtml(`${item.action} ${item.kind}`)}</strong>${item.anchor ? ` — “${escapeHtml(item.anchor)}” → ${escapeHtml(item.target || "")}` : item.tag ? ` — #${escapeHtml(item.tag)}` : ""}</li>`).join("")}</ul>` : ""}${relationships.length ? `<h3>Evidence-backed relationships</h3><ul class="plain-list">${relationships.map((item) => `<li><strong>${escapeHtml(item.target)}</strong> — link the existing phrase “${escapeHtml(item.anchor || "")}” because ${escapeHtml(item.relationship)} (${Math.round((item.confidence || 0) * 100)}%)<ul>${(item.evidence || []).map((fact) => `<li>${escapeHtml(fact)}</li>`).join("")}</ul></li>`).join("")}</ul>` : '<p class="modal-note">No new relationship link is being forced. This proposal only performs the native cleanup or tag edits listed above.</p>'}<div class="diff-grid"><section><h3>Before</h3><pre>${escapeHtml(change.before_content)}</pre></section><section><h3>After</h3><pre>${escapeHtml(change.after_content)}</pre></section></div><div class="modal-actions"><button class="secondary" id="diff-close" type="button">Close</button></div>`;
   if (!modal.open) modal.showModal();
   $("#diff-close").addEventListener("click", () => modal.close());
 }
@@ -1001,7 +1002,7 @@ async function renderVaultRecommendations() {
     host.innerHTML = '<section class="panel empty"><div class="empty-icon">✓</div><p>No vault-maintenance recommendations need review.</p></section>';
     return;
   }
-  host.innerHTML = `<div class="section-head"><div><h2>Vault maintenance recommendations</h2><p>${data.total} proposed whole-vault change(s), each with evidence and a before/after diff.</p></div><div class="settings-actions compact"><button class="secondary" id="apply-all-vault-changes" type="button">Apply all</button><button class="danger" id="reject-all-vault-changes" type="button">Disregard all</button></div></div><div class="vault-review-grid">${data.items.map((change) => `<article class="settings-card vault-change-card"><div><span class="eyebrow">${escapeHtml(change.sweep_type)} SWEEP</span><h3>${escapeHtml(change.path)}</h3><p>${escapeHtml(change.reason)}</p></div><div class="confidence-meter"><span style="width:${Math.round(change.confidence * 100)}%"></span></div><small>${Math.round(change.confidence * 100)}% confidence · ${(change.decision?.relationships || []).length} relationship(s) · ${(change.evidence || []).length} evidence item(s)</small><div class="document-actions"><button class="quiet view-vault-change" data-id="${change.id}" type="button">View evidence & diff</button><button class="secondary approve-vault-change" data-id="${change.id}" type="button">Apply</button><button class="danger reject-vault-change" data-id="${change.id}" type="button">Disregard</button></div></article>`).join("")}</div>`;
+  host.innerHTML = `<div class="section-head"><div><h2>Vault maintenance recommendations</h2><p>${data.total} proposed native Obsidian change(s), each with operation-level evidence and a before/after diff.</p></div><div class="settings-actions compact"><button class="secondary" id="apply-all-vault-changes" type="button">Apply all</button><button class="danger" id="reject-all-vault-changes" type="button">Disregard all</button></div></div><div class="vault-review-grid">${data.items.map((change) => { const operations = change.decision?.operations || []; const links = operations.filter((item) => item.kind === "inline-link").length; const tags = operations.filter((item) => item.kind === "frontmatter-tag").length; const cleanup = operations.filter((item) => item.action === "remove").length; return `<article class="settings-card vault-change-card"><div><span class="eyebrow">${escapeHtml(change.sweep_type)} SWEEP</span><h3>${escapeHtml(change.path)}</h3><p>${escapeHtml(change.reason)}</p></div><div class="confidence-meter"><span style="width:${Math.round(change.confidence * 100)}%"></span></div><small>${Math.round(change.confidence * 100)}% confidence · ${links} inline link edit(s) · ${tags} tag edit(s) · ${cleanup} cleanup(s)</small><div class="document-actions"><button class="quiet view-vault-change" data-id="${change.id}" type="button">View native edits & diff</button><button class="secondary approve-vault-change" data-id="${change.id}" type="button">Apply</button><button class="danger reject-vault-change" data-id="${change.id}" type="button">Disregard</button></div></article>`; }).join("")}</div>`;
   const reload = async () => { await Promise.all([renderVaultRecommendations(), refreshReviewBadge()]); };
   $$(".view-vault-change", host).forEach((button) => button.addEventListener("click", () => openVaultChangeDiff(button.dataset.id).catch((error) => toast(error.message, true))));
   $$(".approve-vault-change", host).forEach((button) => button.addEventListener("click", async () => {
@@ -1233,21 +1234,21 @@ async function renderVault() {
         ${sweepProgress(sweeps.active, "index")}
         ${sweepFailure(sweeps.recent, "index")}
         <div class="sweep-ai-host ai-live-host" data-ai-live-host data-sweep-ai-host="index">${aiActivityMarkup(sweepAiActivity(activity, "index", sweeps.active))}</div>
-        <div class="field"><label for="vault-index-change-mode">Index sweep changes</label><select id="vault-index-change-mode"><option value="index-only">Index only — do not recommend changes</option><option value="review">Send all recommended changes to Review</option><option value="auto">Allow AI Agent to apply all recommended changes</option></select><small class="danger-copy">Automatic mode can change existing entries without human approval. Every change is logged and can be undone.</small></div>
+        <p class="inline-status good">Index Sweep is always read-only. It learns folders, native tags, high-frequency categories, durable entities, category hubs, and exact linkable phrases without editing notes.</p>
         ${sweepScheduleFields("vault-index", settings)}
       </section>
-      <section class="settings-card full-width sweep-overview"><div class="section-head"><div><span class="eyebrow">ACTIVE VAULT CARE</span><h3>Maintenance Sweep</h3><p>Uses Local AI and this vault's learned organization model to recommend only specific, evidence-backed relationships and tags. Retrieval similarity alone can never create a link.</p></div><div class="settings-actions compact"><button class="secondary start-sweep" data-type="maintenance" type="button">Start Maintenance Sweep</button></div></div>
+      <section class="settings-card full-width sweep-overview"><div class="section-head"><div><span class="eyebrow">ACTIVE VAULT CARE</span><h3>Maintenance Sweep</h3><p>Uses Local AI and the read-only vault index to place links on exact phrases already in each note and maintain native YAML tags. It never appends an Obsync relationship section or links same-category notes merely because they look alike.</p></div><div class="settings-actions compact"><button class="secondary start-sweep" data-type="maintenance" type="button">Start Maintenance Sweep</button></div></div>
         ${sweepProgress(sweeps.active, "maintenance")}
         ${sweepFailure(sweeps.recent, "maintenance")}
         <div class="sweep-ai-host ai-live-host" data-ai-live-host data-sweep-ai-host="maintenance">${aiActivityMarkup(sweepAiActivity(activity, "maintenance", sweeps.active))}</div>
         <div class="field"><label for="vault-maintenance-change-mode">Maintenance sweep changes</label><select id="vault-maintenance-change-mode"><option value="review">Send all recommended changes to Review</option><option value="auto">Allow AI Agent to apply all recommended changes</option></select><small class="danger-copy">Warning: automatic mode may modify existing notes, links, tags, and organization without human approval.</small></div>
         <div class="behavior-grid maintenance-categories">
-          ${[["links", "Relationship links and backlinks"], ["tags", "Shared relationship tags"]].map(([value, label]) => `<label class="check-row"><input class="maintenance-category" type="checkbox" value="${value}"> ${label}</label>`).join("")}
+          ${[["links", "Inline relationship links on existing phrases"], ["tags", "Native YAML/frontmatter tags"]].map(([value, label]) => `<label class="check-row"><input class="maintenance-category" type="checkbox" value="${value}"> ${label}</label>`).join("")}
         </div>
         ${sweepScheduleFields("vault-maintenance", settings)}
       </section>
       <section class="settings-card full-width"><h3>Adaptive vault model</h3><p><strong>${escapeHtml(vaultModel.status || "not-learned")}</strong>${vaultModel.learned_at ? ` · learned ${relativeTime(vaultModel.learned_at)}` : ""}${vaultModel.model_name ? ` · ${escapeHtml(vaultModel.model_name)}` : ""}</p><p>${escapeHtml(learnedModel.vault_summary || "The model is learned during the first AI-assisted sweep and refreshed when vault content or review feedback changes. No business categories are hardcoded.")}</p>${learnedPatterns.length ? `<ul class="plain-list">${learnedPatterns.map((pattern) => `<li><strong>${escapeHtml(pattern.name)}</strong> — ${escapeHtml((pattern.signals || []).join("; "))}</li>`).join("")}</ul>` : ""}${vaultModel.error ? `<p class="danger-copy">${escapeHtml(vaultModel.error)}</p>` : ""}</section>
-      <section class="settings-card full-width"><h3>Whole-vault matching and links</h3><div class="field-grid compact-grid"><div class="field"><label for="existing-note-policy">Strong existing-note matches</label><select id="existing-note-policy"><option value="review">Send first adoption to Review</option><option value="auto">Adopt strong matches automatically</option></select><small>Exact source/content matches update automatically. Ambiguous matches always require review.</small></div><div class="field"><label for="vault-candidate-limit">Candidate notes per AI decision</label><input id="vault-candidate-limit" type="number" min="5" max="50" value="${escapeHtml(settings.vault_relationship_candidate_limit || "20")}"><small>Retrieval only shortlists candidates; it never creates links.</small></div><div class="field"><label for="vault-relationship-confidence">Minimum AI relationship confidence</label><input id="vault-relationship-confidence" type="number" min="0.5" max="1" step="0.01" value="${escapeHtml(settings.vault_relationship_min_confidence || "0.72")}"><small>Every accepted link also requires specific source and target evidence.</small></div><div class="field"><label for="vault-link-limit">Maximum evidence-backed links per note</label><input id="vault-link-limit" type="number" min="1" max="50" value="${escapeHtml(settings.vault_link_limit || "20")}"><small>A safety ceiling, not a target.</small></div><div class="field"><label for="vault-timezone">Schedule timezone</label><input id="vault-timezone" value="${escapeHtml(settings.vault_schedule_timezone || "America/New_York")}"></div></div></section>
+      <section class="settings-card full-width"><h3>Whole-vault matching and links</h3><div class="field-grid compact-grid"><div class="field"><label for="existing-note-policy">Strong existing-note matches</label><select id="existing-note-policy"><option value="review">Send first adoption to Review</option><option value="auto">Adopt strong matches automatically</option></select><small>Exact source/content matches update automatically. Ambiguous matches always require review.</small></div><div class="field"><label for="vault-candidate-limit">Candidate notes per AI decision</label><input id="vault-candidate-limit" type="number" min="5" max="50" value="${escapeHtml(settings.vault_relationship_candidate_limit || "20")}"><small>High-recall retrieval is narrowed to candidates with a safe phrase already present in the source note.</small></div><div class="field"><label for="vault-relationship-confidence">Minimum AI relationship confidence</label><input id="vault-relationship-confidence" type="number" min="0.5" max="1" step="0.01" value="${escapeHtml(settings.vault_relationship_min_confidence || "0.72")}"><small>Every accepted link requires a permitted inline anchor plus source and target evidence.</small></div><div class="field"><label for="vault-link-limit">Maximum inline links per note</label><input id="vault-link-limit" type="number" min="1" max="20" value="${escapeHtml(settings.vault_link_limit || "8")}"><small>A safety ceiling, not a target. No anchor means no link.</small></div><div class="field"><label for="vault-timezone">Schedule timezone</label><input id="vault-timezone" value="${escapeHtml(settings.vault_schedule_timezone || "America/New_York")}"></div></div></section>
       <section class="settings-card full-width"><h3>Sweep history and rollback</h3>${recentSweeps ? `<div class="table-wrap sweep-history"><table><thead><tr><th>Type</th><th>Status</th><th>Notes</th><th>Recommendations</th><th>Applied</th><th>Finished</th><th>Rollback</th></tr></thead><tbody>${recentSweeps}</tbody></table></div>` : '<p class="inline-status">No vault sweeps have run yet.</p>'}</section>
       <section class="settings-card"><h3>Vault safety</h3><p>Obsync never writes inside <code>.obsidian</code>. Document adoption preserves the entire prior note outside the managed section. Sweeps use expected hashes, stop on concurrent edits, keep before/after content, and never auto-delete or auto-merge notes.</p></section>
     </form>`;
@@ -1272,7 +1273,6 @@ async function renderVault() {
   };
   $("#vault-agent").addEventListener("change", updateAgentStatus);
   updateAgentStatus();
-  $("#vault-index-change-mode").value = settings.vault_index_change_mode || "index-only";
   $("#vault-maintenance-change-mode").value = settings.vault_maintenance_change_mode || "review";
   $("#existing-note-policy").value = settings.existing_note_policy || "review";
   ["vault-index", "vault-maintenance"].forEach((prefix) => {
@@ -1286,7 +1286,7 @@ async function renderVault() {
     button.disabled = true;
     try {
       const type = button.dataset.type;
-      const changeMode = type === "index" ? $("#vault-index-change-mode").value : $("#vault-maintenance-change-mode").value;
+      const changeMode = type === "index" ? "index-only" : $("#vault-maintenance-change-mode").value;
       await api(`/api/v1/admin/vault/sweeps/${type}/start`, { method: "POST", body: { change_mode: changeMode, full_rebuild: button.dataset.full === "true" } });
       toast(`${type === "index" ? "Index" : "Maintenance"} Sweep started.`);
       await navigate("vault", { silent: true });
@@ -1341,7 +1341,7 @@ function aiSessions(activity) {
 function sweepAiActivity(activity, type, activeSweep) {
   const source = activity?.sweeps?.[type] || { active: [], last: null };
   const matching = activeSweep?.sweep_type === type ? activeSweep : null;
-  const isIndexOnly = type === "index" && matching?.change_mode === "index-only";
+  const isIndexOnly = type === "index";
   const active = isIndexOnly ? [] : (source.active || []);
   const waitingForAi = Boolean(matching && !isIndexOnly && !active.length);
   return {
@@ -1358,7 +1358,7 @@ function sweepAiActivity(activity, type, activeSweep) {
       ? "Index-only sweep does not use AI"
       : waitingForAi ? "Waiting for the AI phase" : `No ${type} sweep inference is active`,
     idle_message: isIndexOnly
-      ? "This sweep only refreshes the vault index. Choose Review or automatic changes before starting an Index Sweep to run Local AI inference."
+      ? "This read-only sweep refreshes the corpus profile, folder hierarchy, tag vocabulary, category hubs, and exact note index. Maintenance Sweep is the separate AI editing process."
       : waitingForAi
         ? "Obsync is indexing the vault first. Live model thinking and output will appear here when AI analysis begins."
         : `Start an AI-assisted ${type === "index" ? "Index" : "Maintenance"} Sweep to follow model thinking, streamed output, and validated decisions here.`,
@@ -1848,7 +1848,7 @@ function vaultSettingsPayload() {
     vault_mode: $('input[name="vault-mode"]:checked')?.value || "local",
     vault_agent_id: $("#vault-agent")?.value || "",
   };
-  if (!$("#vault-index-change-mode")) return payload;
+  if (!$("#existing-note-policy")) return payload;
   return {
     ...payload,
     existing_note_policy: $("#existing-note-policy").value,
@@ -1858,7 +1858,7 @@ function vaultSettingsPayload() {
     vault_index_schedule_weekday: $("#vault-index-weekday").value,
     vault_index_schedule_month_day: $("#vault-index-month-day").value,
     vault_index_schedule_interval_hours: $("#vault-index-interval").value,
-    vault_index_change_mode: $("#vault-index-change-mode").value,
+    vault_index_change_mode: "index-only",
     vault_maintenance_schedule_enabled: $("#vault-maintenance-schedule-enabled").checked,
     vault_maintenance_schedule_frequency: $("#vault-maintenance-frequency").value,
     vault_maintenance_schedule_time: $("#vault-maintenance-time").value,

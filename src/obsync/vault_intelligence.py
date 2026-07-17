@@ -30,6 +30,8 @@ _LABELED_IDENTIFIER_RE = re.compile(
     r"([A-Z0-9][A-Z0-9./_-]{2,})\b"
 )
 _EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+_TOKEN_WITH_SPAN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9&'’./_-]*")
+_STRUCTURAL_HUB_WORDS = frozenset({"catalog", "dashboard", "hub", "index", "moc", "overview"})
 STOP_WORDS = frozenset(
     {
         "about",
@@ -95,6 +97,389 @@ def search_terms(value: str, *, maximum: int = 5000) -> set[str]:
     return terms
 
 
+def normalize_obsidian_tag(value: str) -> str:
+    """Normalize a native Obsidian tag while preserving hierarchical slash segments."""
+    segments = [slugify(part, fallback="", max_length=40) for part in str(value).split("/")]
+    clean = "/".join(segment for segment in segments if segment)[:80].strip("/")
+    return clean
+
+
+def _frontmatter_span(content: str) -> tuple[int, int] | None:
+    if not content.startswith(("---\n", "---\r\n")):
+        return None
+    match = re.match(r"\A---\r?\n.*?\r?\n---(?:\r?\n|\Z)", content, flags=re.DOTALL)
+    return match.span() if match else None
+
+
+def _protected_markdown_ranges(content: str) -> list[tuple[int, int]]:
+    """Return regions where inserting an inline wikilink would change Markdown semantics."""
+    ranges: list[tuple[int, int]] = []
+    frontmatter = _frontmatter_span(content)
+    if frontmatter:
+        ranges.append(frontmatter)
+    patterns = (
+        r"<!--.*?-->",
+        r"(?ms)^(?:```|~~~).*?^(?:```|~~~)[ \t]*$",
+        r"`+[^`\n]*`+",
+        r"!?\[\[[^\]\n]+?\]\]",
+        r"!?\[[^\]\n]*\]\([^\)\n]+\)",
+    )
+    for pattern in patterns:
+        ranges.extend(match.span() for match in re.finditer(pattern, content, flags=re.DOTALL))
+    offset = 0
+    for line in content.splitlines(keepends=True):
+        stripped = line.lstrip()
+        # Headings are navigation labels, and tables need escaped pipes in aliased wikilinks.
+        table_like = (
+            stripped.startswith("|")
+            or stripped.rstrip().endswith("|")
+            or (line.count("|") >= 2 and "[[" not in line)
+        )
+        if stripped.startswith("#") or table_like:
+            ranges.append((offset, offset + len(line)))
+        offset += len(line)
+    ranges.sort()
+    return ranges
+
+
+def _range_is_free(start: int, end: int, protected: list[tuple[int, int]]) -> bool:
+    return not any(
+        start < protected_end and end > protected_start
+        for protected_start, protected_end in protected
+    )
+
+
+def _free_occurrences(content: str, text_value: str) -> list[tuple[int, int, str]]:
+    if not text_value or len(text_value) > 160 or "\n" in text_value:
+        return []
+    protected = _protected_markdown_ranges(content)
+    matches: list[tuple[int, int, str]] = []
+    for match in re.finditer(re.escape(text_value), content, flags=re.IGNORECASE):
+        start, end = match.span()
+        if (
+            start > 0
+            and (text_value[0].isalnum() or text_value[0] == "_")
+            and (content[start - 1].isalnum() or content[start - 1] == "_")
+        ):
+            continue
+        if (
+            end < len(content)
+            and (text_value[-1].isalnum() or text_value[-1] == "_")
+            and (content[end].isalnum() or content[end] == "_")
+        ):
+            continue
+        if _range_is_free(start, end, protected):
+            matches.append((start, end, content[start:end]))
+    return matches
+
+
+def _candidate_descriptor_terms(candidate: dict[str, Any]) -> tuple[list[str], set[str]]:
+    descriptors = [
+        str(candidate.get("title", "")),
+        Path(str(candidate.get("path", ""))).stem.replace("_", " ").replace("-", " "),
+        *(str(value) for value in candidate.get("aliases", [])),
+    ]
+    for entity in candidate.get("entities", []):
+        value = str(entity)
+        descriptors.append(value.split(":", 1)[1] if ":" in value else value)
+    clean_descriptors: list[str] = []
+    terms: set[str] = set()
+    for descriptor in descriptors:
+        clean = re.sub(r"\s+", " ", descriptor).strip(" .,:;#")[:160]
+        if len(clean) < 3 or clean.casefold() in {item.casefold() for item in clean_descriptors}:
+            continue
+        clean_descriptors.append(clean)
+        terms.update(search_terms(clean, maximum=100))
+    return clean_descriptors[:30], terms
+
+
+def inline_anchor_options(
+    source_content: str,
+    candidate: dict[str, Any],
+    *,
+    document_frequency: Counter[str] | None = None,
+    note_count: int = 1,
+    maximum: int = 8,
+) -> list[dict[str, Any]]:
+    """Find exact, safe source phrases that could naturally point at one candidate note."""
+    content = strip_maintenance_block(source_content)
+    descriptors, target_terms = _candidate_descriptor_terms(candidate)
+    if not target_terms:
+        return []
+    frequency = document_frequency or Counter()
+    total = max(1, note_count)
+    scored: dict[str, tuple[float, str, str]] = {}
+
+    def add(value: str, score: float, reason: str) -> None:
+        clean = value.strip()
+        if not (3 <= len(clean) <= 160) or clean.startswith("#") or "]]" in clean:
+            return
+        occurrences = _free_occurrences(content, clean)
+        if not occurrences:
+            return
+        actual = occurrences[0][2]
+        key = actual.casefold()
+        previous = scored.get(key)
+        if previous is None or score > previous[0]:
+            scored[key] = (score, reason, actual)
+
+    for descriptor in descriptors:
+        descriptor_terms = search_terms(descriptor, maximum=100)
+        rarity = sum(
+            math.log((total + 1) / (frequency.get(term, 0) + 1)) + 1 for term in descriptor_terms
+        )
+        add(descriptor, 100.0 + rarity, "exact target title, alias, or identifier")
+
+    protected = _protected_markdown_ranges(content)
+    line_offset = 0
+    for line in content.splitlines(keepends=True):
+        tokens = list(_TOKEN_WITH_SPAN_RE.finditer(line))
+        for start_index in range(len(tokens)):
+            for length in range(1, min(6, len(tokens) - start_index) + 1):
+                first = tokens[start_index]
+                last = tokens[start_index + length - 1]
+                start = line_offset + first.start()
+                end = line_offset + last.end()
+                if not _range_is_free(start, end, protected):
+                    continue
+                phrase = content[start:end]
+                phrase_terms = search_terms(phrase, maximum=30)
+                shared = phrase_terms & target_terms
+                if not shared:
+                    continue
+                rarity = {
+                    term: math.log((total + 1) / (frequency.get(term, 0) + 1)) + 1
+                    for term in shared
+                }
+                rare_single = len(shared) == 1 and any(
+                    frequency.get(term, 0) / total <= 0.05 and len(term) >= 4 for term in shared
+                )
+                if len(shared) < 2 and not rare_single:
+                    continue
+                extra_terms = phrase_terms - target_terms
+                score = sum(rarity.values()) + len(shared) * 2 - len(extra_terms) * 0.35
+                add(phrase, score, "distinctive phrase shared with the target note")
+        line_offset += len(line)
+
+    ranked = sorted(scored.items(), key=lambda item: (-item[1][0], len(item[0]), item[0]))
+    return [
+        {"text": actual, "score": round(score, 4), "reason": reason}
+        for _key, (score, reason, actual) in ranked[:maximum]
+    ]
+
+
+def _split_link_target(value: str) -> tuple[str, str]:
+    raw = str(value).strip()
+    path, _separator, label = raw.partition("|")
+    return path.strip().removesuffix(".md"), label.strip()
+
+
+def _render_inline_link(target: str, anchor: str) -> str:
+    path, _label = _split_link_target(target)
+    if not path or any(value in path for value in ("\n", "|", "]]")):
+        return ""
+    return f"[[{path}|{anchor}]]"
+
+
+def add_inline_link(content: str, *, target: str, anchor: str) -> tuple[str, dict[str, Any] | None]:
+    rendered = _render_inline_link(target, anchor)
+    if not rendered or rendered in content:
+        return content, None
+    occurrences = _free_occurrences(content, anchor)
+    if not occurrences:
+        return content, None
+    start, end, actual = occurrences[0]
+    rendered = _render_inline_link(target, actual)
+    updated = content[:start] + rendered + content[end:]
+    path, _label = _split_link_target(target)
+    return updated, {
+        "action": "add",
+        "kind": "inline-link",
+        "key": path.casefold(),
+        "target": path,
+        "anchor": actual,
+        "rendered": rendered,
+    }
+
+
+def remove_owned_inline_link(
+    content: str, operation: dict[str, Any]
+) -> tuple[str, dict[str, Any] | None]:
+    rendered = str(operation.get("rendered", ""))
+    anchor = str(operation.get("anchor", ""))
+    if not rendered or content.count(rendered) != 1:
+        return content, None
+    return content.replace(rendered, anchor, 1), {
+        "action": "remove",
+        "kind": "inline-link",
+        "key": str(operation.get("key") or operation.get("target", "")).casefold(),
+        "target": str(operation.get("target", "")),
+        "anchor": anchor,
+        "rendered": rendered,
+        "ownership_id": str(operation.get("id", "")),
+    }
+
+
+def _replace_frontmatter_tags(content: str, tags: list[str]) -> str:
+    original = content
+    crlf_count = content.count("\r\n")
+    use_crlf = crlf_count > content.count("\n") - crlf_count
+    if use_crlf:
+        content = content.replace("\r\n", "\n")
+
+    def restore(value: str) -> str:
+        return value.replace("\n", "\r\n") if use_crlf else value
+
+    normalized: list[str] = []
+    for value in tags:
+        tag = normalize_obsidian_tag(value)
+        if tag and tag.casefold() not in {item.casefold() for item in normalized}:
+            normalized.append(tag)
+    if not content.startswith("---\n"):
+        if not normalized:
+            return original
+        block = "tags:\n" + "\n".join(f"  - {tag}" for tag in normalized)
+        return restore(f"---\n{block}\n---\n{content}")
+    span = _frontmatter_span(content)
+    if not span:
+        return original
+    frontmatter = content[4 : span[1] - (4 if content[span[1] - 1] == "\n" else 3)]
+    lines = frontmatter.splitlines()
+    tag_start = next(
+        (index for index, line in enumerate(lines) if re.match(r"^tags\s*:", line)), None
+    )
+    tag_end = tag_start
+    if tag_start is not None:
+        tag_end = tag_start + 1
+        while tag_end < len(lines) and (
+            not lines[tag_end].strip()
+            or lines[tag_end].startswith((" ", "\t"))
+            or re.match(r"^-\s+", lines[tag_end])
+            or lines[tag_end].lstrip().startswith("#")
+        ):
+            tag_end += 1
+        # Comments and YAML anchors inside the tag declaration are human context; fail closed.
+        if any(
+            line.lstrip().startswith("#") or "#" in line or "&" in line
+            for line in lines[tag_start:tag_end]
+        ):
+            return original
+    replacement = ["tags:", *(f"  - {tag}" for tag in normalized)] if normalized else []
+    if tag_start is None:
+        lines.extend(replacement)
+    else:
+        lines[tag_start:tag_end] = replacement
+    if not any(line.strip() for line in lines):
+        return restore(content[span[1] :])
+    rebuilt = "---\n" + "\n".join(lines).rstrip() + "\n---"
+    if content[span[1] - 1 : span[1]] == "\n":
+        rebuilt += "\n"
+    return restore(rebuilt + content[span[1] :])
+
+
+def change_native_tag(
+    content: str, *, tag: str, remove: bool = False, ownership_id: str = ""
+) -> tuple[str, dict[str, Any] | None]:
+    clean = normalize_obsidian_tag(tag)
+    if not clean:
+        return content, None
+    current = note_tags(content.replace("\r\n", "\n"))
+    current_keys = {value.casefold() for value in current}
+    if remove:
+        if clean.casefold() not in current_keys:
+            return content, None
+        tags = [value for value in current if value.casefold() != clean.casefold()]
+        action = "remove"
+    else:
+        if clean.casefold() in current_keys:
+            return content, None
+        tags = [*current, clean]
+        action = "add"
+    updated = _replace_frontmatter_tags(content, tags)
+    if updated == content:
+        return content, None
+    return updated, {
+        "action": action,
+        "kind": "frontmatter-tag",
+        "key": clean.casefold(),
+        "tag": clean,
+        "rendered": clean,
+        "ownership_id": ownership_id,
+    }
+
+
+def native_maintenance_content(
+    content: str,
+    relationships: list[dict[str, Any]],
+    *,
+    suggested_tags: list[str] | None = None,
+    owned_removals: list[dict[str, Any]] | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Apply only native inline links/frontmatter tags and return operation-level audit data."""
+    updated = strip_maintenance_block(content)
+    operations: list[dict[str, Any]] = []
+    if updated != content:
+        operations.append({"action": "remove", "kind": "legacy-maintenance-block", "key": "legacy"})
+    for owned in owned_removals or []:
+        if owned.get("kind") == "inline-link":
+            updated, operation = remove_owned_inline_link(updated, owned)
+        elif owned.get("kind") == "frontmatter-tag":
+            updated, operation = change_native_tag(
+                updated,
+                tag=str(owned.get("tag") or owned.get("key", "")),
+                remove=True,
+                ownership_id=str(owned.get("id", "")),
+            )
+        else:
+            operation = None
+        if operation:
+            operations.append(operation)
+    for relationship in relationships:
+        updated, operation = add_inline_link(
+            updated,
+            target=str(relationship.get("target", "")),
+            anchor=str(relationship.get("anchor", "")),
+        )
+        if operation:
+            operation["relationship"] = str(relationship.get("relationship", ""))
+            operation["confidence"] = float(relationship.get("confidence", 0.0))
+            operations.append(operation)
+    for tag in suggested_tags or []:
+        updated, operation = change_native_tag(updated, tag=tag)
+        if operation:
+            operations.append(operation)
+    return updated, operations
+
+
+def reapply_owned_operations(
+    current_content: str, generated_content: str, operations: list[dict[str, Any]]
+) -> str:
+    """Rebase owned edits across sync without resurrecting user removals."""
+    updated = generated_content
+    for operation in operations:
+        kind = str(operation.get("kind", ""))
+        if kind == "inline-link":
+            rendered = str(operation.get("rendered", ""))
+            anchor = str(operation.get("anchor", ""))
+            if (
+                rendered
+                and anchor
+                and rendered in current_content
+                and rendered not in updated
+                and anchor in updated
+            ):
+                updated, _added = add_inline_link(
+                    updated,
+                    target=str(operation.get("target", "")),
+                    anchor=anchor,
+                )
+        elif kind == "frontmatter-tag":
+            tag = str(operation.get("tag") or operation.get("key", ""))
+            if tag and tag.casefold() in {value.casefold() for value in note_tags(current_content)}:
+                updated, _added = change_native_tag(updated, tag=tag)
+    return updated
+
+
 def _json_safe(value: Any, *, depth: int = 0) -> Any:
     """Normalize YAML values before they cross the Desktop JSON boundary."""
     if depth >= 20:
@@ -120,10 +505,11 @@ def _json_safe(value: Any, *, depth: int = 0) -> Any:
 
 
 def _frontmatter(content: str) -> dict[str, Any]:
-    if not content.startswith("---\n"):
+    normalized = content.replace("\r\n", "\n")
+    if not normalized.startswith("---\n"):
         return {}
     try:
-        raw, _body = content[4:].split("\n---", 1)
+        raw, _body = normalized[4:].split("\n---", 1)
         values = yaml.safe_load(raw) or {}
     except (ValueError, yaml.YAMLError):
         return {}
@@ -212,7 +598,7 @@ def parse_note(
     knowledge = strip_maintenance_block(bounded)
     properties = _frontmatter(bounded)
     aliases = _string_list(properties.get("aliases", properties.get("alias", [])), maximum=100)
-    tags = note_tags(knowledge)
+    tags = note_tags(knowledge.replace("\r\n", "\n"))
     for tag in _INLINE_TAG_RE.findall(knowledge):
         if tag not in tags:
             tags.append(tag)
@@ -279,6 +665,48 @@ def link_target(note: dict[str, Any]) -> str:
     if not path:
         return title
     return f"{path}|{title}" if Path(path).name.casefold() != title.casefold() else path
+
+
+def explicit_category_hub_relationships(
+    source_note: dict[str, Any], candidates: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Return category-hub links proven by an exact source mention and a hub-to-source link."""
+    source_path = _target_key(str(source_note.get("path", "")))
+    source_title = str(source_note.get("title", "")).strip()
+    relationships: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if candidate.get("structural_role") != "category-hub":
+            continue
+        anchor_options = candidate.get("anchor_options", [])
+        anchor = next(
+            (
+                str(option.get("text", ""))
+                for option in anchor_options
+                if isinstance(option, dict)
+                and option.get("reason") == "exact target title, alias, or identifier"
+                and str(option.get("text", "")).strip()
+            ),
+            "",
+        )
+        if not anchor:
+            continue
+        candidate_links = {_target_key(str(link)) for link in candidate.get("links", [])}
+        if source_path not in candidate_links:
+            continue
+        relationships.append(
+            {
+                "target": link_target(candidate),
+                "anchor": anchor,
+                "relationship_type": "category-hub",
+                "relationship": "This category hub explicitly catalogs the source note",
+                "evidence": [
+                    f"SOURCE: the note explicitly names {anchor}",
+                    f"TARGET: the hub directly links to {source_title or source_path}",
+                ],
+                "confidence": 0.99,
+            }
+        )
+    return relationships
 
 
 def _identifier_entities(entities: list[str]) -> set[str]:
@@ -476,8 +904,11 @@ class AdaptiveVaultIndex:
 
     def __init__(self, notes: list[dict[str, Any]]):
         self.notes = notes
+        self.note_count = len(notes)
         self.term_counts: list[Counter[str]] = []
         self.postings: dict[str, list[int]] = {}
+        self.tag_counts: Counter[str] = Counter()
+        self.folder_counts: Counter[str] = Counter()
         document_frequency: Counter[str] = Counter()
         for index, note in enumerate(notes):
             terms = Counter(search_terms(_note_search_text(note)))
@@ -485,10 +916,66 @@ class AdaptiveVaultIndex:
             for term in terms:
                 self.postings.setdefault(term, []).append(index)
                 document_frequency[term] += 1
+            self.tag_counts.update(
+                normalize_obsidian_tag(str(tag))
+                for tag in note.get("tags", [])
+                if normalize_obsidian_tag(str(tag))
+            )
+            path = Path(str(note.get("path", "")))
+            parent = path.parent.as_posix()
+            if parent not in {"", "."}:
+                parts = path.parent.parts
+                for depth in range(1, min(len(parts), 6) + 1):
+                    self.folder_counts[Path(*parts[:depth]).as_posix()] += 1
+        self.document_frequency = document_frequency
         total = max(1, len(notes))
         self.idf = {
             term: math.log((total + 1) / (frequency + 1)) + 1
             for term, frequency in document_frequency.items()
+        }
+
+    @staticmethod
+    def _hub_score(note: dict[str, Any]) -> int:
+        title_terms = search_terms(
+            f"{note.get('title', '')} {Path(str(note.get('path', ''))).stem}", maximum=50
+        )
+        score = 2 if title_terms & _STRUCTURAL_HUB_WORDS else 0
+        outgoing = len(note.get("links", []))
+        if outgoing >= 10:
+            score += 2
+        elif outgoing >= 5:
+            score += 1
+        return score
+
+    def corpus_profile(self) -> dict[str, Any]:
+        total = max(1, self.note_count)
+        high_frequency = [
+            {"term": term, "notes": count, "ratio": round(count / total, 4)}
+            for term, count in sorted(
+                self.document_frequency.items(), key=lambda item: (-item[1], item[0])
+            )
+            if count >= max(3, math.ceil(total * 0.05))
+        ][:120]
+        hubs = [
+            {
+                "path": str(note.get("path", "")),
+                "title": str(note.get("title", "")),
+                "outgoing_links": len(note.get("links", [])),
+            }
+            for note in self.notes
+            if self._hub_score(note) >= 2
+        ][:100]
+        return {
+            "note_count": self.note_count,
+            "folders": [
+                {"path": path, "notes": count}
+                for path, count in self.folder_counts.most_common(150)
+            ],
+            "tag_vocabulary": [
+                {"tag": tag, "notes": count} for tag, count in self.tag_counts.most_common(150)
+            ],
+            "high_frequency_terms": high_frequency,
+            "existing_category_hubs": hubs,
         }
 
     def candidates(
@@ -536,11 +1023,20 @@ class AdaptiveVaultIndex:
                     "reasons": reasons,
                     "link_target": link_target(note),
                     "content_excerpt": _excerpt(clean_content, set(query_terms), maximum=4000),
+                    "structural_role": "category-hub" if self._hub_score(note) >= 2 else "note",
                 }
             )
             scored.append((score, str(note.get("title", "")).casefold(), enriched))
         scored.sort(key=lambda item: (-item[0], item[1], str(item[2].get("path", ""))))
-        return [note for _score, _title, note in scored[: max(0, maximum)]]
+        result = [note for _score, _title, note in scored[: max(0, maximum)]]
+        for note in result:
+            note["anchor_options"] = inline_anchor_options(
+                text,
+                note,
+                document_frequency=self.document_frequency,
+                note_count=self.note_count,
+            )
+        return result
 
 
 def maintenance_content(

@@ -53,8 +53,16 @@ def test_json_extraction_accepts_wrappers_and_rejects_invalid_shapes() -> None:
 
 def test_relationship_validator_requires_exact_target_specificity_evidence_and_confidence() -> None:
     candidates = [
-        {"title": "Client Alpha", "link_target": "People/Client Alpha"},
-        {"title": "Project Orion", "link_target": "Projects/Project Orion"},
+        {
+            "title": "Client Alpha",
+            "link_target": "People/Client Alpha",
+            "anchor_options": [{"text": "Client Alpha"}],
+        },
+        {
+            "title": "Project Orion",
+            "link_target": "Projects/Project Orion",
+            "anchor_options": [{"text": "Project Orion"}],
+        },
     ]
     result = _normalize_relationship_decision(
         {
@@ -67,24 +75,29 @@ def test_relationship_validator_requires_exact_target_specificity_evidence_and_c
                 },
                 {
                     "target": "People/Client Alpha",
+                    "anchor": "Client Alpha",
                     "relationship": "same type",
                     "evidence": ["SOURCE: record", "TARGET: record"],
                     "confidence": 0.99,
                 },
                 {
                     "target": "People/Client Alpha",
+                    "anchor": "Client Alpha",
                     "relationship": "Client owns the source account",
                     "evidence": ["The notes look similar", "TARGET: account A1"],
                     "confidence": 0.99,
                 },
                 {
                     "target": "Projects/Project Orion",
+                    "anchor": "Project Orion",
                     "relationship": "Source invoice funds Project Orion",
                     "evidence": ["SOURCE: project Orion", "TARGET: invoice INV-9"],
                     "confidence": 0.61,
                 },
                 {
                     "target": "People/Client Alpha",
+                    "anchor": "Client Alpha",
+                    "relationship_type": "entity",
                     "relationship": "Client Alpha is the named account owner",
                     "evidence": ["SOURCE: owner Client Alpha", "TARGET: account A1"],
                     "confidence": 0.94,
@@ -99,6 +112,8 @@ def test_relationship_validator_requires_exact_target_specificity_evidence_and_c
     assert result["relationships"] == [
         {
             "target": "People/Client Alpha",
+            "anchor": "Client Alpha",
+            "relationship_type": "entity",
             "relationship": "Client Alpha is the named account owner",
             "evidence": ["SOURCE: owner Client Alpha", "TARGET: account A1"],
             "confidence": 0.94,
@@ -112,6 +127,7 @@ def test_relationship_validator_rejects_ungrounded_model_evidence() -> None:
             "title": "Client Alpha",
             "link_target": "People/Client Alpha",
             "content": "Client Alpha owns billing account A1.",
+            "anchor_options": [{"text": "Client Alpha"}],
         }
     ]
     result = _normalize_relationship_decision(
@@ -119,6 +135,7 @@ def test_relationship_validator_rejects_ungrounded_model_evidence() -> None:
             "relationships": [
                 {
                     "target": "People/Client Alpha",
+                    "anchor": "Client Alpha",
                     "relationship": "Client Alpha owns the billing account",
                     "evidence": [
                         "SOURCE: Project Borealis owns account Z9",
@@ -128,6 +145,8 @@ def test_relationship_validator_rejects_ungrounded_model_evidence() -> None:
                 },
                 {
                     "target": "People/Client Alpha",
+                    "anchor": "Client Alpha",
+                    "relationship_type": "entity",
                     "relationship": "Client Alpha owns the billing account",
                     "evidence": [
                         "SOURCE: Invoice INV-9 bills Client Alpha",
@@ -149,6 +168,57 @@ def test_relationship_validator_rejects_ungrounded_model_evidence() -> None:
 
     assert len(result["relationships"]) == 1
     assert result["relationships"][0]["confidence"] == 0.95
+
+
+def test_relationship_validator_canonicalizes_a_broad_model_anchor_to_the_best_exact_phrase() -> (
+    None
+):
+    candidates = [
+        {
+            "title": "Orion Research",
+            "link_target": "Organizations/Orion Research",
+            "content": "Orion Research commissioned Project Atlas.",
+            "anchor_options": [
+                {
+                    "text": "Orion Research",
+                    "score": 104.0,
+                    "reason": "exact target title, alias, or identifier",
+                },
+                {
+                    "text": "Orion Research commissioned this field report",
+                    "score": 12.0,
+                    "reason": "distinctive phrase shared with the target note",
+                },
+            ],
+        }
+    ]
+    result = _normalize_relationship_decision(
+        {
+            "relationships": [
+                {
+                    "target": "Organizations/Orion Research",
+                    "anchor": "Orion Research commissioned this field report",
+                    "relationship_type": "entity",
+                    "relationship": "Orion Research commissioned the source field report",
+                    "evidence": [
+                        "SOURCE: Orion Research commissioned this field report",
+                        "TARGET: Orion Research commissioned Project Atlas",
+                    ],
+                    "confidence": 0.96,
+                }
+            ]
+        },
+        candidates,
+        minimum_confidence=0.78,
+        maximum_links=8,
+        source_note={
+            "path": "Reports/Field Report 003.md",
+            "title": "Field Report 003",
+            "content": "Orion Research commissioned this field report for Project Atlas.",
+        },
+    )
+
+    assert result["relationships"][0]["anchor"] == "Orion Research"
 
 
 @pytest.mark.asyncio
@@ -207,6 +277,8 @@ async def test_adaptive_relationship_call_uses_specialized_prompt_and_grounded_v
         "relationships": [
             {
                 "target": "People/Client Alpha",
+                "anchor": "Client Alpha",
+                "relationship_type": "entity",
                 "relationship": "Client Alpha owns the billed account",
                 "evidence": [
                     "SOURCE: Invoice INV-9 bills Client Alpha",
@@ -251,16 +323,19 @@ async def test_adaptive_relationship_call_uses_specialized_prompt_and_grounded_v
                 "link_target": "People/Client Alpha",
                 "content": "Client Alpha owns billing account A1.",
                 "content_excerpt": "Client Alpha owns billing account A1.",
+                "anchor_options": [{"text": "Client Alpha"}],
             }
         ],
         vault_model={"vault_summary": "Client records and billing notes."},
         minimum_confidence=0.72,
         maximum_links=20,
+        tag_vocabulary=["client-billing"],
     )
 
     system = captured["messages"][0]["content"]
     assert "Candidate retrieval is only a shortlist" in system
     assert "Respect this vault's naming style." in system
+    assert captured["think"] is False
     assert result["relationships"][0]["target"] == "People/Client Alpha"
     assert result["suggested_tags"] == ["client-billing"]
 

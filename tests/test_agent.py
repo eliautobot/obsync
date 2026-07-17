@@ -9,7 +9,14 @@ import httpx
 import pytest
 
 from obsync.agent import AgentConfig, AgentRuntime, AgentState, RootConfig, SyncPausedError
-from obsync.vault_intelligence import MAINTENANCE_START
+from obsync.llm import Analysis
+from obsync.markdown import render_markdown
+from obsync.vault_intelligence import (
+    MAINTENANCE_START,
+    change_native_tag,
+    native_maintenance_content,
+    parse_note,
+)
 
 
 @pytest.mark.asyncio
@@ -72,8 +79,101 @@ async def test_desktop_whole_vault_index_and_reviewed_maintenance_write(
         applied = await apply_task
 
     assert applied["status"] == "applied"
-    assert MAINTENANCE_START in target.read_text(encoding="utf-8")
-    assert "[[Clients/Acme Holdings]]" in target.read_text(encoding="utf-8")
+    applied_content = target.read_text(encoding="utf-8")
+    assert MAINTENANCE_START not in applied_content
+    assert "[[Clients/Acme Holdings|Acme Holdings]]" in applied_content
+
+
+def test_desktop_sync_rebases_owned_native_edits_and_honors_human_removal(
+    tmp_path: Path,
+) -> None:
+    vault = tmp_path / "desktop-vault"
+    vault.mkdir()
+    destination = vault / "Projects" / "Atlas.md"
+
+    def rendered(text: str, source_hash: str) -> str:
+        return render_markdown(
+            document_id="atlas-document",
+            source_path="Projects/atlas.txt",
+            source_name="atlas.txt",
+            source_hash=source_hash,
+            source_size=len(text),
+            source_mtime_ns=1,
+            machine_name="Test PC",
+            root_name="Projects",
+            mime_type="text/plain",
+            extractor="text",
+            extracted_text=text,
+            extraction_warning="",
+            truncated=False,
+            analysis=Analysis(
+                title="Project Atlas",
+                summary=text,
+                category="Projects",
+                document_type="brief",
+                tags=["project"],
+                confidence=0.9,
+            ),
+        )
+
+    original = rendered("Orion Research commissioned Project Atlas.", "first-hash")
+    maintained, operations = native_maintenance_content(
+        original,
+        [
+            {
+                "target": "Organizations/Orion Research",
+                "anchor": "Orion Research",
+                "relationship": "the organization commissioned the project",
+                "confidence": 0.97,
+            }
+        ],
+        suggested_tags=["projects/active"],
+    )
+    destination.parent.mkdir(parents=True)
+    destination.write_text(maintained, encoding="utf-8")
+    runtime = AgentRuntime(
+        AgentConfig(
+            server_url="http://testserver",
+            agent_id="desktop-agent",
+            agent_token="agent-test-token",
+            name="Test PC",
+            vault_path=str(vault),
+        )
+    )
+
+    runtime._write_vault_note(
+        {
+            "destination_path": "Projects/Atlas.md",
+            "content": rendered(
+                "Orion Research commissioned the revised Project Atlas brief.", "second-hash"
+            ),
+            "owned_operations": operations,
+        }
+    )
+    preserved = destination.read_text(encoding="utf-8")
+    assert "[[Organizations/Orion Research|Orion Research]]" in preserved
+    assert "projects/active" in parse_note(destination, vault=vault).tags
+    assert "revised Project Atlas brief" in preserved
+
+    human_changed = preserved.replace(
+        "[[Organizations/Orion Research|Orion Research]]", "Orion Research"
+    )
+    human_changed, removal = change_native_tag(human_changed, tag="projects/active", remove=True)
+    assert removal is not None
+    destination.write_text(human_changed, encoding="utf-8")
+    runtime._write_vault_note(
+        {
+            "destination_path": "Projects/Atlas.md",
+            "content": rendered(
+                "Orion Research commissioned the final Project Atlas brief.", "third-hash"
+            ),
+            "owned_operations": operations,
+        }
+    )
+    final = destination.read_text(encoding="utf-8")
+    assert "final Project Atlas brief" in final
+    assert "[[Organizations/Orion Research|Orion Research]]" not in final
+    assert "projects/active" not in parse_note(destination, vault=vault).tags
 
 
 @pytest.mark.asyncio

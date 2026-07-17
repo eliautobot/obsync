@@ -15,7 +15,7 @@ from obsync.vault_intelligence import link_target, search_terms, strip_maintenan
 def adaptive_ai(monkeypatch: pytest.MonkeyPatch):
     """Deterministic fake model for service tests; production has no static link fallback."""
 
-    async def learn(_self, notes, *, feedback=None):
+    async def learn(_self, notes, *, feedback=None, corpus_profile=None):
         return {
             "vault_summary": "Test vault model learned from its indexed notes.",
             "organization_principles": ["Use concrete cross-record facts."],
@@ -38,6 +38,8 @@ def adaptive_ai(monkeypatch: pytest.MonkeyPatch):
         minimum_confidence,
         maximum_links,
         feedback=None,
+        owned_operations=None,
+        tag_vocabulary=None,
     ):
         source_content = strip_maintenance_block(str(source_note.get("content", "")))
         source_terms = search_terms(f"{source_note.get('title', '')} {source_content}")
@@ -61,10 +63,19 @@ def adaptive_ai(monkeypatch: pytest.MonkeyPatch):
             if not (title_mentioned or source_title_mentioned or shared_ids):
                 continue
             target = link_target(candidate)
+            anchors = [
+                str(item.get("text", ""))
+                for item in candidate.get("anchor_options", [])
+                if isinstance(item, dict) and str(item.get("text", "")).strip()
+            ]
+            if not anchors:
+                continue
             source_fact = title or next(iter(shared_terms), "named record")
             relationships.append(
                 {
                     "target": target,
+                    "anchor": anchors[0],
+                    "relationship_type": "specific-record",
                     "relationship": "Both records describe the same named record or party",
                     "evidence": [
                         f"SOURCE: {source_fact} appears in the source",
@@ -81,6 +92,8 @@ def adaptive_ai(monkeypatch: pytest.MonkeyPatch):
             "summary": "Test model selected only specifically supported relationships.",
             "suggested_tags": [],
             "relationships": relationships,
+            "obsolete_owned_links": [],
+            "obsolete_owned_tags": [],
         }
 
     monkeypatch.setattr(LLMAnalyzer, "learn_vault_model", learn)
