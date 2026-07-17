@@ -2,6 +2,31 @@
 
 All notable changes to Obsync will be documented here.
 
+## 0.15.0 - 2026-07-16
+
+### Added
+
+- Added an offline-computer **Reconnect** flow that repairs the existing device identity instead of requiring Disconnect and re-pair
+- Added one-time reconnect credentials that rotate a damaged Desktop token while preserving watched folders, document history, vault assignment, index ownership, and queued work
+- Added clear reconnect guidance for reopening a valid installed Desktop or repairing it with the latest signed installer
+
+### Changed
+
+- New and repaired computers remain offline until the background Desktop sends a real heartbeat; registration alone no longer produces a false online state
+- Windows Desktop now keeps retrying when Docker, the server, VPN, or network is temporarily unavailable during sign-in
+- **Start this PC** reuses an existing scheduled task without requiring elevation; administrator access is requested only when startup itself needs repair
+- Reconnecting to the same server preserves local vault selection, scan timing, watcher state, and watched-folder configuration
+
+### Fixed
+
+- Prevented `[Errno 13] Permission denied` when setup encounters an already installed identical Desktop executable
+- Safely stops and retries replacement of a genuinely changed executable that Windows has locked
+- Stages the Desktop executable before consuming a one-time pairing or reconnect code, preventing server-side ghost connections after local installation failure
+
+### Validation
+
+- Added in-place reconnect/credential-rotation stress coverage, locked-executable regression coverage, false-online checks, local-configuration preservation checks, and transient startup-timeout coverage
+
 ## 0.14.0 - 2026-07-16
 
 ### Added

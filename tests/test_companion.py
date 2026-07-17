@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from obsync.agent import AgentConfig
+from obsync.agent import AgentConfig, RootConfig
 from obsync.companion import (
     TASK_NAME,
     background_companion_is_running,
@@ -14,7 +14,9 @@ from obsync.companion import (
     parse_pairing_details,
     register_url_protocol,
     scheduled_task_command,
+    stage_companion_executable,
     start_background_companion,
+    startup_task_is_installed,
     stop_background_companion,
 )
 
@@ -67,6 +69,19 @@ def test_background_desktop_status_and_stop(monkeypatch) -> None:
     stop_background_companion(run=fake_run)
     assert calls[0][:2] == ["schtasks.exe", "/Query"]
     assert calls[1][:2] == ["schtasks.exe", "/End"]
+
+
+def test_startup_task_presence_is_detected(monkeypatch) -> None:
+    monkeypatch.setattr("obsync.companion.is_windows", lambda: True)
+
+    def present(args, **_kwargs):
+        return subprocess.CompletedProcess(args, 0, "SUCCESS", "")
+
+    def missing(args, **_kwargs):
+        return subprocess.CompletedProcess(args, 1, "", "not found")
+
+    assert startup_task_is_installed(run=present) is True
+    assert startup_task_is_installed(run=missing) is False
 
 
 def test_startup_task_reports_windows_error(monkeypatch, tmp_path: Path) -> None:
@@ -151,6 +166,83 @@ async def test_companion_install_requires_administrator(monkeypatch, tmp_path: P
             computer_name="Office PC",
             source_executable=tmp_path / "desktop.exe",
         )
+
+
+def test_identical_installed_executable_is_not_overwritten(monkeypatch, tmp_path: Path) -> None:
+    source = tmp_path / "download" / "Obsync Desktop.exe"
+    destination = tmp_path / "installed" / "Obsync Desktop.exe"
+    source.parent.mkdir()
+    destination.parent.mkdir()
+    source.write_bytes(b"identical signed executable")
+    destination.write_bytes(source.read_bytes())
+
+    def forbidden_copy(*_args, **_kwargs):
+        raise AssertionError("An identical running executable must not be overwritten")
+
+    monkeypatch.setattr("obsync.companion.shutil.copy2", forbidden_copy)
+    assert stage_companion_executable(source, destination) == destination
+    assert destination.read_bytes() == b"identical signed executable"
+
+
+def test_locked_installed_executable_is_stopped_and_retried(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("obsync.companion.is_windows", lambda: True)
+    source = tmp_path / "download" / "Obsync Desktop.exe"
+    destination = tmp_path / "installed" / "Obsync Desktop.exe"
+    source.parent.mkdir()
+    destination.parent.mkdir()
+    source.write_bytes(b"repaired executable")
+    destination.write_bytes(b"old executable")
+    task_calls: list[list[str]] = []
+
+    def fake_run(args, **_kwargs):
+        task_calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "SUCCESS", "")
+
+    real_replace = __import__("os").replace
+    replace_attempts = 0
+
+    def locked_once(source_path, destination_path):
+        nonlocal replace_attempts
+        replace_attempts += 1
+        if replace_attempts == 1:
+            raise PermissionError(13, "Permission denied", str(destination_path))
+        return real_replace(source_path, destination_path)
+
+    monkeypatch.setattr("obsync.companion.subprocess.run", fake_run)
+    monkeypatch.setattr("obsync.companion.os.replace", locked_once)
+    monkeypatch.setattr("obsync.companion.time.sleep", lambda _seconds: None)
+
+    assert stage_companion_executable(source, destination) == destination
+    assert replace_attempts == 2
+    assert task_calls == [["schtasks.exe", "/End", "/TN", TASK_NAME]]
+    assert destination.read_bytes() == b"repaired executable"
+
+
+@pytest.mark.asyncio
+async def test_install_failure_does_not_consume_pairing_code(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("obsync.companion.is_windows", lambda: True)
+    monkeypatch.setattr("obsync.companion.windows_is_admin", lambda: True)
+    paired = False
+
+    async def forbidden_pair(**_kwargs):
+        nonlocal paired
+        paired = True
+        raise AssertionError("Pairing must happen only after local installation succeeds")
+
+    def fail_stage(_source, _destination):
+        raise ValueError("Windows rejected the executable")
+
+    monkeypatch.setattr("obsync.companion.pair_agent", forbidden_pair)
+    monkeypatch.setattr("obsync.companion.stage_companion_executable", fail_stage)
+    with pytest.raises(ValueError, match="Windows rejected"):
+        await install_companion(
+            server_url="http://server:7769",
+            enrollment_code="AAAA-BBBB-CCCC",
+            computer_name="Office PC",
+            config_path=tmp_path / "agent.yml",
+            source_executable=tmp_path / "desktop.exe",
+        )
+    assert paired is False
 
 
 @pytest.mark.asyncio
@@ -258,3 +350,62 @@ async def test_companion_reuses_valid_pairing_and_repairs_startup(
     assert result.computer_name == "Main PC"
     assert AgentConfig.load(config_path).agent_id == "existing-agent"
     assert [item[0] for item in lifecycle] == ["task", "start"]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_code_preserves_local_vault_and_watched_folders(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("obsync.companion.is_windows", lambda: True)
+    monkeypatch.setattr("obsync.companion.windows_is_admin", lambda: True)
+    source = tmp_path / "download" / "desktop.exe"
+    source.parent.mkdir()
+    source.write_bytes(b"new desktop")
+    destination = tmp_path / "installed" / "Obsync Desktop.exe"
+    config_path = tmp_path / "config" / "agent.yml"
+    watched = tmp_path / "watched"
+    watched.mkdir()
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    existing = AgentConfig(
+        server_url="http://server:7769",
+        agent_id="old-agent",
+        agent_token="agent_old_token_value_long_enough",
+        name="Main PC",
+        vault_path=str(vault),
+        scan_interval_seconds=777,
+        roots=[RootConfig(root_key="root-key", name="Records", path=str(watched))],
+    )
+    existing.save(config_path)
+
+    async def invalid(_config):
+        return False
+
+    async def reconnect(**kwargs):
+        return AgentConfig(
+            server_url=kwargs["server_url"],
+            agent_id="old-agent",
+            agent_token="agent_repaired_token_value_long_enough",
+            name=kwargs["name"],
+        )
+
+    monkeypatch.setattr("obsync.companion.existing_pairing_is_valid", invalid)
+    monkeypatch.setattr("obsync.companion.pair_agent", reconnect)
+    monkeypatch.setattr("obsync.companion.installed_companion_path", lambda: destination)
+    monkeypatch.setattr("obsync.companion.register_url_protocol", lambda _executable: None)
+    monkeypatch.setattr("obsync.companion.install_startup_task", lambda *_args: None)
+    monkeypatch.setattr("obsync.companion.start_background_companion", lambda *_args: None)
+
+    await install_companion(
+        server_url="http://server:7769",
+        enrollment_code="RECONNECT-CODE",
+        computer_name="Main PC",
+        config_path=config_path,
+        source_executable=source,
+    )
+    repaired = AgentConfig.load(config_path)
+    assert repaired.agent_id == "old-agent"
+    assert repaired.vault_path == str(vault)
+    assert repaired.scan_interval_seconds == 777
+    assert len(repaired.roots) == 1
+    assert repaired.roots[0].root_key == "root-key"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import filecmp
 import json
 import logging
 import os
@@ -10,7 +11,9 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import webbrowser
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -214,6 +217,22 @@ def install_startup_task(
     )
 
 
+def startup_task_is_installed(
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> bool:
+    if not is_windows():
+        return False
+    result = run(
+        ["schtasks.exe", "/Query", "/TN", TASK_NAME],
+        check=False,
+        capture_output=True,
+        text=True,
+        creationflags=_windows_creation_flags(),
+    )
+    return result.returncode == 0
+
+
 def start_background_companion(
     executable: Path,
     config_path: Path,
@@ -316,6 +335,66 @@ def _current_standalone_executable() -> Path:
     return Path(sys.executable).resolve()
 
 
+def _same_executable(source: Path, destination: Path) -> bool:
+    try:
+        return source.resolve() == destination.resolve() or (
+            destination.is_file() and filecmp.cmp(source, destination, shallow=False)
+        )
+    except OSError:
+        return False
+
+
+def stage_companion_executable(source: Path, destination: Path) -> Path:
+    """Install Desktop without overwriting a running identical Windows executable."""
+    source = source.resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if _same_executable(source, destination):
+        return destination
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".obsync-desktop-", suffix=".tmp", dir=destination.parent
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        shutil.copy2(source, temporary)
+        if destination.exists() and is_windows():
+            # Windows locks running executables. Stop the background copy before replacing it.
+            subprocess.run(
+                ["schtasks.exe", "/End", "/TN", TASK_NAME],
+                check=False,
+                capture_output=True,
+                text=True,
+                creationflags=_windows_creation_flags(),
+            )
+        for attempt in range(41):
+            try:
+                os.replace(temporary, destination)
+                return destination
+            except PermissionError as exc:
+                if attempt == 40:
+                    raise ValueError(
+                        "Windows is still using the installed Obsync Desktop file. Close every "
+                        "Obsync Desktop window, wait a few seconds, and try again."
+                    ) from exc
+                time.sleep(0.1)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
+
+
+def _preserve_local_connection_settings(existing: AgentConfig, repaired: AgentConfig) -> None:
+    if not existing.agent_token or existing.server_url.rstrip("/") != repaired.server_url.rstrip(
+        "/"
+    ):
+        return
+    repaired.verify_tls = existing.verify_tls
+    repaired.scan_interval_seconds = existing.scan_interval_seconds
+    repaired.settle_seconds = existing.settle_seconds
+    repaired.vault_path = existing.vault_path
+    repaired.roots = list(existing.roots)
+
+
 async def install_companion(
     *,
     server_url: str,
@@ -340,6 +419,12 @@ async def install_companion(
             "Enter the complete Obsync server address beginning with http:// or https://"
         )
 
+    source = (source_executable or _current_standalone_executable()).resolve()
+    destination = installed_companion_path()
+    # Prove Windows can install the app before consuming a one-time code. This prevents the
+    # server from showing a newly registered PC when the local executable was never installed.
+    stage_companion_executable(source, destination)
+
     target_config = config_path or default_config_path()
     existing = AgentConfig.load(target_config)
     existing_matches = bool(existing.agent_token and existing.server_url.rstrip("/") == server)
@@ -361,6 +446,7 @@ async def install_companion(
                 "Could not reach the Obsync server. Check the address and that both computers "
                 "are connected to the same LAN or VPN."
             ) from exc
+        _preserve_local_connection_settings(existing, config)
     else:
         if existing.agent_token and existing.server_url.rstrip("/") == server:
             raise ValueError(
@@ -372,12 +458,6 @@ async def install_companion(
     if vault_path:
         config.set_vault(Path(vault_path))
     saved_config = config.save(target_config)
-
-    source = (source_executable or _current_standalone_executable()).resolve()
-    destination = installed_companion_path()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if source != destination.resolve():
-        shutil.copy2(source, destination)
     register_url_protocol(destination)
     install_startup_task(destination, saved_config)
     start_background_companion(destination, saved_config)
@@ -571,7 +651,13 @@ def run_setup_gui(
             executable = installed_companion_path()
             if not executable.is_file():
                 raise ValueError("Connect and install Obsync Desktop before starting it")
-            install_startup_task(executable, target_config)
+            if not startup_task_is_installed():
+                if not windows_is_admin():
+                    raise ValueError(
+                        "Automatic startup needs repair. Close this window, right-click Obsync "
+                        "Desktop, choose Run as administrator, then click Connect and install."
+                    )
+                install_startup_task(executable, target_config)
             start_background_companion(executable, target_config)
             sync_status_value.set("Folder watching is running")
         except (OSError, ValueError) as exc:

@@ -147,12 +147,12 @@ Update Python-based desktop agents to the same release as the server, then verif
 
 ```bash
 python -m pip install --upgrade \
-  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.14.0"
+  "obsync-app @ git+https://github.com/eliautobot/obsync.git@v0.15.0"
 obsync --version
 obsync agent scan
 ```
 
-Replace `v0.14.0` with the release you are installing. For Windows, use **Sources → Add another computer → Download Obsync Desktop**, right-click it, choose **Run as administrator**, and then choose **Connect and install**. Elevation is required only for setup; the watcher runs with limited permissions and no visible terminal. Command-line Windows and Linux agents remain available for advanced installations.
+Replace `v0.15.0` with the release you are installing. For Windows, use **Sources → Add another computer → Download Obsync Desktop**, right-click it, choose **Run as administrator**, and then choose **Connect and install**. Elevation is required only for setup; the watcher runs with limited permissions and no visible terminal. Command-line Windows and Linux agents remain available for advanced installations.
 
 Before any update, back up the Obsidian vault and Obsync `/data` volume. The full [Updating and rollback guide](docs/UPDATING.md) includes copy-and-paste backup commands for Linux and Windows, fixed-version installs, every agent type, verification, and safe rollback instructions.
 
@@ -163,6 +163,8 @@ The Obsync server appears automatically in **Sources** and is included in the Ov
 Choose **Sources → Add another computer**. Create a one-time pairing code, download Obsync Desktop, right-click it and choose **Run as administrator**, click **Copy all setup details**, then use **Paste setup details** in the desktop app. Click **Connect and install**. It installs for the current Windows user, runs silently with limited permissions, and starts automatically at sign-in. Its window also provides **Start this PC**, **Stop this PC**, and **Open Obsync**. Once the computer card appears, confirm the exact destination under **Obsidian Vault**, choose **Start Global Sync**, then add folders.
 
 Use **Disconnect** on a computer card to revoke an old desktop and remove its Obsync ledger. Source files and existing Obsidian notes are always kept. If the computer is the active vault writer, select another destination in **Obsidian Vault** first.
+
+If a paired computer goes offline, use **Reconnect** on its card. First try **Open installed Desktop → Start this PC**; a valid saved pairing reconnects automatically. If its credential or installation is damaged, use the generated reconnect details with the latest Desktop installer. Repairing in place keeps the computer ID, watched folders, document history, and vault assignment.
 
 Use **Stop Global Sync** to cancel all active sync and AI classification while keeping every connection intact. **Start Global Sync** resumes every running folder and immediately reconciles changes that occurred while stopped. Every folder also has independent **Start**, **Pause**, and **Stop** controls. Use **Remove** to forget only that folder; its originals and existing notes are kept.
 
@@ -258,6 +260,7 @@ If an ordinary destination is not a verified exact match or an explicitly approv
 - [Supported files](docs/SUPPORTED_FILES.md)
 - [Security model](docs/SECURITY.md)
 - [Development and testing](docs/DEVELOPMENT.md)
+- [v0.15.0 release notes](docs/releases/v0.15.0.md)
 - [v0.14.0 release notes](docs/releases/v0.14.0.md)
 - [v0.13.1 release notes](docs/releases/v0.13.1.md)
 - [v0.13.0 release notes](docs/releases/v0.13.0.md)

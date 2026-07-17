@@ -1036,8 +1036,9 @@ class AgentRuntime:
 
     async def run_forever(self) -> None:
         self._running = True
-        await self.heartbeat_once()
-        await self.register_roots()
+        # The background app may start before Docker, a VPN, or the network is ready.
+        # Each long-running loop owns its retry behavior, so a transient first connection
+        # failure must not terminate the Windows scheduled task.
         tasks = [
             asyncio.create_task(self._heartbeat_loop()),
             asyncio.create_task(self._command_loop()),

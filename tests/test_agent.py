@@ -736,3 +736,43 @@ async def test_desktop_vault_audit_reports_matching_modified_and_missing_notes(
     assert vault_note is not None
     assert vault_note["title"] == "Laws and Rules"
     assert json.loads(vault_note["tags_json"]) == ["law", "permit"]
+
+
+@pytest.mark.asyncio
+async def test_background_runtime_survives_initial_server_timeout(
+    monkeypatch, tmp_path: Path
+) -> None:
+    runtime = AgentRuntime(
+        AgentConfig(
+            server_url="http://offline-server",
+            agent_id="agent-id",
+            agent_token="agent_token_value_long_enough",
+            name="Offline PC",
+        ),
+        config_path=tmp_path / "agent.yml",
+    )
+    attempts = 0
+
+    async def unavailable_heartbeat():
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ConnectTimeout(
+            "Server is still starting", request=httpx.Request("POST", "http://offline-server")
+        )
+
+    async def no_commands():
+        return None
+
+    async def no_inventory():
+        return {}
+
+    monkeypatch.setattr(runtime, "heartbeat_once", unavailable_heartbeat)
+    monkeypatch.setattr(runtime, "process_commands_once", no_commands)
+    monkeypatch.setattr(runtime, "inventory_all", no_inventory)
+
+    task = asyncio.create_task(runtime.run_forever())
+    await asyncio.sleep(0.05)
+    assert attempts >= 1
+    assert task.done() is False
+    runtime._stop.set()
+    await asyncio.wait_for(task, timeout=1)

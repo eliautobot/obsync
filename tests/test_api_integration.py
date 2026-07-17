@@ -86,6 +86,11 @@ def test_ui_includes_guided_help_and_obsync_desktop(client: TestClient) -> None:
     assert 'popover="manual"' in index
     assert "renderHelp" in app_js
     assert "Download Obsync Desktop" in app_js
+    assert "Reconnect" in app_js
+    assert "/reconnect" in app_js
+    assert "Your existing computer record will be preserved" in app_js
+    assert "Windows reports Errno 13 or Permission denied" in app_js
+    assert "Do not Disconnect the PC" in app_js
     assert "/api/v1/downloads/windows-desktop" in app_js
     download = client.get("/api/v1/downloads/windows-desktop", follow_redirects=False)
     assert download.status_code == 307
@@ -581,11 +586,87 @@ def test_enrollment_is_single_use(client: TestClient, admin_headers: dict[str, s
     status = client.get(
         f"/api/v1/admin/enrollments/{enrollment['id']}", headers=admin_headers
     ).json()
-    assert status["connected"] is True
+    assert status["connected"] is False
     assert status["agent"]["id"] == registered.json()["agent_id"]
+    heartbeat = client.post(
+        "/api/v1/agent/heartbeat",
+        headers={"Authorization": f"Bearer {registered.json()['agent_token']}"},
+        json={},
+    )
+    assert heartbeat.status_code == 200
+    connected = client.get(
+        f"/api/v1/admin/enrollments/{enrollment['id']}", headers=admin_headers
+    ).json()
+    assert connected["connected"] is True
     second = client.post("/api/v1/agents/register", json=payload)
     assert second.status_code == 400
     assert "already used" in second.json()["detail"]
+
+
+def test_reconnect_repairs_existing_computer_without_losing_records(
+    app,
+    client: TestClient,
+    admin_headers: dict[str, str],
+    enrolled_agent: dict[str, str],
+    agent_headers: dict[str, str],
+    registered_root: dict,
+) -> None:
+    synced = sync_text(
+        client,
+        agent_headers,
+        registered_root["id"],
+        "client/current-record.txt",
+        b"Preserve this indexed record during reconnect.",
+    )
+    assert synced.status_code == 200
+    app.state.service.db.execute(
+        "UPDATE agents SET status = 'offline', last_seen_at = ? WHERE id = ?",
+        ("2000-01-01T00:00:00+00:00", enrolled_agent["agent_id"]),
+    )
+    reconnect = client.post(
+        f"/api/v1/admin/agents/{enrolled_agent['agent_id']}/reconnect",
+        headers=admin_headers,
+        json={"minutes": 20},
+    )
+    assert reconnect.status_code == 200
+    enrollment = reconnect.json()
+    before = client.get(
+        f"/api/v1/admin/enrollments/{enrollment['id']}", headers=admin_headers
+    ).json()
+    assert before["connected"] is False
+
+    replacement_token = "agent_" + "n" * 48
+    repaired = client.post(
+        "/api/v1/agents/register",
+        json={
+            "code": enrollment["code"],
+            "name": "Test PC",
+            "hostname": "test-pc",
+            "os_name": "Windows",
+            "agent_version": "0.15.0",
+            "agent_token": replacement_token,
+        },
+    )
+    assert repaired.status_code == 200
+    assert repaired.json()["agent_id"] == enrolled_agent["agent_id"]
+    assert client.post("/api/v1/agent/heartbeat", headers=agent_headers, json={}).status_code == 401
+
+    new_headers = {"Authorization": f"Bearer {replacement_token}"}
+    assert client.post("/api/v1/agent/heartbeat", headers=new_headers, json={}).status_code == 200
+    after = client.get("/api/v1/admin/agents", headers=admin_headers).json()["items"]
+    assert len(after) == 1
+    assert after[0]["id"] == enrolled_agent["agent_id"]
+    assert after[0]["root_count"] == 1
+    assert after[0]["document_count"] == 1
+    assert (
+        client.get("/api/v1/admin/roots", headers=admin_headers).json()["items"][0]["id"]
+        == registered_root["id"]
+    )
+    assert client.get("/api/v1/admin/documents", headers=admin_headers).json()["total"] == 1
+    status = client.get(
+        f"/api/v1/admin/enrollments/{enrollment['id']}", headers=admin_headers
+    ).json()
+    assert status["connected"] is True
 
 
 def test_enrollment_retry_with_same_client_credential_is_idempotent(

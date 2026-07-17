@@ -94,6 +94,28 @@ def test_repeated_pair_disconnect_cycles_leave_no_stale_computers(app) -> None:
     assert service.db.query_one("SELECT count(*) AS count FROM enrollments")["count"] == 0
 
 
+def test_repeated_reconnect_cycles_keep_one_computer_and_rotate_credentials(app) -> None:
+    service = app.state.service
+    enrollment = service.create_enrollment("Durable PC")
+    current = service.register_agent(
+        enrollment["code"],
+        {"name": "Durable PC", "agent_token": "agent_initial_" + "a" * 40},
+    )
+    original_id = current["agent_id"]
+    for index in range(30):
+        reconnect = service.create_reconnect_enrollment(original_id)
+        next_token = f"agent_reconnect_{index:02d}_" + "r" * 40
+        repaired = service.register_agent(
+            reconnect["code"],
+            {"name": "Durable PC", "agent_token": next_token},
+        )
+        assert repaired["agent_id"] == original_id
+        assert service.authenticate_agent(next_token)["id"] == original_id
+        assert service.authenticate_agent(current["agent_token"]) is None
+        current = repaired
+    assert service.db.query_one("SELECT count(*) AS count FROM agents")["count"] == 1
+
+
 @pytest.mark.asyncio
 async def test_ai_activity_stream_pushes_each_inference_update_and_cleans_up(app) -> None:
     service = app.state.service

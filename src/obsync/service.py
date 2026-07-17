@@ -1916,6 +1916,48 @@ class ObsyncService:
         )
         return {"id": enrollment_id, "code": code, "expires_at": expires.isoformat()}
 
+    def create_reconnect_enrollment(self, agent_id: str, *, minutes: int = 20) -> dict[str, Any]:
+        """Create a one-time credential that repairs an existing computer in place."""
+        agent = self.db.query_one("SELECT id, name, enabled FROM agents WHERE id = ?", (agent_id,))
+        if not agent or not agent["enabled"]:
+            raise ValueError("Computer not found")
+        code = new_enrollment_code()
+        enrollment_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        expires = now + timedelta(minutes=max(1, min(minutes, 1440)))
+        with self.db.transaction() as connection:
+            # Only the newest unused repair credential should remain valid for a computer.
+            connection.execute(
+                "DELETE FROM enrollments WHERE agent_id = ? AND used_at IS NULL", (agent_id,)
+            )
+            connection.execute(
+                """
+                INSERT INTO enrollments(
+                    id, code_hash, label, expires_at, agent_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    enrollment_id,
+                    hash_token(code),
+                    str(agent["name"])[:120],
+                    expires.isoformat(),
+                    agent_id,
+                    now.isoformat(),
+                ),
+            )
+        self.db.add_event(
+            "enrollment.reconnect_created",
+            f"Reconnect code created for {agent['name']}",
+            agent_id=agent_id,
+        )
+        return {
+            "id": enrollment_id,
+            "code": code,
+            "expires_at": expires.isoformat(),
+            "agent_id": agent_id,
+            "name": str(agent["name"]),
+        }
+
     def register_agent(self, code: str, payload: dict[str, str]) -> dict[str, str]:
         now = datetime.now(UTC)
         proposed_token = str(payload.get("agent_token") or "").strip()
@@ -1955,30 +1997,63 @@ class ObsyncService:
                 raise ValueError("Enrollment code is invalid or already used")
             if datetime.fromisoformat(enrollment["expires_at"]) < now:
                 raise ValueError("Enrollment code has expired")
-            connection.execute(
-                """
-                INSERT INTO agents(id, name, hostname, os_name, os_version, agent_version,
-                                   token_hash, status, last_seen_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'online', ?, ?, ?)
-                """,
-                (
-                    agent_id,
-                    name,
-                    hostname,
-                    (payload.get("os_name") or "unknown")[:100],
-                    (payload.get("os_version") or "")[:200],
-                    (payload.get("agent_version") or "")[:50],
-                    hash_token(token),
-                    now.isoformat(),
-                    now.isoformat(),
-                    now.isoformat(),
-                ),
-            )
+            reconnect_agent_id = str(enrollment["agent_id"] or "")
+            if reconnect_agent_id:
+                existing = connection.execute(
+                    "SELECT id, name, enabled FROM agents WHERE id = ?", (reconnect_agent_id,)
+                ).fetchone()
+                if not existing or not existing["enabled"]:
+                    raise ValueError("The computer being reconnected no longer exists")
+                agent_id = reconnect_agent_id
+                connection.execute(
+                    """
+                    UPDATE agents
+                    SET name = ?, hostname = ?, os_name = ?, os_version = ?, agent_version = ?,
+                        token_hash = ?, status = 'pending', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        name,
+                        hostname,
+                        (payload.get("os_name") or "unknown")[:100],
+                        (payload.get("os_version") or "")[:200],
+                        (payload.get("agent_version") or "")[:50],
+                        hash_token(token),
+                        now.isoformat(),
+                        agent_id,
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO agents(id, name, hostname, os_name, os_version, agent_version,
+                                       token_hash, status, last_seen_at, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                    """,
+                    (
+                        agent_id,
+                        name,
+                        hostname,
+                        (payload.get("os_name") or "unknown")[:100],
+                        (payload.get("os_version") or "")[:200],
+                        (payload.get("agent_version") or "")[:50],
+                        hash_token(token),
+                        now.isoformat(),
+                        now.isoformat(),
+                        now.isoformat(),
+                    ),
+                )
             connection.execute(
                 "UPDATE enrollments SET used_at = ?, agent_id = ? WHERE id = ?",
                 (now.isoformat(), agent_id, enrollment["id"]),
             )
-        self.db.add_event("agent.registered", f"Device {name} joined Obsync", agent_id=agent_id)
+        event_type = "agent.reconnected" if reconnect_agent_id else "agent.registered"
+        event_message = (
+            f"Computer {name} reconnected without removing its records"
+            if reconnect_agent_id
+            else f"Device {name} joined Obsync"
+        )
+        self.db.add_event(event_type, event_message, agent_id=agent_id)
         return {"agent_id": agent_id, "agent_token": token, "name": name}
 
     def disconnect_agent(self, agent_id: str) -> dict[str, Any]:
@@ -2044,10 +2119,23 @@ class ObsyncService:
         agent = None
         if enrollment.get("agent_id"):
             agent = self.db.query_one(
-                "SELECT id, name, hostname, os_name, last_seen_at FROM agents WHERE id = ?",
+                """
+                SELECT id, name, hostname, os_name, status, enabled, last_seen_at
+                FROM agents WHERE id = ?
+                """,
                 (enrollment["agent_id"],),
             )
-        enrollment["connected"] = bool(agent)
+        cutoff = datetime.now(UTC) - timedelta(seconds=90)
+        try:
+            connected = bool(
+                agent
+                and agent["enabled"]
+                and agent["status"] == "online"
+                and datetime.fromisoformat(agent["last_seen_at"]) >= cutoff
+            )
+        except (TypeError, ValueError):
+            connected = False
+        enrollment["connected"] = connected
         enrollment["agent"] = agent
         return enrollment
 
@@ -2101,13 +2189,19 @@ class ObsyncService:
         )
         cutoff = datetime.now(UTC) - timedelta(seconds=90)
         for row in rows:
+            stored_status = str(row.get("status", ""))
             try:
-                online = row["enabled"] and datetime.fromisoformat(row["last_seen_at"]) >= cutoff
+                online = bool(
+                    row["enabled"]
+                    and stored_status == "online"
+                    and datetime.fromisoformat(row["last_seen_at"]) >= cutoff
+                )
             except (TypeError, ValueError):
                 online = False
-            row["status"] = "online" if online else "offline"
-            if not online and row["status"] != "offline":
+            effective_status = "online" if online else "offline"
+            if stored_status != effective_status:
                 self.db.execute("UPDATE agents SET status = 'offline' WHERE id = ?", (row["id"],))
+            row["status"] = effective_status
         return rows
 
     def upsert_root(self, agent_id: str, payload: dict[str, Any]) -> dict[str, Any]:

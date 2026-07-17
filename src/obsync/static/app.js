@@ -638,6 +638,39 @@ function openDisconnectComputer(agent) {
   });
 }
 
+async function openReconnectComputer(agent) {
+  const modal = $("#modal");
+  $("#modal-title").textContent = `Reconnect ${agent.name}`;
+  $("#modal-body").innerHTML = '<p class="modal-note">Preparing a safe reconnect code…</p>';
+  modal.showModal();
+  try {
+    const enrollment = await api(`/api/v1/admin/agents/${agent.id}/reconnect`, {
+      method: "POST",
+      body: { minutes: 20 },
+    });
+    const server = state.server?.public_url || location.origin;
+    const setupDetails = JSON.stringify({ server, code: enrollment.code, name: agent.name });
+    $("#modal-body").innerHTML = `
+      <div class="good-box"><strong>Your existing computer record will be preserved.</strong><p>Watched folders, document history, vault assignment, and generated notes stay attached to ${escapeHtml(agent.name)}.</p></div>
+      <div class="pair-steps">
+        <div class="pair-step"><p><strong>1.</strong> On ${escapeHtml(agent.name)}, open the installed Obsync Desktop and choose <strong>Start this PC</strong>. A valid saved connection will reconnect automatically.</p><button class="primary full" id="open-reconnect-desktop" type="button">Open installed Desktop</button></div>
+        <div class="pair-step admin-required"><p><strong>2.</strong> If the saved connection is damaged or unauthorized, download the latest Desktop, right-click it, choose <strong>Run as administrator</strong>, and paste these repair details.</p><a class="secondary button-link full" href="/api/v1/downloads/windows-desktop">Download latest Desktop</a></div>
+        <div class="pair-step"><button class="secondary full copy-reconnect-setup" type="button" data-copy="${escapeHtml(setupDetails)}">Copy reconnect details</button><details class="manual-pair-details"><summary>Or enter the repair details manually</summary><div class="pair-detail"><span>Server</span><code>${escapeHtml(server)}</code></div><div class="pair-detail"><span>Code</span><code>${escapeHtml(enrollment.code)}</code></div><div class="pair-detail"><span>Name</span><code>${escapeHtml(agent.name)}</code></div></details></div>
+      </div>
+      <p class="inline-status" id="pairing-status"><span class="connection-wait"><i></i>Waiting for ${escapeHtml(agent.name)} to reconnect…</span></p>
+      <p class="modal-note">The repair code expires in 20 minutes. It updates this PC in place; it does not create a duplicate computer.</p>`;
+    $("#open-reconnect-desktop").addEventListener("click", () => {
+      window.location.href = "obsync://open";
+      toast("Windows was asked to open Obsync Desktop.");
+    });
+    $(".copy-reconnect-setup").addEventListener("click", () => copyText(setupDetails));
+    pollEnrollment(enrollment.id);
+  } catch (error) {
+    modal.close();
+    toast(error.message, true);
+  }
+}
+
 function openRemoveFolder(root) {
   const modal = $("#modal");
   $("#modal-title").textContent = "Remove synced folder";
@@ -775,7 +808,7 @@ async function renderSources() {
     return `<article class="source-card">
       <div class="source-top"><span class="device-icon">${agent.os_name === "Windows" ? "▣" : "◫"}</span><div><h3>${escapeHtml(agent.name)} ${helpIcon("A paired Obsync Desktop app that gives Obsync safe access to folders on this computer.", `About ${agent.name}`)}</h3><p>${escapeHtml(agent.os_name)} · seen ${relativeTime(agent.last_seen_at)}</p>${agent.vault_ready ? '<span class="device-role">VAULT WRITER READY</span>' : ""}</div><span class="status-pill ${agent.status}" title="Whether Obsync Desktop is currently communicating with the server">${agent.status}</span></div>
       ${rootRows || '<div class="root-row">No watched folders registered yet.</div>'}
-      <div class="source-stats"><span>${agent.document_count || 0} files indexed</span><div class="source-actions"><button class="danger disconnect-computer" data-agent="${agent.id}" title="Revoke this computer and remove it from Obsync">Disconnect</button><button class="primary add-folder" data-pipeline-work="true" data-agent="${agent.id}" title="Open this computer's folder browser and add a directory to watch" ${pipeline.enabled && overview.vault.configured !== false ? "" : "disabled"}>+ Add folder</button></div></div>
+      <div class="source-stats"><span>${agent.document_count || 0} files indexed</span><div class="source-actions">${agent.status === "online" ? "" : `<button class="secondary reconnect-computer" data-agent="${agent.id}" title="Repair this PC without removing its folders or history">Reconnect</button>`}<button class="danger disconnect-computer" data-agent="${agent.id}" title="Revoke this computer and remove it from Obsync">Disconnect</button><button class="primary add-folder" data-pipeline-work="true" data-agent="${agent.id}" title="Open this computer's folder browser and add a directory to watch" ${pipeline.enabled && overview.vault.configured !== false ? "" : "disabled"}>+ Add folder</button></div></div>
     </article>`;
   }).join("");
   const serverCard = `<article class="source-card server-card">
@@ -793,6 +826,10 @@ async function renderSources() {
   $$(".disconnect-computer").forEach((button) => button.addEventListener("click", () => {
     const agent = state.agents.find((item) => item.id === button.dataset.agent);
     if (agent) openDisconnectComputer(agent);
+  }));
+  $$(".reconnect-computer").forEach((button) => button.addEventListener("click", () => {
+    const agent = state.agents.find((item) => item.id === button.dataset.agent);
+    if (agent) openReconnectComputer(agent);
   }));
   $$(".remove-root").forEach((button) => button.addEventListener("click", () => {
     const root = state.roots.find((item) => item.id === button.dataset.root);
@@ -1719,7 +1756,7 @@ async function renderHelp() {
           <div class="help-status">${comparisonBadge("vault-missing")}<p>The source is known, but its expected managed note is missing.</p></div>
           <div class="help-status">${comparisonBadge("source-missing")}<p>The original file disappeared. Obsync keeps the note and marks it missing.</p></div>
         </article>
-        <article class="settings-card"><h3>Why Windows needs Obsync Desktop</h3><p>Docker and web browsers are intentionally isolated from arbitrary Windows files. Obsync Desktop includes the safe local bridge, native folder picker, background watcher, and start/stop controls in one app. Run it as Administrator for the one-time setup; background syncing then runs with limited permissions.</p><p>If a computer shows offline, open Obsync Desktop and choose Start this PC. Reconnecting reuses the saved pairing.</p></article>
+        <article class="settings-card"><h3>Why Windows needs Obsync Desktop</h3><p>Docker and web browsers are intentionally isolated from arbitrary Windows files. Obsync Desktop includes the safe local bridge, native folder picker, background watcher, and start/stop controls in one app. Run it as Administrator for the one-time setup; background syncing then runs with limited permissions.</p><p>If a computer shows offline, use <strong>Reconnect</strong> on its Sources card. Start the installed Desktop first; if its saved credential or installation is damaged, use the generated repair details. Reconnecting in place preserves watched folders, document history, and vault assignment.</p></article>
         <article class="settings-card"><h3>Stopping and removing</h3><p>Use <strong>Stop inference</strong> on Local AI to end only the active model request and move that file to Review. Use <strong>Stop Global Sync</strong> to cancel all active sync and AI work. Each source folder also has independent Start, Pause, and Stop controls. Remove forgets a folder; Disconnect revokes a whole computer. Original files and existing Obsidian notes are always kept.</p></article>
         <article class="settings-card"><h3>Server vs. desktop</h3><p>The central server always appears as one connected computer. Docker can access only folders mounted into its container. Pair the physical desktop whenever the vault or source folders live in Windows Documents, another user folder, a Mac, or a different PC.</p></article>
         <article class="settings-card"><h3>Local AI and the whole vault</h3><p>AI is optional. Obsync searches the complete whole-vault index, then sends bounded content from only the most relevant notes—not unrestricted filesystem or Obsidian API access. Obsync validates matching, folders, tags, properties, and path-qualified links before writing. The live activity view is read-only and its bounded model trace is not stored as chat history.</p></article>
@@ -1727,6 +1764,8 @@ async function renderHelp() {
       </section>
       <section class="settings-card help-troubleshooting"><h3>Troubleshooting</h3>
         <details><summary>A Windows PC does not appear in a selector</summary><p>Confirm Obsync Desktop reported success and the Sources card says online. The Overview count includes the central server, which is not a desktop selector option.</p></details>
+        <details><summary>A Windows PC is offline or cannot reconnect</summary><p>Open <strong>Sources</strong> and choose <strong>Reconnect</strong> on that PC. First choose <strong>Open installed Desktop</strong> and <strong>Start this PC</strong>. If the saved connection is damaged, download the latest Desktop and use the repair details. Do not Disconnect the PC unless you intend to remove its watched-folder and document ledger.</p></details>
+        <details><summary>Windows reports Errno 13 or Permission denied</summary><p>Close every visible Obsync Desktop window, wait a few seconds, and retry with the latest Desktop. Obsync stops its background task before replacing a changed executable and does not consume the reconnect code unless the local repair succeeds.</p></details>
         <details><summary>Obsync Desktop says the pairing code was already used</summary><p>Close duplicate Desktop windows and reopen one copy. Obsync reuses a valid saved connection and repairs startup. If the computer was disconnected, create a new code.</p></details>
         <details><summary>Windows warns that Obsync Desktop is unrecognized</summary><p>Early community builds are not code-signed. Confirm the file came from the official Obsync GitHub release before choosing <strong>More info → Run anyway</strong> in Windows SmartScreen.</p></details>
         <details><summary>The folder browser does not open</summary><p>The selected desktop must be online. Open Obsync Desktop and choose Start this PC, then retry Add folder or Browse for vault.</p></details>

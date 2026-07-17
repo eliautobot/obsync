@@ -524,6 +524,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             status = 409 if "vault writer" in str(exc).lower() else 404
             raise HTTPException(status_code=status, detail=str(exc)) from exc
 
+    @app.post("/api/v1/admin/agents/{agent_id}/reconnect")
+    async def reconnect_agent(
+        agent_id: str,
+        _token: AdminDependency,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = payload or {}
+        try:
+            return service.create_reconnect_enrollment(
+                agent_id, minutes=int(payload.get("minutes", 20))
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     @app.get("/api/v1/admin/roots")
     async def roots(_token: AdminDependency) -> dict[str, Any]:
         return {"items": service.list_roots()}
