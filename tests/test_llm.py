@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -45,10 +46,60 @@ def test_fallback_analysis_bounds_long_preview_and_tag_count() -> None:
 def test_json_extraction_accepts_wrappers_and_rejects_invalid_shapes() -> None:
     assert _extract_json('```json\n{"ok": true}\n```') == {"ok": True}
     assert _extract_json('Model output: {"ok": true} trailing text') == {"ok": True}
+    assert _extract_json('{"ok": true}\n{"duplicate": true}') == {"ok": True}
     with pytest.raises(ValueError, match="did not return JSON"):
         _extract_json("no structured response")
     with pytest.raises(ValueError, match="JSON object"):
         _extract_json("[1, 2, 3]")
+
+
+@pytest.mark.asyncio
+async def test_complete_json_retries_once_with_smaller_response(monkeypatch) -> None:
+    progress: list[tuple[str, str]] = []
+    analyzer = LLMAnalyzer(
+        LLMConfig(enabled=True, provider="ollama", base_url="http://model", model="local"),
+        progress=lambda kind, message: progress.append((kind, message)),
+    )
+    prompts: list[str] = []
+
+    async def call(_base_url, _prompt, *, system_prompt):
+        prompts.append(system_prompt)
+        if len(prompts) == 1:
+            return '{"vault_summary": "truncated"'
+        return '{"vault_summary": "valid"}'
+
+    monkeypatch.setattr(analyzer, "_call_ollama", call)
+
+    result = await analyzer._complete_json("SYSTEM", "PROMPT", operation="testing")
+
+    assert result == {"vault_summary": "valid"}
+    assert len(prompts) == 2
+    assert "RETRY REQUIREMENT" not in prompts[0]
+    assert "RETRY REQUIREMENT" in prompts[1]
+    assert any("incomplete JSON" in message for _kind, message in progress)
+
+
+@pytest.mark.asyncio
+async def test_complete_json_enforces_total_timeout_while_model_is_streaming(monkeypatch) -> None:
+    analyzer = LLMAnalyzer(
+        LLMConfig(
+            enabled=True,
+            provider="ollama",
+            base_url="http://model",
+            model="local",
+            timeout_seconds=0.01,
+        )
+    )
+
+    async def call(_base_url, _prompt, *, system_prompt):
+        del system_prompt
+        await asyncio.sleep(60)
+        return '{"ok": true}'
+
+    monkeypatch.setattr(analyzer, "_call_ollama", call)
+
+    with pytest.raises(LLMRequestTimeoutError, match="timed out after 0.01 seconds"):
+        await analyzer._complete_json("SYSTEM", "PROMPT", operation="testing total timeout")
 
 
 def test_relationship_validator_requires_exact_target_specificity_evidence_and_confidence() -> None:
@@ -56,12 +107,12 @@ def test_relationship_validator_requires_exact_target_specificity_evidence_and_c
         {
             "title": "Client Alpha",
             "link_target": "People/Client Alpha",
-            "anchor_options": [{"text": "Client Alpha"}],
+            "anchor_options": [{"text": "Client Alpha", "context": "owner Client Alpha"}],
         },
         {
             "title": "Project Orion",
             "link_target": "Projects/Project Orion",
-            "anchor_options": [{"text": "Project Orion"}],
+            "anchor_options": [{"text": "Project Orion", "context": "project Orion"}],
         },
     ]
     result = _normalize_relationship_decision(
@@ -113,6 +164,8 @@ def test_relationship_validator_requires_exact_target_specificity_evidence_and_c
         {
             "target": "People/Client Alpha",
             "anchor": "Client Alpha",
+            "anchor_occurrence": 0,
+            "anchor_context": "owner Client Alpha",
             "relationship_type": "entity",
             "relationship": "Client Alpha is the named account owner",
             "evidence": ["SOURCE: owner Client Alpha", "TARGET: account A1"],
@@ -127,7 +180,12 @@ def test_relationship_validator_rejects_ungrounded_model_evidence() -> None:
             "title": "Client Alpha",
             "link_target": "People/Client Alpha",
             "content": "Client Alpha owns billing account A1.",
-            "anchor_options": [{"text": "Client Alpha"}],
+            "anchor_options": [
+                {
+                    "text": "Client Alpha",
+                    "context": "Invoice INV-9 bills Client Alpha for account A1.",
+                }
+            ],
         }
     ]
     result = _normalize_relationship_decision(
@@ -136,6 +194,7 @@ def test_relationship_validator_rejects_ungrounded_model_evidence() -> None:
                 {
                     "target": "People/Client Alpha",
                     "anchor": "Client Alpha",
+                    "anchor_context": "Invoice INV-9 bills Client Alpha for account A1.",
                     "relationship": "Client Alpha owns the billing account",
                     "evidence": [
                         "SOURCE: Project Borealis owns account Z9",
@@ -146,6 +205,7 @@ def test_relationship_validator_rejects_ungrounded_model_evidence() -> None:
                 {
                     "target": "People/Client Alpha",
                     "anchor": "Client Alpha",
+                    "anchor_context": "Invoice INV-9 bills Client Alpha for account A1.",
                     "relationship_type": "entity",
                     "relationship": "Client Alpha owns the billing account",
                     "evidence": [
@@ -170,9 +230,55 @@ def test_relationship_validator_rejects_ungrounded_model_evidence() -> None:
     assert result["relationships"][0]["confidence"] == 0.95
 
 
-def test_relationship_validator_canonicalizes_a_broad_model_anchor_to_the_best_exact_phrase() -> (
-    None
-):
+def test_relationship_validator_rejects_evidence_about_two_different_facts() -> None:
+    candidates = [
+        {
+            "title": "Delivery System",
+            "link_target": "Delivery/Delivery System",
+            "content": "The delivery system covers onboarding and handoff for Pro customers.",
+            "anchor_options": [
+                {
+                    "text": "willingness to pay for Pro",
+                    "context": "Validate willingness to pay for Pro before setting launch pricing.",
+                }
+            ],
+        }
+    ]
+    result = _normalize_relationship_decision(
+        {
+            "relationships": [
+                {
+                    "target": "Delivery/Delivery System",
+                    "anchor": "willingness to pay for Pro",
+                    "anchor_context": (
+                        "Validate willingness to pay for Pro before setting launch pricing."
+                    ),
+                    "relationship_type": "dependency",
+                    "relationship": "The pricing decision depends on the delivery workflow",
+                    "evidence": [
+                        "SOURCE: Validate willingness to pay for Pro before setting "
+                        "launch pricing.",
+                        "TARGET: The delivery system covers onboarding and handoff for "
+                        "Pro customers.",
+                    ],
+                    "confidence": 0.95,
+                }
+            ]
+        },
+        candidates,
+        minimum_confidence=0.72,
+        maximum_links=8,
+        source_note={
+            "path": "Strategy/Launch Plan.md",
+            "title": "Launch Plan",
+            "content": "Validate willingness to pay for Pro before setting launch pricing.",
+        },
+    )
+
+    assert result["relationships"] == []
+
+
+def test_relationship_validator_preserves_the_valid_model_selected_anchor() -> None:
     candidates = [
         {
             "title": "Orion Research",
@@ -183,11 +289,13 @@ def test_relationship_validator_canonicalizes_a_broad_model_anchor_to_the_best_e
                     "text": "Orion Research",
                     "score": 104.0,
                     "reason": "exact target title, alias, or identifier",
+                    "context": "Orion Research commissioned this field report for Project Atlas.",
                 },
                 {
                     "text": "Orion Research commissioned this field report",
                     "score": 12.0,
                     "reason": "distinctive phrase shared with the target note",
+                    "context": "Orion Research commissioned this field report for Project Atlas.",
                 },
             ],
         }
@@ -198,6 +306,9 @@ def test_relationship_validator_canonicalizes_a_broad_model_anchor_to_the_best_e
                 {
                     "target": "Organizations/Orion Research",
                     "anchor": "Orion Research commissioned this field report",
+                    "anchor_context": (
+                        "Orion Research commissioned this field report for Project Atlas."
+                    ),
                     "relationship_type": "entity",
                     "relationship": "Orion Research commissioned the source field report",
                     "evidence": [
@@ -218,7 +329,477 @@ def test_relationship_validator_canonicalizes_a_broad_model_anchor_to_the_best_e
         },
     )
 
-    assert result["relationships"][0]["anchor"] == "Orion Research"
+    assert result["relationships"][0]["anchor"] == "Orion Research commissioned this field report"
+
+
+def test_relationship_validator_rejects_already_linked_targets_and_wrong_anchor_context() -> None:
+    candidates = [
+        {
+            "title": "Project Atlas",
+            "link_target": "Projects/Project Atlas",
+            "content": "Project Atlas depends on Architecture A-100.",
+            "already_linked": True,
+            "anchor_options": [
+                {
+                    "text": "Project Atlas",
+                    "context": "Project Atlas depends on Architecture A-100.",
+                }
+            ],
+        },
+        {
+            "title": "Architecture A-100",
+            "link_target": "Architecture/A-100",
+            "content": "Architecture A-100 defines the accounting core.",
+            "anchor_options": [
+                {
+                    "text": "accounting core",
+                    "context": "Build the accounting core before financial workflows.",
+                }
+            ],
+        },
+    ]
+    result = _normalize_relationship_decision(
+        {
+            "relationships": [
+                {
+                    "target": "Projects/Project Atlas",
+                    "anchor": "Project Atlas",
+                    "anchor_context": "Project Atlas depends on Architecture A-100.",
+                    "relationship": "Project Atlas is the source project",
+                    "evidence": [
+                        "SOURCE: Project Atlas depends on Architecture A-100",
+                        "TARGET: Project Atlas depends on Architecture A-100",
+                    ],
+                    "confidence": 0.99,
+                },
+                {
+                    "target": "Architecture/A-100",
+                    "anchor": "accounting core",
+                    "anchor_context": "Build the accounting core before financial workflows.",
+                    "relationship": "Architecture A-100 defines the accounting core",
+                    "evidence": [
+                        "SOURCE: unrelated ownership metadata",
+                        "TARGET: Architecture A-100 defines the accounting core",
+                    ],
+                    "confidence": 0.99,
+                },
+            ]
+        },
+        candidates,
+        minimum_confidence=0.8,
+        maximum_links=8,
+        source_note={
+            "path": "Projects/Project Atlas.md",
+            "title": "Project Atlas",
+            "content": "Build the accounting core before financial workflows.",
+        },
+    )
+
+    assert result["relationships"] == []
+
+
+def test_relationship_validator_rejects_shared_infrastructure_as_the_only_connection() -> None:
+    candidate = {
+        "title": "Ollama Tailscale Setup",
+        "link_target": "Infrastructure/Ollama Tailscale Setup",
+        "content": "Windows Tailscale IPv4 is 198.51.100.42.",
+        "anchor_options": [
+            {
+                "text": "Tailscale use",
+                "context": "The app server is intended for private Tailscale use only.",
+            }
+        ],
+    }
+    result = _normalize_relationship_decision(
+        {
+            "relationships": [
+                {
+                    "target": "Infrastructure/Ollama Tailscale Setup",
+                    "anchor": "Tailscale use",
+                    "anchor_context": "The app server is intended for private Tailscale use only.",
+                    "relationship": "Both apps run on the same Windows Tailscale node and IP.",
+                    "evidence": [
+                        "SOURCE: private Tailscale use on 198.51.100.42",
+                        "TARGET: Windows Tailscale IPv4 is 198.51.100.42",
+                    ],
+                    "confidence": 0.99,
+                }
+            ]
+        },
+        [candidate],
+        minimum_confidence=0.8,
+        maximum_links=8,
+        source_note={
+            "path": "Apps/Architecture.md",
+            "title": "App Architecture",
+            "content": (
+                "The app server is intended for private Tailscale use only at 198.51.100.42."
+            ),
+        },
+    )
+
+    assert result["relationships"] == []
+
+
+def test_tag_and_organization_decisions_require_grounding_confidence_and_allowed_values() -> None:
+    source = {
+        "path": "LedgeFlow/03-accounting-core.md",
+        "title": "Phase 3 Accounting Core",
+        "content": "Phase 3 builds the double-entry accounting core for LedgeFlow.",
+    }
+    candidates = [
+        {
+            "title": "LedgeFlow Index",
+            "link_target": "LedgeFlow/README",
+            "structural_role": "category-hub",
+            "content_excerpt": "LedgeFlow Index catalogs accounting phases.",
+            "anchor_options": [],
+        }
+    ]
+    result = _normalize_relationship_decision(
+        {
+            "suggested_tags": [
+                "legacy-string-is-invalid",
+                {
+                    "tag": "ledgeflow",
+                    "reason": "Stable project classification.",
+                    "evidence": ["SOURCE: LedgeFlow Phase 3 accounting core"],
+                    "confidence": 0.96,
+                },
+                {
+                    "tag": "accounting",
+                    "reason": "Unsupported tag.",
+                    "evidence": ["SOURCE: unrelated text"],
+                    "confidence": 0.99,
+                },
+                {
+                    "tag": "business",
+                    "reason": "Broad label adds no durable classification.",
+                    "evidence": ["SOURCE: LedgeFlow accounting core"],
+                    "confidence": 0.99,
+                },
+            ],
+            "organization_operations": [
+                {
+                    "kind": "move-note",
+                    "destination_folder": "LedgeFlow/Phases",
+                    "reason": "Existing folder stores milestone phase notes.",
+                    "evidence": ["SOURCE: Phase 3 accounting core"],
+                    "confidence": 0.95,
+                },
+                {
+                    "kind": "move-note",
+                    "destination_folder": "Invented/Folder",
+                    "reason": "Invented destination.",
+                    "evidence": ["SOURCE: Phase 3 accounting core"],
+                    "confidence": 0.99,
+                },
+            ],
+            "index_memberships": [
+                {
+                    "target": "LedgeFlow/README",
+                    "reason": "The project index catalogs accounting phases.",
+                    "evidence": [
+                        "SOURCE: Phase 3 accounting core for LedgeFlow",
+                        "TARGET: LedgeFlow Index catalogs accounting phases",
+                    ],
+                    "confidence": 0.97,
+                }
+            ],
+        },
+        candidates,
+        minimum_confidence=0.8,
+        maximum_links=8,
+        source_note=source,
+        allowed_folders=["LedgeFlow", "LedgeFlow/Phases"],
+    )
+
+    assert [item["tag"] for item in result["suggested_tags"]] == ["ledgeflow"]
+    assert result["suggested_tags"][0]["confidence"] == 0.96
+    assert result["organization_operations"] == [
+        {
+            "kind": "move-note",
+            "destination_folder": "LedgeFlow/Phases",
+            "reason": "Existing folder stores milestone phase notes.",
+            "evidence": ["SOURCE: Phase 3 accounting core"],
+            "confidence": 0.95,
+        }
+    ]
+    assert result["index_memberships"][0]["target"] == "LedgeFlow/README"
+
+
+def test_unknown_relationship_target_is_rejected_without_crashing() -> None:
+    result = _normalize_relationship_decision(
+        {
+            "relationships": [
+                {
+                    "target": "Invented/Target",
+                    "anchor": "accounting core",
+                    "anchor_context": "Build the accounting core before reporting.",
+                    "relationship": "The invented target defines this accounting core.",
+                    "evidence": [
+                        "SOURCE: Build the accounting core before reporting.",
+                        "TARGET: Invented target defines the accounting core.",
+                    ],
+                    "confidence": 0.99,
+                }
+            ]
+        },
+        [],
+        minimum_confidence=0.8,
+        maximum_links=8,
+        source_note={
+            "path": "LedgeFlow/03-accounting-core.md",
+            "title": "Accounting Core",
+            "content": "Build the accounting core before reporting.",
+        },
+    )
+
+    assert result["relationships"] == []
+
+
+def test_structural_tags_must_match_the_source_classification() -> None:
+    source = {
+        "path": "Ent Forge/02_brand_marketing/social-presence-plan.md",
+        "title": "Social Presence Plan",
+        "headings": ["Channels", "Posting rhythm"],
+        "content": (
+            "A social presence plan for the Virtual Office product. "
+            "Virtual Office clips will demonstrate the product."
+        ),
+    }
+    result = _normalize_relationship_decision(
+        {
+            "suggested_tags": [
+                {
+                    "tag": "overview",
+                    "reason": "Incorrectly treats the plan as a hub.",
+                    "evidence": ["SOURCE: Social Presence Plan"],
+                    "confidence": 0.99,
+                },
+                {
+                    "tag": "architecture",
+                    "reason": "Incorrectly transfers a role from another project.",
+                    "evidence": ["SOURCE: Virtual Office product"],
+                    "confidence": 0.99,
+                },
+                {
+                    "tag": "data-model",
+                    "reason": "A subsection does not make the full note a data-model record.",
+                    "evidence": ["SOURCE: Data Model"],
+                    "confidence": 0.99,
+                },
+                {
+                    "tag": "virtual-office",
+                    "reason": "Stable project classification named by the source.",
+                    "evidence": ["SOURCE: Virtual Office product"],
+                    "confidence": 0.95,
+                },
+            ]
+        },
+        [],
+        minimum_confidence=0.8,
+        maximum_links=8,
+        source_note=source,
+    )
+
+    assert [item["tag"] for item in result["suggested_tags"]] == ["virtual-office"]
+
+
+def test_tag_validator_rejects_a_topic_mentioned_in_only_one_subsection() -> None:
+    result = _normalize_relationship_decision(
+        {
+            "suggested_tags": [
+                {
+                    "tag": "account",
+                    "reason": "One subsection lists metadata for account records.",
+                    "evidence": ["SOURCE: Required metadata for account records"],
+                    "confidence": 0.95,
+                }
+            ]
+        },
+        [],
+        minimum_confidence=0.8,
+        maximum_links=8,
+        source_note={
+            "path": "Operations/System of Record.md",
+            "title": "System of Record",
+            "content": (
+                "# System of Record\n\n## Required metadata for account records\n- owner\n"
+            ),
+        },
+    )
+
+    assert result["suggested_tags"] == []
+
+
+def test_structural_tag_accepts_a_matching_note_title() -> None:
+    result = _normalize_relationship_decision(
+        {
+            "suggested_tags": [
+                {
+                    "tag": "data-model",
+                    "reason": "The note is the project's data model specification.",
+                    "evidence": ["SOURCE: LedgeFlow Data Model"],
+                    "confidence": 0.95,
+                }
+            ]
+        },
+        [],
+        minimum_confidence=0.8,
+        maximum_links=8,
+        source_note={
+            "path": "LedgeFlow/DATA_MODEL.md",
+            "title": "LedgeFlow Data Model",
+            "content": "LedgeFlow Data Model defines journal entries.",
+        },
+    )
+
+    assert [item["tag"] for item in result["suggested_tags"]] == ["data-model"]
+
+
+def test_relationship_decision_rejects_single_word_category_hub_anchor() -> None:
+    candidate = {
+        "title": "LedgeFlow",
+        "path": "LedgeFlow/README.md",
+        "link_target": "LedgeFlow/README|LedgeFlow",
+        "structural_role": "category-hub",
+        "content": "LedgeFlow project hub catalogs the architecture specification.",
+        "anchor_options": [
+            {
+                "text": "LedgeFlow",
+                "context": "LedgeFlow should be built as an API-first application.",
+                "occurrence": 0,
+            }
+        ],
+    }
+    result = _normalize_relationship_decision(
+        {
+            "relationships": [
+                {
+                    "target": "LedgeFlow/README|LedgeFlow",
+                    "anchor": "LedgeFlow",
+                    "anchor_context": "LedgeFlow should be built as an API-first application.",
+                    "relationship": "The project hub catalogs this architecture specification",
+                    "evidence": [
+                        "SOURCE: LedgeFlow API-first architecture specification",
+                        "TARGET: LedgeFlow architecture specification project hub",
+                    ],
+                    "confidence": 0.99,
+                }
+            ]
+        },
+        [candidate],
+        minimum_confidence=0.8,
+        maximum_links=8,
+        source_note={
+            "path": "LedgeFlow/ARCHITECTURE.md",
+            "title": "LedgeFlow Architecture",
+            "content": "LedgeFlow should be built as an API-first application.",
+        },
+    )
+
+    assert result["relationships"] == []
+
+
+def test_relationship_decision_rejects_semantic_phrase_for_category_hub() -> None:
+    context = "Milestone 4 / Cody Task 15 remains pending."
+    candidate = {
+        "title": "LedgeFlow",
+        "path": "LedgeFlow/README.md",
+        "link_target": "LedgeFlow/README|LedgeFlow",
+        "structural_role": "category-hub",
+        "content": "Project hub tracks Milestone 4 Cody Task 15.",
+        "anchor_options": [
+            {
+                "text": "Milestone 4 / Cody Task",
+                "context": context,
+                "occurrence": 0,
+                "reason": "distinctive phrase supported by target content",
+            }
+        ],
+    }
+    result = _normalize_relationship_decision(
+        {
+            "relationships": [
+                {
+                    "target": "LedgeFlow/README|LedgeFlow",
+                    "anchor": "Milestone 4 / Cody Task",
+                    "anchor_context": context,
+                    "relationship": "The project hub tracks this milestone task",
+                    "evidence": [
+                        "SOURCE: Milestone 4 Cody Task 15 remains pending",
+                        "TARGET: Milestone 4 Cody Task 15 project hub",
+                    ],
+                    "confidence": 0.99,
+                }
+            ]
+        },
+        [candidate],
+        minimum_confidence=0.8,
+        maximum_links=8,
+        source_note={
+            "path": "LedgeFlow/Phase-04.md",
+            "title": "Phase 4",
+            "content": context,
+        },
+    )
+
+    assert result["relationships"] == []
+
+
+def test_index_membership_rejects_adjacent_entities_that_do_not_match_the_hub_category() -> None:
+    hub = {
+        "title": "Purchase Order Index",
+        "path": "Indexes/Purchase Order Index.md",
+        "link_target": "Indexes/Purchase Order Index",
+        "structural_role": "category-hub",
+        "content_excerpt": "Category home for purchase orders.",
+        "anchor_options": [],
+    }
+    proposal = {
+        "index_memberships": [
+            {
+                "target": "Indexes/Purchase Order Index",
+                "reason": "The source mentions Purchase Order 101.",
+                "evidence": [
+                    "SOURCE: Northstar Labs purchased equipment under Purchase Order 101.",
+                    "TARGET: Category home for purchase orders.",
+                ],
+                "confidence": 0.99,
+            }
+        ]
+    }
+    organization = {
+        "path": "Organizations/Northstar Labs.md",
+        "title": "Northstar Labs",
+        "tags": ["organization"],
+        "content": "Northstar Labs purchased equipment under Purchase Order 101.",
+    }
+    order = {
+        "path": "Orders/Purchase Order 101.md",
+        "title": "Purchase Order 101",
+        "tags": [],
+        "content": "Northstar Labs ordered sensor equipment.",
+    }
+
+    rejected = _normalize_relationship_decision(
+        proposal,
+        [hub],
+        minimum_confidence=0.8,
+        maximum_links=8,
+        source_note=organization,
+    )
+    accepted = _normalize_relationship_decision(
+        proposal,
+        [hub],
+        minimum_confidence=0.8,
+        maximum_links=8,
+        source_note=order,
+    )
+
+    assert rejected["index_memberships"] == []
+    assert accepted["index_memberships"][0]["target"] == "Indexes/Purchase Order Index"
 
 
 @pytest.mark.asyncio
@@ -265,6 +846,99 @@ async def test_vault_model_accepts_vault_specific_patterns_without_fixed_categor
 
 
 @pytest.mark.asyncio
+async def test_vault_model_prompt_fits_local_context_and_samples_rare_folders(monkeypatch) -> None:
+    analyzer = LLMAnalyzer(
+        LLMConfig(enabled=True, provider="ollama", base_url="http://model", model="local")
+    )
+    notes = [
+        {
+            "path": f"Invoices/Invoice {index:04d}.md",
+            "title": f"Invoice {index:04d}",
+            "content": "Repeated invoice template details. " * 100,
+        }
+        for index in range(500)
+    ]
+    notes.extend(
+        [
+            {
+                "path": "Rare Strategy/Launch Plan.md",
+                "title": "Launch Plan",
+                "content": "RARE-STRATEGY-SIGNAL launch decisions and pricing.",
+            },
+            {
+                "path": "Architecture/Core.md",
+                "title": "Architecture Core",
+                "content": "RARE-ARCHITECTURE-SIGNAL system dependency graph.",
+            },
+        ]
+    )
+    notes.sort(key=lambda item: item["path"])
+    captured: dict[str, str] = {}
+
+    async def complete(system_prompt, user_prompt, *, operation):
+        captured["prompt"] = user_prompt
+        return {"vault_summary": "Representative full-vault model", "confidence": 0.9}
+
+    monkeypatch.setattr(analyzer, "_complete_json", complete)
+
+    await analyzer.learn_vault_model(notes, corpus_profile={"note_count": len(notes)})
+
+    assert len(captured["prompt"]) < 115_000
+    assert "RARE-STRATEGY-SIGNAL" in captured["prompt"]
+    assert "RARE-ARCHITECTURE-SIGNAL" in captured["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_vault_model_uses_observed_profile_after_two_invalid_json_responses(
+    monkeypatch,
+) -> None:
+    progress: list[tuple[str, str]] = []
+    analyzer = LLMAnalyzer(
+        LLMConfig(enabled=True, provider="ollama", base_url="http://model", model="local"),
+        progress=lambda kind, message: progress.append((kind, message)),
+    )
+
+    async def complete(*_args, **_kwargs):
+        raise ValueError("Local AI returned invalid JSON twice while learning")
+
+    monkeypatch.setattr(analyzer, "_complete_json", complete)
+    result = await analyzer.learn_vault_model(
+        [{"path": "Projects/Plan.md", "title": "Plan", "content": "Plan"}],
+        corpus_profile={
+            "folders": [{"path": "Projects", "notes": 1}],
+            "tag_vocabulary": [{"tag": "strategy", "notes": 1}],
+            "existing_category_hubs": [
+                {"path": "Projects/README.md", "title": "Projects", "outgoing_links": 4}
+            ],
+        },
+    )
+
+    assert result["fallback"] == "deterministic-observed-profile"
+    assert result["category_hierarchy"][0]["name"] == "Projects"
+    assert "strategy" in result["folder_guidance"][0]
+    assert any("sweep can continue safely" in message for _kind, message in progress)
+
+
+@pytest.mark.asyncio
+async def test_vault_model_uses_observed_profile_after_empty_json(monkeypatch) -> None:
+    analyzer = LLMAnalyzer(
+        LLMConfig(enabled=True, provider="ollama", base_url="http://model", model="local")
+    )
+
+    async def complete(*_args, **_kwargs):
+        return {}
+
+    monkeypatch.setattr(analyzer, "_complete_json", complete)
+    result = await analyzer.learn_vault_model(
+        [{"path": "Projects/Plan.md", "title": "Plan", "content": "Plan"}],
+        corpus_profile={"folders": [{"path": "Projects", "notes": 1}]},
+    )
+
+    assert result["fallback"] == "deterministic-observed-profile"
+    assert result["category_hierarchy"][0]["name"] == "Projects"
+
+
+@pytest.mark.asyncio
 async def test_adaptive_relationship_call_uses_specialized_prompt_and_grounded_validation(
     monkeypatch,
 ) -> None:
@@ -273,11 +947,19 @@ async def test_adaptive_relationship_call_uses_specialized_prompt_and_grounded_v
         "source_category": "billing",
         "source_role": "client invoice",
         "summary": "The invoice names the client account.",
-        "suggested_tags": ["Client Billing"],
+        "suggested_tags": [
+            {
+                "tag": "Client Billing",
+                "reason": "This is a durable client billing record.",
+                "evidence": ["SOURCE: Invoice INV-9 bills Client Alpha"],
+                "confidence": 0.91,
+            }
+        ],
         "relationships": [
             {
                 "target": "People/Client Alpha",
                 "anchor": "Client Alpha",
+                "anchor_context": "Invoice INV-9 bills Client Alpha for account A1.",
                 "relationship_type": "entity",
                 "relationship": "Client Alpha owns the billed account",
                 "evidence": [
@@ -323,7 +1005,12 @@ async def test_adaptive_relationship_call_uses_specialized_prompt_and_grounded_v
                 "link_target": "People/Client Alpha",
                 "content": "Client Alpha owns billing account A1.",
                 "content_excerpt": "Client Alpha owns billing account A1.",
-                "anchor_options": [{"text": "Client Alpha"}],
+                "anchor_options": [
+                    {
+                        "text": "Client Alpha",
+                        "context": "Invoice INV-9 bills Client Alpha for account A1.",
+                    }
+                ],
             }
         ],
         vault_model={"vault_summary": "Client records and billing notes."},
@@ -337,7 +1024,84 @@ async def test_adaptive_relationship_call_uses_specialized_prompt_and_grounded_v
     assert "Respect this vault's naming style." in system
     assert captured["think"] is False
     assert result["relationships"][0]["target"] == "People/Client Alpha"
-    assert result["suggested_tags"] == ["client-billing"]
+    assert result["suggested_tags"] == [
+        {
+            "tag": "client-billing",
+            "reason": "This is a durable client billing record.",
+            "evidence": ["SOURCE: Invoice INV-9 bills Client Alpha"],
+            "confidence": 0.91,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_adaptive_relationship_prompt_is_bounded_for_large_notes(monkeypatch) -> None:
+    analyzer = LLMAnalyzer(
+        LLMConfig(enabled=True, provider="ollama", base_url="http://model", model="local")
+    )
+    captured: dict[str, str] = {}
+
+    async def complete(_system_prompt, user_prompt, *, operation):
+        captured["prompt"] = user_prompt
+        captured["operation"] = operation
+        return {
+            "relationships": [
+                {
+                    "target": "Projects/Candidate-19",
+                    "anchor": "Candidate 19",
+                    "anchor_context": "The source depends on Candidate 19 for validation.",
+                    "relationship_type": "dependency",
+                    "relationship": "The source depends on Candidate 19 for validation",
+                    "evidence": [
+                        "SOURCE: The source depends on Candidate 19 for validation.",
+                        "TARGET: candidate-19 evidence",
+                    ],
+                    "confidence": 0.99,
+                }
+            ]
+        }
+
+    monkeypatch.setattr(analyzer, "_complete_json", complete)
+    candidates = [
+        {
+            "path": f"Projects/Candidate-{index:02d}.md",
+            "title": f"Candidate {index:02d}",
+            "link_target": f"Projects/Candidate-{index:02d}",
+            "content_excerpt": f"candidate-{index:02d} " + ("evidence " * 500),
+            "anchor_options": [
+                {
+                    "text": f"Candidate {index:02d}",
+                    "context": f"The source depends on Candidate {index:02d} for validation.",
+                }
+            ],
+        }
+        for index in range(20)
+    ]
+
+    result = await analyzer.adjudicate_relationships(
+        {
+            "path": "Projects/Large Guide.md",
+            "title": "Large Guide",
+            "content": "The source depends on Candidate 19 for validation. "
+            + ("source material " * 5_000),
+            "properties": {"large": "property " * 2_000},
+            "headings": ["heading " * 100 for _index in range(30)],
+        },
+        candidates,
+        vault_model={"vault_summary": "model " * 10_000},
+        minimum_confidence=0.72,
+        maximum_links=8,
+        feedback=[{"reason": "feedback " * 2_000}],
+        owned_operations=[{"reason": "owned " * 2_000}],
+        tag_vocabulary=[f"tag-{index}-" + ("x" * 100) for index in range(100)],
+        allowed_folders=[f"Folder/{index}/" + ("x" * 100) for index in range(150)],
+    )
+
+    assert result["relationships"] == []
+    assert len(captured["prompt"]) < 80_000
+    assert "candidate-00" in captured["prompt"]
+    assert "candidate-19" not in captured["prompt"]
+    assert captured["operation"].endswith("Projects/Large Guide.md")
 
 
 @pytest.mark.asyncio

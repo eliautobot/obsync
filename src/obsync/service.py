@@ -62,12 +62,20 @@ from .security import (
 from .vault_intelligence import (
     AdaptiveVaultIndex,
     add_backlinks,
+    add_index_membership,
+    apply_native_operations,
+    change_native_tag,
     content_hash,
     decode_db_note,
+    exact_duplicate_groups,
     existing_note_match,
     explicit_category_hub_relationships,
+    explicit_reciprocal_relationships,
+    explicit_reference_relationships,
+    link_target,
     native_maintenance_content,
     normalize_obsidian_tag,
+    note_links_to,
     parse_note,
     reapply_owned_operations,
     serialize_note_for_db,
@@ -106,10 +114,11 @@ DEFAULT_SETTINGS: dict[str, tuple[str, bool]] = {
     "vault_maintenance_schedule_interval_hours": ("168", False),
     "vault_maintenance_change_mode": ("review", False),
     "vault_schedule_timezone": ("America/New_York", False),
-    "vault_maintenance_categories": ('["links", "tags"]', False),
+    "vault_maintenance_categories": ('["links", "tags", "organization"]', False),
     "vault_relationship_candidate_limit": ("20", False),
     "vault_relationship_min_confidence": ("0.72", False),
     "vault_link_limit": ("8", False),
+    "vault_metadata_version": ("2", False),
 }
 
 PIPELINE_COMMANDS = frozenset(
@@ -143,6 +152,8 @@ class ObsyncService:
         self.db = db or Database(settings.database_path)
         self.db.initialize()
         self._ensure_defaults()
+        self._recover_interrupted_sweeps()
+        self._repair_stored_vault_metadata()
         self._ensure_ai_profiles()
         self._inventory_vault_indexes: dict[
             str,
@@ -160,6 +171,7 @@ class ObsyncService:
         self._ai_activity_subscribers: set[asyncio.Queue[int]] = set()
         self._cancel_reasons: dict[str, str] = {}
         self._sweep_task: asyncio.Task[Any] | None = None
+        self._sweep_ai_task: asyncio.Task[Any] | None = None
         self._sweep_stop = asyncio.Event()
         self._scheduler_task: asyncio.Task[Any] | None = None
         self._dummy_password_hash = hash_password("obsync-invalid-password")
@@ -174,6 +186,23 @@ class ObsyncService:
             missing["sync_enabled"] = ("false", False)
         if missing:
             self.db.set_settings(missing)
+
+    def _recover_interrupted_sweeps(self) -> None:
+        """Close persisted work that cannot still have a task after process startup."""
+        now = utc_now()
+        self.db.execute(
+            "UPDATE vault_sweeps SET status = 'stopped', current_note = '', finished_at = ?, "
+            "updated_at = ?, error = CASE WHEN error = '' THEN "
+            "'Interrupted by a server restart before completion.' ELSE error END "
+            "WHERE status IN ('queued', 'running', 'stopping')",
+            (now, now),
+        )
+        self.db.execute(
+            "UPDATE vault_models SET status = 'not-learned', error = "
+            "'Interrupted by a server restart before completion.', updated_at = ? "
+            "WHERE status = 'learning'",
+            (now,),
+        )
 
     def _ensure_ai_profiles(self) -> None:
         active_id = self.db.get_setting("ai_active_profile_id", "")
@@ -360,6 +389,56 @@ class ObsyncService:
                 (key,),
             )
         ]
+
+    def _reparse_indexed_notes(self, vault_key: str) -> list[dict[str, Any]]:
+        """Derive metadata from current stored Markdown instead of trusting legacy JSON columns."""
+        rows = self._indexed_vault_notes(vault_key)
+        reparsed: list[dict[str, Any]] = []
+        for row in rows:
+            note = parse_note(
+                Path(str(row.get("path", ""))),
+                content=str(row.get("content", "")),
+                modified_ns=int(row.get("modified_ns", 0)),
+            ).as_dict()
+            note["size"] = int(row.get("size", note["size"]))
+            note["content_hash"] = content_hash(str(row.get("content", "")))
+            reparsed.append(note)
+        add_backlinks(reparsed)
+        owned_tags: dict[str, set[str]] = {}
+        for owned in self.db.query_all(
+            "SELECT path, target FROM vault_edit_ownership WHERE vault_key = ? "
+            "AND kind = 'frontmatter-tag' AND status = 'active'",
+            (vault_key,),
+        ):
+            owned_tags.setdefault(str(owned["path"]), set()).add(str(owned["target"]).casefold())
+        for note in reparsed:
+            generated = owned_tags.get(str(note.get("path", "")), set())
+            note["human_tags"] = [
+                tag for tag in note.get("tags", []) if str(tag).casefold() not in generated
+            ]
+            note["learning_properties"] = {
+                **dict(note.get("properties", {})),
+                "tags": list(note["human_tags"]),
+            }
+            learning_content = str(note.get("content", ""))
+            for tag in generated:
+                learning_content, _removed = change_native_tag(
+                    learning_content, tag=tag, remove=True
+                )
+            note["learning_content"] = learning_content
+        return reparsed
+
+    def _repair_stored_vault_metadata(self) -> None:
+        if self.db.get_setting("vault_metadata_version", "2") == "2":
+            return
+        keys = [
+            str(row["vault_key"])
+            for row in self.db.query_all("SELECT DISTINCT vault_key FROM vault_notes")
+        ]
+        for vault_key in keys:
+            notes = self._reparse_indexed_notes(vault_key)
+            self._store_vault_index(vault_key, notes, full_rebuild=True)
+        self.db.set_settings({"vault_metadata_version": ("2", False)})
 
     def _store_vault_index(
         self,
@@ -549,6 +628,7 @@ class ObsyncService:
         evidence: list[str],
         confidence: float,
         decision: dict[str, Any] | None = None,
+        change_type: str = "native-maintenance",
     ) -> str:
         change_id = str(uuid.uuid4())
         before_content = str(note.get("content", ""))
@@ -558,13 +638,14 @@ class ObsyncService:
                 id, sweep_id, vault_key, path, change_type, status, before_hash, after_hash,
                 before_content, after_content, reason, evidence_json, confidence, created_at
                 , decision_json
-            ) VALUES (?, ?, ?, ?, 'native-maintenance', 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 change_id,
                 sweep_id,
                 self._vault_key(),
                 note["path"],
+                change_type,
                 str(note.get("content_hash") or content_hash(before_content)),
                 content_hash(after_content),
                 before_content,
@@ -598,6 +679,9 @@ class ObsyncService:
                     "source_path": str(row.get("path", "")),
                     "outcome": str(row.get("status", "")),
                     "relationships": list(decision.get("relationships", []))[:20],
+                    "suggested_tags": list(decision.get("suggested_tags", []))[:20],
+                    "operations": list(decision.get("operations", []))[:30],
+                    "review": decision.get("review", {}),
                 }
             )
         return feedback
@@ -617,7 +701,9 @@ class ObsyncService:
         for note in sorted(notes, key=lambda item: str(item.get("path", "")).casefold()):
             digest.update(str(note.get("path", "")).encode())
             digest.update(b"\0")
-            knowledge_hash = content_hash(strip_maintenance_block(str(note.get("content", ""))))
+            knowledge_hash = content_hash(
+                strip_maintenance_block(str(note.get("learning_content", note.get("content", ""))))
+            )
             digest.update(knowledge_hash.encode())
         digest.update(json.dumps(feedback, sort_keys=True, ensure_ascii=False).encode())
         return digest.hexdigest()
@@ -649,9 +735,12 @@ class ObsyncService:
         return row
 
     def _refresh_vault_corpus_profile(
-        self, notes: list[dict[str, Any]]
+        self,
+        notes: list[dict[str, Any]],
+        *,
+        noncanonical_paths: set[str] | None = None,
     ) -> tuple[AdaptiveVaultIndex, dict[str, Any]]:
-        adaptive = AdaptiveVaultIndex(notes)
+        adaptive = AdaptiveVaultIndex(notes, noncanonical_paths=noncanonical_paths)
         corpus = adaptive.corpus_profile()
         serialized = json.dumps(corpus, sort_keys=True, ensure_ascii=False)
         fingerprint = hashlib.sha256(serialized.encode()).hexdigest()
@@ -870,9 +959,15 @@ class ObsyncService:
                     phase_label="Learning adaptive vault model",
                 ),
             )
-            model = await analyzer.learn_vault_model(
-                notes, feedback=feedback, corpus_profile=corpus_profile
+            ai_task = asyncio.create_task(
+                analyzer.learn_vault_model(notes, feedback=feedback, corpus_profile=corpus_profile)
             )
+            self._sweep_ai_task = ai_task
+            try:
+                model = await ai_task
+            finally:
+                if self._sweep_ai_task is ai_task:
+                    self._sweep_ai_task = None
             self._update_sweep_inference(
                 sweep_id,
                 "decision",
@@ -880,6 +975,13 @@ class ObsyncService:
                 phase="learning",
                 phase_label="Adaptive vault model ready",
             )
+        except asyncio.CancelledError:
+            self.db.execute(
+                "UPDATE vault_models SET status = 'not-learned', error = ?, updated_at = ? "
+                "WHERE vault_key = ?",
+                ("Learning stopped by user", utc_now(), self._vault_key()),
+            )
+            raise
         except Exception as exc:
             self._update_sweep_inference(
                 sweep_id,
@@ -902,8 +1004,70 @@ class ObsyncService:
         )
         return model, feedback
 
+    def _resolved_duplicate_paths(self) -> set[str]:
+        return {
+            str(row["duplicate_path"])
+            for row in self.db.query_all(
+                "SELECT duplicate_path FROM vault_duplicate_resolutions "
+                "WHERE vault_key = ? AND status = 'active'",
+                (self._vault_key(),),
+            )
+        }
+
+    def _create_duplicate_findings(self, sweep_id: str, notes: list[dict[str, Any]]) -> list[str]:
+        """Create review-only canonical selections before relationship inference."""
+        resolved = {path.casefold() for path in self._resolved_duplicate_paths()}
+        change_ids: list[str] = []
+        for group in exact_duplicate_groups(notes):
+            canonical = group[0]
+            canonical_path = str(canonical.get("path", ""))
+            for duplicate in group[1:]:
+                duplicate_path = str(duplicate.get("path", ""))
+                if not duplicate_path or duplicate_path.casefold() in resolved:
+                    continue
+                reason = (
+                    f"Exact duplicate content detected. Use {canonical_path} as the canonical "
+                    f"knowledge record and exclude {duplicate_path} from relationship retrieval."
+                )
+                operation = {
+                    "operation_id": str(uuid.uuid4()),
+                    "action": "select",
+                    "kind": "canonical-selection",
+                    "key": duplicate_path.casefold(),
+                    "canonical_path": canonical_path,
+                    "duplicate_path": duplicate_path,
+                    "reason": reason,
+                    "confidence": 1.0,
+                }
+                decision = {
+                    "summary": reason,
+                    "relationships": [],
+                    "suggested_tags": [],
+                    "operations": [operation],
+                }
+                change_ids.append(
+                    self._create_vault_change(
+                        sweep_id=sweep_id,
+                        note=duplicate,
+                        after_content=str(duplicate.get("content", "")),
+                        reason=reason,
+                        evidence=[
+                            f"Both notes have the same SHA-256 after legacy maintenance cleanup: "
+                            f"{canonical_path} and {duplicate_path}"
+                        ],
+                        confidence=1.0,
+                        decision=decision,
+                        change_type="duplicate-finding",
+                    )
+                )
+        return change_ids
+
     async def _generate_maintenance_changes(self, sweep_id: str) -> list[str]:
-        notes = self._indexed_vault_notes()
+        notes = self._reparse_indexed_notes(self._vault_key())
+        if notes:
+            self._store_vault_index(
+                self._vault_key(), notes, full_rebuild=False, delete_missing=False
+            )
         if not notes:
             self.db.execute(
                 "UPDATE vault_sweeps SET recommendations = 0, updated_at = ? WHERE id = ?",
@@ -935,10 +1099,17 @@ class ObsyncService:
         try:
             categories = set(json.loads(categories_raw))
         except (TypeError, json.JSONDecodeError):
-            categories = {"links", "tags"}
-        change_ids: list[str] = []
+            categories = {"links", "tags", "organization"}
+        change_ids = self._create_duplicate_findings(sweep_id, notes)
         total = len(notes)
-        search_index, corpus_profile = self._refresh_vault_corpus_profile(notes)
+        noncanonical_paths = self._resolved_duplicate_paths() | {
+            str(group_item.get("path", ""))
+            for group in exact_duplicate_groups(notes)
+            for group_item in group[1:]
+        }
+        search_index, corpus_profile = self._refresh_vault_corpus_profile(
+            notes, noncanonical_paths=noncanonical_paths
+        )
         vault_model, feedback = await self._learn_vault_model(
             notes, sweep_id, corpus_profile=corpus_profile
         )
@@ -971,7 +1142,9 @@ class ObsyncService:
                 phase_label=f"Analyzing note {index} of {total}",
                 current_note=str(note["path"]),
             )
-            if not ({"links", "tags"} & categories):
+            if str(note.get("path", "")) in noncanonical_paths:
+                continue
+            if not ({"links", "tags", "organization"} & categories):
                 continue
             candidates = await asyncio.to_thread(
                 search_index.candidates,
@@ -981,24 +1154,39 @@ class ObsyncService:
                 maximum=min(50, candidate_limit * 3),
                 source_note=note,
             )
-            candidates = [candidate for candidate in candidates if candidate.get("anchor_options")][
-                :candidate_limit
-            ]
+            candidates = [
+                candidate
+                for candidate in candidates
+                if candidate.get("anchor_options")
+                or candidate.get("already_linked")
+                or candidate.get("structural_role") == "category-hub"
+            ][:candidate_limit]
             owned_operations = self._owned_operations(
                 str(note.get("path", "")), content=str(note.get("content", ""))
             )
             attempted += 1
             try:
-                decision = await analyzer.adjudicate_relationships(
-                    note,
-                    candidates,
-                    vault_model=vault_model,
-                    minimum_confidence=minimum_confidence,
-                    maximum_links=maximum,
-                    feedback=feedback,
-                    owned_operations=owned_operations,
-                    tag_vocabulary=list(search_index.tag_counts),
+                ai_task = asyncio.create_task(
+                    analyzer.adjudicate_relationships(
+                        note,
+                        candidates,
+                        vault_model=vault_model,
+                        minimum_confidence=minimum_confidence,
+                        maximum_links=maximum,
+                        feedback=feedback,
+                        owned_operations=owned_operations,
+                        tag_vocabulary=search_index.tag_vocabulary_for(note),
+                        allowed_folders=[
+                            path for path, _count in search_index.folder_counts.most_common(150)
+                        ],
+                    )
                 )
+                self._sweep_ai_task = ai_task
+                try:
+                    decision = await ai_task
+                finally:
+                    if self._sweep_ai_task is ai_task:
+                        self._sweep_ai_task = None
             except Exception as exc:
                 failures += 1
                 failure_message = str(exc).strip() or type(exc).__name__
@@ -1024,29 +1212,43 @@ class ObsyncService:
                 existing_targets = {
                     str(relationship.get("target", "")).casefold() for relationship in relationships
                 }
-                relationships.extend(
-                    relationship
-                    for relationship in explicit_category_hub_relationships(note, candidates)
-                    if str(relationship.get("target", "")).casefold() not in existing_targets
-                )
-                decision["relationships"] = relationships
-            tags = decision.get("suggested_tags", []) if "tags" in categories else []
+                for explicit in [
+                    *explicit_reciprocal_relationships(note, candidates),
+                    *explicit_category_hub_relationships(note, candidates),
+                    *explicit_reference_relationships(note, candidates),
+                ]:
+                    key = str(explicit.get("target", "")).casefold()
+                    if key and key not in existing_targets:
+                        relationships.append(explicit)
+                        existing_targets.add(key)
+            tag_decisions = decision.get("suggested_tags", []) if "tags" in categories else []
             allowed_tag_keys = {
                 normalize_obsidian_tag(tag).casefold()
                 for tag in search_index.tag_counts
                 if normalize_obsidian_tag(tag)
-            } | {
-                normalize_obsidian_tag(item.get("name", "")).casefold()
-                for item in vault_model.get("category_hierarchy", [])
-                if isinstance(item, dict) and normalize_obsidian_tag(item.get("name", ""))
             }
-            tags = [
-                normalize_obsidian_tag(tag)
-                for tag in tags
-                if normalize_obsidian_tag(tag).casefold() in allowed_tag_keys
-                and normalize_obsidian_tag(tag).casefold() != "obsync"
+            tag_decisions = [
+                {**item, "tag": normalize_obsidian_tag(item.get("tag", ""))}
+                for item in tag_decisions
+                if isinstance(item, dict)
+                and normalize_obsidian_tag(item.get("tag", "")).casefold() in allowed_tag_keys
+                and normalize_obsidian_tag(item.get("tag", "")).casefold() != "obsync"
             ]
-            decision["suggested_tags"] = tags
+            tags = [item["tag"] for item in tag_decisions]
+            decision["suggested_tags"] = tag_decisions
+            organization = (
+                decision.get("organization_operations", []) if "organization" in categories else []
+            )
+            if note.get("managed") or note.get("backlinks"):
+                # Raw filesystem moves do not receive Obsidian's interactive link rewrite.
+                # Keep managed notes and backlink targets stable instead of proposing a move
+                # that could disconnect sources or path-qualified wikilinks.
+                organization = []
+            memberships = (
+                decision.get("index_memberships", []) if "organization" in categories else []
+            )
+            decision["organization_operations"] = organization
+            decision["index_memberships"] = memberships
             if "links" not in categories:
                 decision["obsolete_owned_links"] = []
             if "tags" not in categories:
@@ -1056,7 +1258,8 @@ class ObsyncService:
                 sweep_id,
                 "decision",
                 f"{note['path']}: {len(relationships)} evidence-backed relationship(s), "
-                f"{len(tags)} suggested tag(s). "
+                f"{len(tags)} suggested tag(s), "
+                f"{len(organization) + len(memberships)} organization proposal(s). "
                 f"{str(decision.get('summary') or '').strip()}",
                 phase="relationships",
                 phase_label=f"Analyzing note {index} of {total}",
@@ -1068,52 +1271,192 @@ class ObsyncService:
                 suggested_tags=tags,
                 owned_removals=owned_removals,
             )
-            decision["operations"] = operations
-            if after == note.get("content"):
-                continue
-            evidence = [
-                f"{relationship['target']}: {item}"
-                for relationship in relationships
-                for item in relationship.get("evidence", [])
-            ][:30]
-            relationship_confidences = [
-                float(item.get("confidence", 0.0)) for item in relationships
-            ]
-            cleanup_confidences = [
-                float(item.get("confidence", 0.0))
+            if operations:
+                # A separate move card would retain the pre-edit hash and become stale as soon
+                # as the native-maintenance card is applied (or vice versa). A later sweep can
+                # reconsider placement after content maintenance has settled.
+                organization = []
+                decision["organization_operations"] = []
+            relationship_by_target = {
+                str(item.get("target", "")).split("|", 1)[0].removesuffix(".md").casefold(): item
+                for item in relationships
+            }
+            tag_by_key = {item["tag"].casefold(): item for item in tag_decisions}
+            cleanup_items = [
+                item
                 for key in ("obsolete_owned_links", "obsolete_owned_tags")
                 for item in decision.get(key, [])
             ]
-            confidence = (
-                min([*relationship_confidences, *cleanup_confidences])
-                if relationship_confidences or cleanup_confidences
-                else float(vault_model.get("confidence", 0.75))
-            )
-            added_links = sum(
-                operation.get("kind") == "inline-link" and operation.get("action") == "add"
-                for operation in operations
-            )
-            added_tags = sum(
-                operation.get("kind") == "frontmatter-tag" and operation.get("action") == "add"
-                for operation in operations
-            )
-            removed = sum(operation.get("action") == "remove" for operation in operations)
-            reason = (
-                f"Native Obsidian maintenance proposes {added_links} inline link(s), "
-                f"{added_tags} frontmatter tag(s), and {removed} cleanup operation(s)."
-            )
-            summary = str(decision.get("summary") or "")
-            change_ids.append(
-                self._create_vault_change(
-                    sweep_id=sweep_id,
-                    note=note,
-                    after_content=after,
-                    reason=(reason + (f" {summary}" if summary else ""))[:1000],
-                    evidence=evidence,
-                    confidence=confidence,
-                    decision=decision,
+            for operation in operations:
+                operation["operation_id"] = str(uuid.uuid4())
+                metadata: dict[str, Any] = {}
+                if operation.get("kind") == "inline-link" and operation.get("action") == "add":
+                    metadata = relationship_by_target.get(
+                        str(operation.get("target", "")).casefold(), {}
+                    )
+                elif (
+                    operation.get("kind") == "frontmatter-tag" and operation.get("action") == "add"
+                ):
+                    metadata = tag_by_key.get(str(operation.get("tag", "")).casefold(), {})
+                elif operation.get("action") == "remove":
+                    key = str(operation.get("target") or operation.get("tag") or "").casefold()
+                    metadata = next(
+                        (
+                            item
+                            for item in cleanup_items
+                            if str(item.get("target") or item.get("tag") or "").casefold() == key
+                        ),
+                        {},
+                    )
+                operation["reason"] = str(
+                    metadata.get("relationship") or metadata.get("reason") or ""
                 )
-            )
+                operation["evidence"] = list(metadata.get("evidence", []))
+                operation["confidence"] = float(metadata.get("confidence", 1.0))
+            actual_link_keys = {
+                str(operation.get("target", "")).casefold()
+                for operation in operations
+                if operation.get("kind") == "inline-link" and operation.get("action") == "add"
+            }
+            relationships = [
+                item
+                for item in relationships
+                if str(item.get("target", "")).split("|", 1)[0].removesuffix(".md").casefold()
+                in actual_link_keys
+            ]
+            actual_tag_keys = {
+                str(operation.get("tag", "")).casefold()
+                for operation in operations
+                if operation.get("kind") == "frontmatter-tag" and operation.get("action") == "add"
+            }
+            tag_decisions = [
+                item for item in tag_decisions if item["tag"].casefold() in actual_tag_keys
+            ]
+            decision["relationships"] = relationships
+            decision["suggested_tags"] = tag_decisions
+            decision["operations"] = operations
+            if after != note.get("content"):
+                evidence = [
+                    *(
+                        f"{relationship['target']}: {item}"
+                        for relationship in relationships
+                        for item in relationship.get("evidence", [])
+                    ),
+                    *(
+                        f"#{item['tag']}: {fact}"
+                        for item in tag_decisions
+                        for fact in item.get("evidence", [])
+                    ),
+                ][:30]
+                confidence = min(
+                    (float(operation.get("confidence", 1.0)) for operation in operations),
+                    default=1.0,
+                )
+                added_links = sum(
+                    operation.get("kind") == "inline-link" and operation.get("action") == "add"
+                    for operation in operations
+                )
+                added_tags = sum(
+                    operation.get("kind") == "frontmatter-tag" and operation.get("action") == "add"
+                    for operation in operations
+                )
+                removed = sum(operation.get("action") == "remove" for operation in operations)
+                reason = (
+                    f"Native Obsidian maintenance proposes {added_links} inline link(s), "
+                    f"{added_tags} frontmatter tag(s), and {removed} cleanup operation(s)."
+                )
+                change_ids.append(
+                    self._create_vault_change(
+                        sweep_id=sweep_id,
+                        note=note,
+                        after_content=after,
+                        reason=reason,
+                        evidence=evidence,
+                        confidence=confidence,
+                        decision=decision,
+                    )
+                )
+
+            existing_paths = {str(item.get("path", "")).casefold() for item in notes}
+            for move in organization[:1]:
+                destination = (
+                    Path(str(move.get("destination_folder", ""))) / Path(str(note["path"])).name
+                ).as_posix()
+                if not destination or destination.casefold() in existing_paths:
+                    continue
+                operation = {
+                    **move,
+                    "operation_id": str(uuid.uuid4()),
+                    "action": "move",
+                    "kind": "move-note",
+                    "key": str(note["path"]).casefold(),
+                    "from_path": str(note["path"]),
+                    "to_path": destination,
+                }
+                move_decision = {
+                    "summary": str(move.get("reason", "")),
+                    "relationships": [],
+                    "suggested_tags": [],
+                    "operations": [operation],
+                }
+                change_ids.append(
+                    self._create_vault_change(
+                        sweep_id=sweep_id,
+                        note=note,
+                        after_content=str(note.get("content", "")),
+                        reason=(
+                            f"Review-only organization proposes moving this note to {destination}."
+                        ),
+                        evidence=list(move.get("evidence", [])),
+                        confidence=float(move.get("confidence", 0.0)),
+                        decision=move_decision,
+                        change_type="move-note",
+                    )
+                )
+
+            candidates_by_target = {
+                str(candidate.get("link_target", "")).casefold(): candidate
+                for candidate in candidates
+            }
+            for membership in memberships:
+                hub = candidates_by_target.get(str(membership.get("target", "")).casefold())
+                if not hub or note_links_to(hub, note):
+                    continue
+                hub_after, operation = add_index_membership(
+                    str(hub.get("content", "")), source_target=link_target(note)
+                )
+                if not operation:
+                    continue
+                operation.update(
+                    {
+                        "operation_id": str(uuid.uuid4()),
+                        "source_target": link_target(note),
+                        "reason": str(membership.get("reason", "")),
+                        "evidence": list(membership.get("evidence", [])),
+                        "confidence": float(membership.get("confidence", 0.0)),
+                    }
+                )
+                membership_decision = {
+                    "summary": str(membership.get("reason", "")),
+                    "relationships": [],
+                    "suggested_tags": [],
+                    "operations": [operation],
+                }
+                change_ids.append(
+                    self._create_vault_change(
+                        sweep_id=sweep_id,
+                        note=hub,
+                        after_content=hub_after,
+                        reason=(
+                            "Review-only organization proposes adding "
+                            f"{note['path']} to this index."
+                        ),
+                        evidence=list(membership.get("evidence", [])),
+                        confidence=float(membership.get("confidence", 0.0)),
+                        decision=membership_decision,
+                        change_type="index-membership",
+                    )
+                )
             await asyncio.sleep(0)
         if attempted and failures == attempted:
             detail = failure_messages[-1] if failure_messages else "Unknown Local AI error"
@@ -1141,16 +1484,58 @@ class ObsyncService:
         *,
         reverse: bool = False,
     ) -> None:
+        if str(change.get("change_type", "")) == "duplicate-finding":
+            return
         expected_hash = str(change["after_hash"] if reverse else change["before_hash"])
         new_content = str(change["before_content"] if reverse else change["after_content"])
         vault_key = str(change["vault_key"])
+        decision = json.loads(change.get("decision_json") or "{}")
+        operations = decision.get("operations", []) if isinstance(decision, dict) else []
+        move = next(
+            (
+                operation
+                for operation in operations
+                if isinstance(operation, dict) and operation.get("kind") == "move-note"
+            ),
+            None,
+        )
+        source_path = str(change["path"])
+        move_to = ""
+        if move:
+            source_path = str(move.get("to_path" if reverse else "from_path", ""))
+            move_to = str(move.get("from_path" if reverse else "to_path", ""))
         if vault_key == "local":
-            path = safe_vault_path(self.settings.vault_path, str(change["path"]))
+            path = safe_vault_path(self.settings.vault_path, source_path)
             if not path.is_file():
-                raise ValueError(f"Vault note is missing: {change['path']}")
+                raise ValueError(f"Vault note is missing: {source_path}")
             current = path.read_text(encoding="utf-8")
             if content_hash(current) != expected_hash:
                 raise ValueError("The note changed after this recommendation was created")
+            if move_to:
+                destination = safe_vault_path(self.settings.vault_path, move_to)
+                if not destination.parent.is_dir():
+                    raise ValueError("The proposed destination folder no longer exists")
+                if destination.exists():
+                    raise ValueError("The proposed destination note already exists")
+                path.replace(destination)
+                now = utc_now()
+                self.db.execute(
+                    "UPDATE vault_edit_ownership SET path = ?, updated_at = ? "
+                    "WHERE vault_key = ? AND path = ?",
+                    (move_to, now, vault_key, source_path),
+                )
+                self.db.execute(
+                    "UPDATE vault_duplicate_resolutions SET canonical_path = ?, updated_at = ? "
+                    "WHERE vault_key = ? AND canonical_path = ?",
+                    (move_to, now, vault_key, source_path),
+                )
+                self.db.execute(
+                    "DELETE FROM vault_notes WHERE vault_key = 'local' AND path = ?",
+                    (source_path,),
+                )
+                indexed = parse_note(destination, vault=self.settings.vault_path).as_dict()
+                self._upsert_indexed_note("local", indexed)
+                return
             self._atomic_write(path, new_content)
             indexed = parse_note(path, vault=self.settings.vault_path).as_dict()
             self._upsert_indexed_note("local", indexed)
@@ -1164,17 +1549,130 @@ class ObsyncService:
                 "path": change["path"],
                 "expected_hash": expected_hash,
                 "content": new_content,
+                "move_to": move_to,
+                "source_path": source_path,
             },
         )
         if not await self._wait_for_command(command["id"], str(change["sweep_id"])):
             raise ValueError("Vault change was stopped")
+        indexed_path = move_to or source_path
+        if move_to:
+            self.db.execute(
+                "DELETE FROM vault_notes WHERE vault_key = ? AND path = ?",
+                (vault_key, source_path),
+            )
+        indexed = parse_note(Path(indexed_path), content=new_content).as_dict()
+        self._upsert_indexed_note(vault_key, indexed)
 
-    async def approve_vault_change(self, change_id: str) -> dict[str, Any]:
+    def _select_change_operations(
+        self, change: dict[str, Any], selected_operation_ids: list[str]
+    ) -> dict[str, Any]:
+        try:
+            decision = json.loads(change.get("decision_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            decision = {}
+        operations = decision.get("operations", []) if isinstance(decision, dict) else []
+        selected_keys = {str(value) for value in selected_operation_ids if str(value)}
+        selected = [
+            operation
+            for operation in operations
+            if isinstance(operation, dict)
+            and str(operation.get("operation_id", "")) in selected_keys
+        ]
+        if not selected or len(selected) != len(selected_keys):
+            raise ValueError("Choose at least one valid proposed operation")
+        if str(change.get("change_type", "")) in {"native-maintenance", "index-membership"}:
+            after, applied = apply_native_operations(str(change["before_content"]), selected)
+            if len(applied) != len(selected) or after == str(change["before_content"]):
+                raise ValueError("The selected operations can no longer be applied safely")
+            selected = applied
+            change["after_content"] = after
+            change["after_hash"] = content_hash(after)
+        selected_targets = {
+            str(item.get("target", "")).casefold()
+            for item in selected
+            if item.get("kind") == "inline-link"
+        }
+        selected_tags = {
+            str(item.get("tag", "")).casefold()
+            for item in selected
+            if item.get("kind") == "frontmatter-tag"
+        }
+        decision["relationships"] = [
+            item
+            for item in decision.get("relationships", [])
+            if str(item.get("target", "")).split("|", 1)[0].removesuffix(".md").casefold()
+            in selected_targets
+        ]
+        decision["suggested_tags"] = [
+            item
+            for item in decision.get("suggested_tags", [])
+            if isinstance(item, dict) and str(item.get("tag", "")).casefold() in selected_tags
+        ]
+        decision["review"] = {
+            "selected_operation_ids": sorted(selected_keys),
+            "rejected_operation_ids": sorted(
+                str(item.get("operation_id", ""))
+                for item in operations
+                if str(item.get("operation_id", "")) not in selected_keys
+            ),
+        }
+        decision["operations"] = selected
+        change["decision_json"] = json.dumps(decision, ensure_ascii=False)
+        change["confidence"] = min(
+            (float(item.get("confidence", 1.0)) for item in selected), default=1.0
+        )
+        self.db.execute(
+            "UPDATE vault_changes SET after_content = ?, after_hash = ?, decision_json = ?, "
+            "confidence = ? WHERE id = ? AND status = 'pending'",
+            (
+                change["after_content"],
+                change["after_hash"],
+                change["decision_json"],
+                change["confidence"],
+                change["id"],
+            ),
+        )
+        return change
+
+    async def approve_vault_change(
+        self, change_id: str, selected_operation_ids: list[str] | None = None
+    ) -> dict[str, Any]:
         change = self.db.query_one("SELECT * FROM vault_changes WHERE id = ?", (change_id,))
         if not change:
             raise ValueError("Vault recommendation not found")
         if change["status"] != "pending":
             raise ValueError("Vault recommendation has already been reviewed")
+        if selected_operation_ids is not None:
+            change = self._select_change_operations(change, selected_operation_ids)
+        if change["change_type"] == "duplicate-finding":
+            decision = json.loads(change.get("decision_json") or "{}")
+            operation = next(
+                (
+                    item
+                    for item in decision.get("operations", [])
+                    if isinstance(item, dict) and item.get("kind") == "canonical-selection"
+                ),
+                None,
+            )
+            if not operation:
+                raise ValueError("Duplicate recommendation is invalid")
+            now = utc_now()
+            self.db.execute(
+                "INSERT INTO vault_duplicate_resolutions(vault_key, duplicate_path, "
+                "canonical_path, status, source_change_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, 'active', ?, ?, ?) ON CONFLICT(vault_key, duplicate_path) "
+                "DO UPDATE SET canonical_path = excluded.canonical_path, status = 'active', "
+                "source_change_id = excluded.source_change_id, updated_at = excluded.updated_at",
+                (
+                    change["vault_key"],
+                    operation["duplicate_path"],
+                    operation["canonical_path"],
+                    change_id,
+                    now,
+                    now,
+                ),
+            )
         try:
             await self._apply_change_content(change)
         except Exception as exc:
@@ -1222,6 +1720,18 @@ class ObsyncService:
         reverted = 0
         errors: list[str] = []
         for change in changes:
+            if change.get("change_type") == "duplicate-finding":
+                self.db.execute(
+                    "DELETE FROM vault_duplicate_resolutions WHERE vault_key = ? "
+                    "AND source_change_id = ?",
+                    (change["vault_key"], change["id"]),
+                )
+                self.db.execute(
+                    "UPDATE vault_changes SET status = 'reverted', reviewed_at = ? WHERE id = ?",
+                    (utc_now(), change["id"]),
+                )
+                reverted += 1
+                continue
             try:
                 await self._apply_change_content(change, reverse=True)
             except Exception as exc:
@@ -1278,6 +1788,11 @@ class ObsyncService:
                     for change_id in change_ids:
                         if self._sweep_stop.is_set():
                             break
+                        candidate = self.db.query_one(
+                            "SELECT change_type FROM vault_changes WHERE id = ?", (change_id,)
+                        )
+                        if not candidate or candidate["change_type"] != "native-maintenance":
+                            continue
                         try:
                             await self.approve_vault_change(change_id)
                         except (OSError, UnicodeError, ValueError) as exc:
@@ -1296,6 +1811,20 @@ class ObsyncService:
             self.db.add_event(
                 f"vault.{sweep['sweep_type']}_sweep_{status}",
                 f"Vault {sweep['sweep_type']} sweep {status}",
+                details={"sweep_id": sweep_id},
+            )
+        except asyncio.CancelledError:
+            if not self._sweep_stop.is_set():
+                raise
+            now = utc_now()
+            self.db.execute(
+                "UPDATE vault_sweeps SET status = 'stopped', current_note = '', finished_at = ?, "
+                "updated_at = ? WHERE id = ?",
+                (now, now, sweep_id),
+            )
+            self.db.add_event(
+                f"vault.{sweep['sweep_type']}_sweep_stopped",
+                f"Vault {sweep['sweep_type']} sweep stopped",
                 details={"sweep_id": sweep_id},
             )
         except Exception as exc:
@@ -1394,11 +1923,13 @@ class ObsyncService:
         if not sweep:
             return {"ok": True, "stopped": False}
         self._sweep_stop.set()
+        if self._sweep_ai_task and not self._sweep_ai_task.done():
+            self._cancel_task(self._sweep_ai_task)
         self._update_sweep_inference(
             str(sweep["id"]),
             "stage",
-            "Stop requested. The current model request will finish or time out; no additional "
-            "notes will be analyzed afterward.",
+            "Stop requested. Cancelling the active model request; no additional notes will be "
+            "analyzed afterward.",
             phase="stopping",
             phase_label="Stopping sweep safely",
         )
@@ -4732,7 +5263,7 @@ class ObsyncService:
                     categories = json.loads(categories)
                 except json.JSONDecodeError:
                     raise ValueError("Maintenance categories are invalid") from None
-            allowed_categories = {"links", "tags"}
+            allowed_categories = {"links", "tags", "organization"}
             if not isinstance(categories, list) or not set(categories) <= allowed_categories:
                 raise ValueError("Maintenance categories are invalid")
             payload = {**payload, "vault_maintenance_categories": json.dumps(categories)}

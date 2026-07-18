@@ -87,6 +87,9 @@ def test_ui_includes_guided_help_and_obsync_desktop(client: TestClient) -> None:
     assert 'data-view="help"' in index
     assert 'popover="manual"' in index
     assert "renderHelp" in app_js
+    assert ' style="' not in app_js
+    assert ".style." not in app_js
+    assert '<progress class="confidence-meter"' in app_js
     assert "Download Obsync Desktop" in app_js
     assert "Reconnect" in app_js
     assert "/reconnect" in app_js
@@ -117,7 +120,8 @@ def test_ui_includes_guided_help_and_obsync_desktop(client: TestClient) -> None:
     assert "sweep-row-error" in app_js
     assert "Schedule Index Sweep" in app_js
     assert "Schedule Maintenance Sweep" in app_js
-    assert "Allow AI Agent to apply all recommended changes" in app_js
+    assert "Allow AI Agent to apply validated link/tag changes" in app_js
+    assert "Open a card to apply only the operations you want" in app_js
     assert "Vault maintenance recommendations" in app_js
     assert "/api/v1/admin/vault/sweeps" in app_js
     assert "/api/v1/admin/vault/changes" in app_js

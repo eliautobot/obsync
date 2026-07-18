@@ -2,6 +2,57 @@
 
 All notable changes to Obsync will be documented here.
 
+## 0.18.0 - 2026-07-18
+
+### Added
+
+- Added per-operation Review so links, tags, duplicate decisions, moves, and index memberships can be accepted independently
+- Added deterministic exact-duplicate findings with review-only canonical-note selection and reversible resolution records
+- Added review-only folder placement and category-index membership proposals grounded in the vault's observed structure
+- Added startup recovery for sweeps and vault-model learning interrupted by a server restart
+
+### Changed
+
+- Relationship validation now preserves the model's exact allowed anchor and requires its source sentence to support the target
+- Maintenance reparses current Markdown before learning, discards phantom stored metadata, and excludes Obsync-owned tags from the human vocabulary
+- Tags require their own allowed value, grounded source evidence, reason, and confidence instead of inheriting an overall model score
+- Large append-only notes use bounded anchor discovery so maintenance remains responsive without forcing generic phrase links
+- Relationship prompts bound source metadata and the highest-ranked candidate excerpts so large notes fit local-model context windows and finish within the configured timeout
+- Stop Sweep immediately cancels the active model request instead of waiting for the request timeout
+- Move proposals are withheld for managed notes, backlink targets, and notes with competing content edits; approved moves carry ownership and canonical paths with them
+- Updated PDF and OCR dependencies to patched `pypdf` 6.x and Pillow 12.x release lines
+
+### Fixed
+
+- Rejected dates, times, standalone numbers, metadata labels, hashes, punctuation fragments, and generic words as misleading wikilink anchors
+- Prevented duplicate links to targets already connected through path-qualified wikilinks, title links, aliases, or Markdown links
+- Removed relationship descriptions that could not produce an actual operation, keeping Review counts and diffs consistent
+- Prevented shared infrastructure, document type, tag, folder, or broad subject similarity from becoming a relationship without a concrete two-sided fact
+- Replaced the Review confidence bar's Content-Security-Policy-blocked inline style with a native progress element
+
+### Validation
+
+- Added adversarial regressions for the original maintenance failures, stale metadata, weak tags, exact duplicates, selective apply, organization safety, interrupted sweeps, and large-note performance
+- Replayed the earlier review queue against the new validator, ran real-model end-to-end maintenance, and completed a deterministic 511-note safe-copy scale sweep with selective apply and Undo
+- Migrated a safe copy of the production database and verified native Markdown through Obsidian's Local REST API
+- Verified Linux packaging, schema 12 migration/rollback prerequisites, Docker health/login, responsive browser layout, and GitHub release artifacts
+
+## 0.17.0 - 2026-07-17
+
+### Added
+
+- Added native inline wikilink and YAML-tag maintenance with operation-level ownership
+- Added ordinary-sync rebasing for still-current approved maintenance and human-removal detection
+
+### Changed
+
+- Made Index Sweep strictly read-only and reduced the default maintenance link ceiling to eight
+- Replaced visible generated relationship blocks with native Obsidian edits
+
+### Validation
+
+- Added native edit, YAML/CRLF preservation, review/automatic apply, migration, concurrent-edit, ordinary-sync, and Undo coverage
+
 ## 0.16.0 - 2026-07-17
 
 ### Added

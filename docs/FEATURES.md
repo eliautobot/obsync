@@ -45,6 +45,8 @@ Obsync is a one-way, continuously reconciled knowledge pipeline from arbitrary f
 - Corpus-adaptive candidate retrieval separated from relationship decisions, so similarity alone never creates a link
 - Evidence-gated links requiring an exact target, an exact existing phrase in the source note, a specific relationship, grounded source/target facts, configurable confidence, and a safety ceiling up to 20
 - Read-only Index Sweeps plus live Maintenance Sweep inference with streamed provider reasoning/output, processing stages, validated decisions, errors, current-note context, and independent follow-latest controls
+- Context-grounded anchor validation that rejects dates, numbers, metadata labels, generic words, protected Markdown, duplicate existing links, and source sentences that do not support the target
+- Current-Markdown metadata rebuilding, human-tag-only learning, exact duplicate detection, review-only folder/index recommendations, and per-operation approval
 
 ## Obsidian output
 
@@ -57,7 +59,7 @@ Each document receives:
 - Optional category, tags, related-note wikilinks, YAML properties, and source details according to the profile
 - A manual section that Obsync preserves across updates
 
-Approved maintenance uses native Obsidian Markdown only: existing body phrases become inline path-qualified `[[wikilinks]]`, and tags join the existing YAML frontmatter. It adds no visible Obsync maintenance section. Operation ownership is stored in SQLite so later source sync can rebase only edits that still exist; a human-removed link or tag is not resurrected.
+Approved maintenance uses native Obsidian Markdown only: exact contextual body phrases become inline path-qualified `[[wikilinks]]`, and independently evidenced tags join the existing YAML frontmatter. It adds no visible Obsync maintenance section. Exact duplicates, folder placement, and index membership remain explicit review operations and never auto-delete or auto-merge notes. Operation ownership is stored in SQLite so later source sync can rebase only edits that still exist; a human-removed link or tag is not resurrected.
 
 New notes reuse a strongly related existing vault folder when the index supplies a validated high-confidence context; otherwise they use the configured destination/device/root/category fallback. Their destination remains stable on later edits, preventing routine reclassification from breaking backlinks.
 
@@ -84,7 +86,7 @@ Ordinary existing notes may be adopted after an exact match or explicit review. 
 - Searchable, compact document table with bounded panel scrolling and responsive mobile cards
 - Error retry commands
 - Complete review workflow with Approve, Disregard, feedback-driven Redo AI review, and explicit separate-note creation for possible duplicates
-- Combined Review queue for document decisions and native whole-vault edit recommendations, with exact anchors, operation counts, relationship descriptions, source/target evidence, confidence, before/after diffs, and individual or bulk approval
+- Combined Review queue for document decisions and native whole-vault edit recommendations, with exact anchor sentences, operation counts, per-operation evidence/confidence, before/after diffs, selective operation approval, and explicit duplicate/organization decisions
 - Manual and scheduled read-only Index and native Maintenance Sweeps with live progress and model inference, safe Stop, daily/weekly/monthly/custom timing, review/automatic modes, audit history, concurrent-edit protection, and Undo Sweep
 - Complete Local AI connection, profile, prompt, parameter, and Obsidian behavior configuration
 - Fast model discovery that does not start inference

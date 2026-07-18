@@ -248,6 +248,14 @@ Orion Research commissioned Project Atlas field work, including Field Report 003
         "Indexes/Field Report Index",
     } <= decision_targets
     assert not any(target.startswith("Reports/Field Report 00") for target in decision_targets)
+    membership_sources = {
+        operation.get("source_target", "")
+        for change in changes
+        if change["change_type"] == "index-membership"
+        for operation in change["decision"].get("operations", [])
+    }
+    assert "Organizations/Orion Research" not in membership_sources
+    assert "Organizations/Northstar Labs" not in membership_sources
     assert MAINTENANCE_START not in diff["after_content"]
     assert "Related knowledge" not in diff["after_content"]
     for operation in diff["decision"]["operations"]:

@@ -709,12 +709,24 @@ class AgentRuntime:
     def _apply_vault_change(self, payload: dict[str, Any]) -> str:
         if not self.config.vault_path:
             raise ValueError("No Obsidian vault is selected on this computer")
-        destination = safe_vault_path(Path(self.config.vault_path), str(payload.get("path", "")))
+        destination = safe_vault_path(
+            Path(self.config.vault_path),
+            str(payload.get("source_path") or payload.get("path", "")),
+        )
         if not destination.is_file():
             raise ValueError(f"Vault note is missing: {payload.get('path', '')}")
         current = destination.read_text(encoding="utf-8")
         if content_hash(current) != str(payload.get("expected_hash", "")):
             raise ValueError("The note changed after this recommendation was created")
+        move_to = str(payload.get("move_to", ""))
+        if move_to:
+            moved = safe_vault_path(Path(self.config.vault_path), move_to)
+            if not moved.parent.is_dir():
+                raise ValueError("The proposed destination folder no longer exists")
+            if moved.exists():
+                raise ValueError("The proposed destination note already exists")
+            destination.replace(moved)
+            return str(moved)
         replacement = str(payload.get("content", ""))
         if not replacement:
             raise ValueError("Vault change contains no Markdown content")

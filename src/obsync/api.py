@@ -647,8 +647,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return service.vault_change_diff(change_id)
 
     @app.post("/api/v1/admin/vault/changes/{change_id}/approve")
-    async def approve_vault_change(change_id: str, _token: AdminDependency) -> dict[str, Any]:
-        return await service.approve_vault_change(change_id)
+    async def approve_vault_change(
+        change_id: str,
+        _token: AdminDependency,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        selected = (payload or {}).get("operation_ids")
+        if selected is not None and not isinstance(selected, list):
+            raise ValueError("operation_ids must be a list")
+        return await service.approve_vault_change(
+            change_id,
+            [str(value) for value in selected] if isinstance(selected, list) else None,
+        )
 
     @app.post("/api/v1/admin/vault/changes/{change_id}/reject")
     async def reject_vault_change(change_id: str, _token: AdminDependency) -> dict[str, Any]:

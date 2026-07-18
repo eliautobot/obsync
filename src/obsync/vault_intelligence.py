@@ -10,6 +10,7 @@ from datetime import date, datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 import yaml
 
@@ -17,12 +18,14 @@ from .markdown import is_managed_note, note_tags, note_title
 from .security import slugify
 
 MAX_INDEXED_NOTE_CHARS = 2_000_000
+MAX_INLINE_PHRASE_SCAN_CHARS = 40_000
 MAINTENANCE_START = "<!-- obsync:maintenance:start -->"
 MAINTENANCE_END = "<!-- obsync:maintenance:end -->"
 
 _WORD_RE = re.compile(r"[a-z0-9][a-z0-9_-]{2,}")
 _HEADING_RE = re.compile(r"(?m)^#{1,6}\s+(.+?)\s*$")
 _WIKILINK_RE = re.compile(r"!?(?:\[\[)([^\]\n]+?)(?:\]\])")
+_MARKDOWN_LINK_RE = re.compile(r"(?<!!)\[[^\]\n]*\]\(([^)\n]+)\)")
 _INLINE_TAG_RE = re.compile(r"(?<![\w/])#([A-Za-z][\w/-]{1,79})")
 _LABELED_IDENTIFIER_RE = re.compile(
     r"(?i)\b([A-Z][A-Z0-9_-]{1,39})"
@@ -31,7 +34,60 @@ _LABELED_IDENTIFIER_RE = re.compile(
 )
 _EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
 _TOKEN_WITH_SPAN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9&'’./_-]*")
-_STRUCTURAL_HUB_WORDS = frozenset({"catalog", "dashboard", "hub", "index", "moc", "overview"})
+_STRUCTURAL_HUB_WORDS = frozenset(
+    {"catalog", "dashboard", "hub", "index", "moc", "overview", "readme"}
+)
+_LOW_INFORMATION_ANCHORS = frozenset(
+    {
+        "action",
+        "author",
+        "business",
+        "category",
+        "current",
+        "date",
+        "decision",
+        "document",
+        "id",
+        "name",
+        "note",
+        "number",
+        "owner",
+        "pending",
+        "phase",
+        "plan",
+        "project",
+        "status",
+        "updated",
+        "version",
+    }
+)
+_ANCHOR_EDGE_STOP_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "as",
+        "at",
+        "by",
+        "create",
+        "for",
+        "from",
+        "in",
+        "into",
+        "is",
+        "of",
+        "on",
+        "or",
+        "the",
+        "to",
+        "watch",
+        "where",
+        "with",
+    }
+)
+_DATE_ANCHOR_RE = re.compile(r"^(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})$")
+_TIME_ANCHOR_RE = re.compile(r"^\d{1,2}:\d{2}(?::\d{2})?(?:\s*[ap]m)?$", re.IGNORECASE)
+_NUMBER_ANCHOR_RE = re.compile(r"^[#]?(?:0x)?[0-9a-f][0-9a-f.,:/_-]*$", re.IGNORECASE)
 STOP_WORDS = frozenset(
     {
         "about",
@@ -149,10 +205,15 @@ def _range_is_free(start: int, end: int, protected: list[tuple[int, int]]) -> bo
     )
 
 
-def _free_occurrences(content: str, text_value: str) -> list[tuple[int, int, str]]:
+def _free_occurrences(
+    content: str,
+    text_value: str,
+    *,
+    protected: list[tuple[int, int]] | None = None,
+) -> list[tuple[int, int, str]]:
     if not text_value or len(text_value) > 160 or "\n" in text_value:
         return []
-    protected = _protected_markdown_ranges(content)
+    protected_ranges = protected if protected is not None else _protected_markdown_ranges(content)
     matches: list[tuple[int, int, str]] = []
     for match in re.finditer(re.escape(text_value), content, flags=re.IGNORECASE):
         start, end = match.span()
@@ -168,9 +229,49 @@ def _free_occurrences(content: str, text_value: str) -> list[tuple[int, int, str
             and (content[end].isalnum() or content[end] == "_")
         ):
             continue
-        if _range_is_free(start, end, protected):
+        if _range_is_free(start, end, protected_ranges):
             matches.append((start, end, content[start:end]))
     return matches
+
+
+def _anchor_context(content: str, start: int, end: int) -> str:
+    """Return the complete source line containing an anchor, without list syntax."""
+    line_start = content.rfind("\n", 0, start) + 1
+    line_end = content.find("\n", end)
+    if line_end < 0:
+        line_end = len(content)
+    line = content[line_start:line_end].strip()
+    return re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", line)[:600]
+
+
+def _low_information_anchor(
+    value: str,
+    *,
+    document_frequency: Counter[str] | None = None,
+    note_count: int = 1,
+) -> bool:
+    clean = re.sub(r"\s+", " ", value).strip(" \t\r\n.,:;!?()[]{}\"'`")
+    if len(clean) < 4 or not any(character.isalpha() for character in clean):
+        return True
+    folded = clean.casefold()
+    if (
+        folded in _LOW_INFORMATION_ANCHORS
+        or _DATE_ANCHOR_RE.fullmatch(folded)
+        or _TIME_ANCHOR_RE.fullmatch(folded)
+        or _NUMBER_ANCHOR_RE.fullmatch(folded)
+    ):
+        return True
+    terms = search_terms(clean, maximum=20)
+    if not terms:
+        return True
+    if terms <= _LOW_INFORMATION_ANCHORS:
+        return True
+    if len(terms) == 1:
+        term = next(iter(terms))
+        frequency = (document_frequency or Counter()).get(term, 0)
+        if term in _LOW_INFORMATION_ANCHORS or frequency / max(1, note_count) >= 0.1:
+            return True
+    return False
 
 
 def _candidate_descriptor_terms(candidate: dict[str, Any]) -> tuple[list[str], set[str]]:
@@ -200,28 +301,90 @@ def inline_anchor_options(
     document_frequency: Counter[str] | None = None,
     note_count: int = 1,
     maximum: int = 8,
+    protected_ranges: list[tuple[int, int]] | None = None,
 ) -> list[dict[str, Any]]:
     """Find exact, safe source phrases that could naturally point at one candidate note."""
     content = strip_maintenance_block(source_content)
-    descriptors, target_terms = _candidate_descriptor_terms(candidate)
-    if not target_terms:
+    descriptors, descriptor_terms = _candidate_descriptor_terms(candidate)
+    target_terms = search_terms(
+        " ".join(
+            [
+                *descriptors,
+                str(candidate.get("content_excerpt", "")),
+                str(candidate.get("content", ""))[:20_000],
+            ]
+        ),
+        maximum=5000,
+    )
+    if not descriptor_terms and not target_terms:
         return []
     frequency = document_frequency or Counter()
     total = max(1, note_count)
-    scored: dict[str, tuple[float, str, str]] = {}
+    scored: dict[str, tuple[float, str, str, int, str]] = {}
+    protected = (
+        protected_ranges if protected_ranges is not None else _protected_markdown_ranges(content)
+    )
+    normalized_target_knowledge = normalized_text(
+        " ".join(
+            [
+                str(candidate.get("content_excerpt", "")),
+                str(candidate.get("content", ""))[:20_000],
+            ]
+        )
+    )
 
-    def add(value: str, score: float, reason: str) -> None:
+    def add(
+        value: str,
+        score: float,
+        reason: str,
+        *,
+        known_occurrence: tuple[int, int, str] | None = None,
+    ) -> None:
         clean = value.strip()
-        if not (3 <= len(clean) <= 160) or clean.startswith("#") or "]]" in clean:
+        edge_words = re.findall(r"[A-Za-z0-9][A-Za-z0-9&'’./_-]*", clean)
+        if (
+            not (4 <= len(clean) <= 160)
+            or clean.startswith("#")
+            or "]]" in clean
+            or any(marker in clean for marker in ("*", "`", "[", "]", "<", ">"))
+            or (
+                reason != "exact target title, alias, or identifier"
+                and any(marker in clean for marker in (",", ";", ":"))
+            )
+            or (
+                reason != "exact target title, alias, or identifier"
+                and edge_words
+                and edge_words[0].casefold() in _ANCHOR_EDGE_STOP_WORDS
+            )
+            or (
+                reason != "exact target title, alias, or identifier"
+                and edge_words
+                and edge_words[-1].casefold() in _ANCHOR_EDGE_STOP_WORDS
+            )
+            or _low_information_anchor(clean, document_frequency=frequency, note_count=total)
+        ):
             return
-        occurrences = _free_occurrences(content, clean)
+        occurrences = (
+            [known_occurrence]
+            if known_occurrence is not None
+            else _free_occurrences(content, clean, protected=protected)
+        )
         if not occurrences:
             return
-        actual = occurrences[0][2]
-        key = actual.casefold()
-        previous = scored.get(key)
-        if previous is None or score > previous[0]:
-            scored[key] = (score, reason, actual)
+        for occurrence, (start, end, actual) in enumerate(occurrences):
+            context = _anchor_context(content, start, end)
+            context_terms = search_terms(context, maximum=100)
+            contextual_overlap = context_terms & target_terms
+            if reason != "exact target title, alias, or identifier" and len(contextual_overlap) < 2:
+                continue
+            contextual_score = score + sum(
+                math.log((total + 1) / (frequency.get(term, 0) + 1)) + 1
+                for term in contextual_overlap
+            )
+            key = actual.casefold()
+            previous = scored.get(key)
+            if previous is None or contextual_score > previous[0]:
+                scored[key] = (contextual_score, reason, actual, occurrence, context)
 
     for descriptor in descriptors:
         descriptor_terms = search_terms(descriptor, maximum=100)
@@ -230,7 +393,29 @@ def inline_anchor_options(
         )
         add(descriptor, 100.0 + rarity, "exact target title, alias, or identifier")
 
-    protected = _protected_markdown_ranges(content)
+    def ranked_options() -> list[dict[str, Any]]:
+        ranked = sorted(scored.items(), key=lambda item: (-item[1][0], len(item[0]), item[0]))
+        return [
+            {
+                "text": actual,
+                "score": round(score, 4),
+                "reason": reason,
+                "occurrence": occurrence,
+                "context": context,
+            }
+            for _key, (score, reason, actual, occurrence, context) in ranked[:maximum]
+        ]
+
+    # Exact titles, aliases, and identifiers are the clearest possible anchors. Once found,
+    # scanning every word combination cannot improve safety and becomes expensive on run logs.
+    if scored:
+        return ranked_options()
+    # Large append-only logs can contain hundreds of thousands of possible word sequences. If
+    # they do not explicitly name the target, declining the link is safer than mining a generic
+    # shared phrase and keeps whole-vault maintenance bounded.
+    if len(content) > MAX_INLINE_PHRASE_SCAN_CHARS:
+        return []
+
     line_offset = 0
     for line in content.splitlines(keepends=True):
         tokens = list(_TOKEN_WITH_SPAN_RE.finditer(line))
@@ -242,30 +427,46 @@ def inline_anchor_options(
                 end = line_offset + last.end()
                 if not _range_is_free(start, end, protected):
                     continue
-                phrase = content[start:end]
+                raw_phrase = content[start:end]
+                phrase = raw_phrase.strip(" \t.,:;!?()[]{}\"'")
+                if not phrase:
+                    continue
+                leading = raw_phrase.find(phrase)
+                start += leading
+                end = start + len(phrase)
                 phrase_terms = search_terms(phrase, maximum=30)
                 shared = phrase_terms & target_terms
                 if not shared:
+                    continue
+                descriptor_overlap = phrase_terms & descriptor_terms
+                normalized_phrase = normalized_text(phrase)
+                exact_target_phrase = (
+                    len(normalized_phrase) >= 8 and normalized_phrase in normalized_target_knowledge
+                )
+                rare_descriptor = len(descriptor_overlap) == 1 and any(
+                    frequency.get(term, 0) / total <= 0.02 and len(term) >= 5
+                    for term in descriptor_overlap
+                )
+                distinctive_body_phrase = exact_target_phrase and len(phrase_terms) >= 3
+                if not (len(descriptor_overlap) >= 2 or rare_descriptor or distinctive_body_phrase):
                     continue
                 rarity = {
                     term: math.log((total + 1) / (frequency.get(term, 0) + 1)) + 1
                     for term in shared
                 }
-                rare_single = len(shared) == 1 and any(
-                    frequency.get(term, 0) / total <= 0.05 and len(term) >= 4 for term in shared
-                )
-                if len(shared) < 2 and not rare_single:
+                if len(shared) < 2:
                     continue
                 extra_terms = phrase_terms - target_terms
                 score = sum(rarity.values()) + len(shared) * 2 - len(extra_terms) * 0.35
-                add(phrase, score, "distinctive phrase shared with the target note")
+                add(
+                    phrase,
+                    score,
+                    "distinctive phrase shared with the target note",
+                    known_occurrence=(start, end, phrase),
+                )
         line_offset += len(line)
 
-    ranked = sorted(scored.items(), key=lambda item: (-item[1][0], len(item[0]), item[0]))
-    return [
-        {"text": actual, "score": round(score, 4), "reason": reason}
-        for _key, (score, reason, actual) in ranked[:maximum]
-    ]
+    return ranked_options()
 
 
 def _split_link_target(value: str) -> tuple[str, str]:
@@ -281,14 +482,30 @@ def _render_inline_link(target: str, anchor: str) -> str:
     return f"[[{path}|{anchor}]]"
 
 
-def add_inline_link(content: str, *, target: str, anchor: str) -> tuple[str, dict[str, Any] | None]:
+def add_inline_link(
+    content: str,
+    *,
+    target: str,
+    anchor: str,
+    occurrence: int = 0,
+    context: str = "",
+) -> tuple[str, dict[str, Any] | None]:
     rendered = _render_inline_link(target, anchor)
     if not rendered or rendered in content:
         return content, None
     occurrences = _free_occurrences(content, anchor)
     if not occurrences:
         return content, None
-    start, end, actual = occurrences[0]
+    if context:
+        contextual = [
+            item for item in occurrences if _anchor_context(content, item[0], item[1]) == context
+        ]
+        if contextual:
+            occurrences = contextual
+            occurrence = 0
+    if occurrence < 0 or occurrence >= len(occurrences):
+        return content, None
+    start, end, actual = occurrences[occurrence]
     rendered = _render_inline_link(target, actual)
     updated = content[:start] + rendered + content[end:]
     path, _label = _split_link_target(target)
@@ -298,6 +515,8 @@ def add_inline_link(content: str, *, target: str, anchor: str) -> tuple[str, dic
         "key": path.casefold(),
         "target": path,
         "anchor": actual,
+        "anchor_occurrence": occurrence,
+        "anchor_context": _anchor_context(content, start, end),
         "rendered": rendered,
     }
 
@@ -439,6 +658,8 @@ def native_maintenance_content(
             updated,
             target=str(relationship.get("target", "")),
             anchor=str(relationship.get("anchor", "")),
+            occurrence=int(relationship.get("anchor_occurrence", 0) or 0),
+            context=str(relationship.get("anchor_context", "")),
         )
         if operation:
             operation["relationship"] = str(relationship.get("relationship", ""))
@@ -599,7 +820,11 @@ def parse_note(
     properties = _frontmatter(bounded)
     aliases = _string_list(properties.get("aliases", properties.get("alias", [])), maximum=100)
     tags = note_tags(knowledge.replace("\r\n", "\n"))
-    for tag in _INLINE_TAG_RE.findall(knowledge):
+    protected = _protected_markdown_ranges(knowledge)
+    for match in _INLINE_TAG_RE.finditer(knowledge):
+        if not _range_is_free(match.start(), match.end(), protected):
+            continue
+        tag = match.group(1)
         if tag not in tags:
             tags.append(tag)
         if len(tags) >= 200:
@@ -608,6 +833,12 @@ def parse_note(
     links: list[str] = []
     for raw_link in _WIKILINK_RE.findall(knowledge):
         target = raw_link.split("|", 1)[0].split("#", 1)[0].strip()
+        if target and target not in links:
+            links.append(target[:500])
+        if len(links) >= 1000:
+            break
+    for raw_link in _MARKDOWN_LINK_RE.findall(knowledge):
+        target = _markdown_link_target(raw_link)
         if target and target not in links:
             links.append(target[:500])
         if len(links) >= 1000:
@@ -640,6 +871,34 @@ def _target_key(value: str) -> str:
     return clean.casefold()
 
 
+def _markdown_link_target(value: str) -> str:
+    raw = str(value).strip().strip("<>")
+    if not raw or raw.startswith(("#", "mailto:", "http://", "https://")):
+        return ""
+    parsed = urlsplit(raw)
+    path = unquote(parsed.path).replace("\\", "/").strip()
+    while path.startswith("../"):
+        path = path[3:]
+    return path.removeprefix("./").removesuffix(".md").strip("/")
+
+
+def note_links_to(source_note: dict[str, Any], candidate: dict[str, Any]) -> bool:
+    """Resolve full-path, basename, title, wikilink, and Markdown-link target forms."""
+    candidate_path = _target_key(str(candidate.get("path", "")))
+    candidate_title = str(candidate.get("title", "")).strip().casefold()
+    candidate_stem = Path(str(candidate.get("path", ""))).stem.casefold()
+    for raw in source_note.get("links", []):
+        target = _target_key(str(raw))
+        if not target:
+            continue
+        if target == candidate_path:
+            return True
+        leaf = Path(target).name.casefold()
+        if leaf and leaf in {candidate_title, candidate_stem}:
+            return True
+    return False
+
+
 def add_backlinks(notes: list[dict[str, Any]]) -> None:
     by_path = {_target_key(str(note.get("path", ""))): note for note in notes}
     by_title: dict[str, list[dict[str, Any]]] = {}
@@ -667,6 +926,94 @@ def link_target(note: dict[str, Any]) -> str:
     return f"{path}|{title}" if Path(path).name.casefold() != title.casefold() else path
 
 
+def exact_duplicate_groups(notes: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Group substantive notes with exactly the same knowledge content."""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for note in notes:
+        knowledge = strip_maintenance_block(str(note.get("content", ""))).strip()
+        if len(knowledge) < 40:
+            continue
+        groups.setdefault(content_hash(knowledge), []).append(note)
+    duplicates = [group for group in groups.values() if len(group) > 1]
+    for group in duplicates:
+        group.sort(
+            key=lambda item: (
+                -len(item.get("backlinks", [])),
+                -len(item.get("links", [])),
+                len(Path(str(item.get("path", ""))).parts),
+                str(item.get("path", "")).casefold(),
+            )
+        )
+    return sorted(duplicates, key=lambda group: str(group[0].get("path", "")).casefold())
+
+
+def add_index_membership(content: str, *, source_target: str) -> tuple[str, dict[str, Any] | None]:
+    """Append one native MOC/index entry without inventing prose or duplicating a link."""
+    path, label = _split_link_target(source_target)
+    if not path or any(value in path for value in ("\n", "|", "]]")):
+        return content, None
+    parsed = parse_note(Path("Index.md"), content=content).as_dict()
+    candidate = {"path": f"{path}.md", "title": label or Path(path).name}
+    if note_links_to(parsed, candidate):
+        return content, None
+    wikilink = f"[[{path}|{label}]]" if label else f"[[{path}]]"
+    rendered = f"- {wikilink}"
+    newline = (
+        "\r\n" if content.count("\r\n") > content.count("\n") - content.count("\r\n") else "\n"
+    )
+    base = content.rstrip("\r\n")
+    updated = base + newline + newline + rendered + newline
+    return updated, {
+        "action": "add",
+        "kind": "index-membership",
+        "key": path.casefold(),
+        "target": path,
+        "rendered": rendered,
+    }
+
+
+def apply_native_operations(
+    content: str, operations: list[dict[str, Any]]
+) -> tuple[str, list[dict[str, Any]]]:
+    """Apply an explicitly selected operation subset for operation-level Review."""
+    updated = content
+    applied: list[dict[str, Any]] = []
+    for requested in operations:
+        kind = str(requested.get("kind", ""))
+        action = str(requested.get("action", ""))
+        if kind == "inline-link" and action == "add":
+            updated, operation = add_inline_link(
+                updated,
+                target=str(requested.get("target", "")),
+                anchor=str(requested.get("anchor", "")),
+                occurrence=int(requested.get("anchor_occurrence", 0) or 0),
+                context=str(requested.get("anchor_context", "")),
+            )
+        elif kind == "inline-link" and action == "remove":
+            updated, operation = remove_owned_inline_link(updated, requested)
+        elif kind == "frontmatter-tag":
+            updated, operation = change_native_tag(
+                updated,
+                tag=str(requested.get("tag") or requested.get("key", "")),
+                remove=action == "remove",
+                ownership_id=str(requested.get("ownership_id", "")),
+            )
+        elif kind == "index-membership" and action == "add":
+            updated, operation = add_index_membership(
+                updated, source_target=str(requested.get("source_target", ""))
+            )
+        elif kind == "legacy-maintenance-block" and action == "remove":
+            stripped = strip_maintenance_block(updated)
+            operation = dict(requested) if stripped != updated else None
+            updated = stripped
+        else:
+            operation = None
+        if operation:
+            merged = {**requested, **operation}
+            applied.append(merged)
+    return updated, applied
+
+
 def explicit_category_hub_relationships(
     source_note: dict[str, Any], candidates: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -678,17 +1025,20 @@ def explicit_category_hub_relationships(
         if candidate.get("structural_role") != "category-hub":
             continue
         anchor_options = candidate.get("anchor_options", [])
-        anchor = next(
+        anchor_option = next(
             (
-                str(option.get("text", ""))
+                option
                 for option in anchor_options
                 if isinstance(option, dict)
                 and option.get("reason") == "exact target title, alias, or identifier"
                 and str(option.get("text", "")).strip()
             ),
-            "",
+            None,
         )
-        if not anchor:
+        anchor = str((anchor_option or {}).get("text", ""))
+        if not anchor or len(search_terms(anchor, maximum=20)) < 2:
+            continue
+        if note_links_to(source_note, candidate):
             continue
         candidate_links = {_target_key(str(link)) for link in candidate.get("links", [])}
         if source_path not in candidate_links:
@@ -697,11 +1047,143 @@ def explicit_category_hub_relationships(
             {
                 "target": link_target(candidate),
                 "anchor": anchor,
+                "anchor_occurrence": int((anchor_option or {}).get("occurrence", 0) or 0),
+                "anchor_context": str((anchor_option or {}).get("context", "")),
                 "relationship_type": "category-hub",
                 "relationship": "This category hub explicitly catalogs the source note",
                 "evidence": [
                     f"SOURCE: the note explicitly names {anchor}",
                     f"TARGET: the hub directly links to {source_title or source_path}",
+                ],
+                "confidence": 0.99,
+            }
+        )
+    return relationships
+
+
+def explicit_reciprocal_relationships(
+    source_note: dict[str, Any], candidates: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Return links when both ordinary notes explicitly identify one another.
+
+    This closes a conservative-model gap without turning similarity into a relationship: the
+    source must contain an exact safe title/alias anchor for the candidate, and the candidate must
+    independently name or link the source record.
+    """
+
+    source_descriptors = [
+        str(source_note.get("title", "")),
+        Path(str(source_note.get("path", ""))).stem.replace("_", " ").replace("-", " "),
+        *(str(value) for value in source_note.get("aliases", [])),
+    ]
+    source_descriptors = [
+        re.sub(r"\s+", " ", value).strip(" .,:;#")
+        for value in source_descriptors
+        if value and not _low_information_anchor(value)
+    ]
+    relationships: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if candidate.get("structural_role") == "category-hub" or candidate.get("already_linked"):
+            continue
+        anchor_option = next(
+            (
+                option
+                for option in candidate.get("anchor_options", [])
+                if isinstance(option, dict)
+                and option.get("reason") == "exact target title, alias, or identifier"
+                and str(option.get("text", "")).strip()
+            ),
+            None,
+        )
+        anchor = str((anchor_option or {}).get("text", "")).strip()
+        if not anchor:
+            continue
+        candidate_content = strip_maintenance_block(
+            str(candidate.get("learning_content", candidate.get("content", "")))
+        )
+        reciprocal_descriptor = next(
+            (
+                descriptor
+                for descriptor in source_descriptors
+                if _free_occurrences(candidate_content, descriptor)
+            ),
+            "",
+        )
+        linked_back = note_links_to(candidate, source_note)
+        if not reciprocal_descriptor and not linked_back:
+            continue
+        target_context = ""
+        if reciprocal_descriptor:
+            start, end, _actual = _free_occurrences(candidate_content, reciprocal_descriptor)[0]
+            target_context = _anchor_context(candidate_content, start, end)
+        source_context = str((anchor_option or {}).get("context", ""))
+        relationships.append(
+            {
+                "target": link_target(candidate),
+                "anchor": anchor,
+                "anchor_occurrence": int((anchor_option or {}).get("occurrence", 0) or 0),
+                "anchor_context": source_context,
+                "relationship_type": "specific-record",
+                "relationship": (
+                    "Both notes explicitly identify the same two-sided record relationship"
+                ),
+                "evidence": [
+                    f"SOURCE: {source_context or f'the source explicitly names {anchor}'}",
+                    (
+                        f"TARGET: {target_context}"
+                        if target_context
+                        else "TARGET: the candidate directly links back to the source note"
+                    ),
+                ],
+                "confidence": 0.99,
+            }
+        )
+    return relationships
+
+
+def explicit_reference_relationships(
+    source_note: dict[str, Any], candidates: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Link exact document names from checklist and README navigation records."""
+
+    classification = " ".join(
+        [
+            str(source_note.get("title", "")),
+            Path(str(source_note.get("path", ""))).stem.replace("_", " ").replace("-", " "),
+        ]
+    ).casefold()
+    if not re.search(r"\b(?:checklist|readme)\b", classification):
+        return []
+    relationships: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if candidate.get("already_linked"):
+            continue
+        anchor_option = next(
+            (
+                option
+                for option in candidate.get("anchor_options", [])
+                if isinstance(option, dict)
+                and option.get("reason") == "exact target title, alias, or identifier"
+                and str(option.get("text", "")).strip()
+            ),
+            None,
+        )
+        anchor = str((anchor_option or {}).get("text", "")).strip()
+        target = link_target(candidate)
+        if not anchor or not target:
+            continue
+        context = str((anchor_option or {}).get("context", ""))
+        relationships.append(
+            {
+                "target": target,
+                "anchor": anchor,
+                "anchor_occurrence": int((anchor_option or {}).get("occurrence", 0) or 0),
+                "anchor_context": context,
+                "relationship_type": "reference",
+                "relationship": "This navigation record explicitly names the target document",
+                "evidence": [
+                    f"SOURCE: {context or f'the source explicitly names {anchor}'}",
+                    f"TARGET: {candidate.get('title') or target} is the named document",
                 ],
                 "confidence": 0.99,
             }
@@ -884,17 +1366,17 @@ def _property_scalars(value: Any, *, prefix: str = "", depth: int = 0) -> set[st
 
 
 def _note_search_text(note: dict[str, Any]) -> str:
-    properties = note.get("properties", {})
+    properties = note.get("learning_properties", note.get("properties", {}))
     property_text = " ".join(sorted(_property_scalars(properties)))
     values = [
         str(note.get("title", "")),
         str(note.get("path", "")),
         *(str(value) for value in note.get("aliases", [])),
-        *(str(value) for value in note.get("tags", [])),
+        *(str(value) for value in note.get("human_tags", note.get("tags", []))),
         *(str(value) for value in note.get("headings", [])),
         *(str(value) for value in note.get("entities", [])),
         property_text,
-        strip_maintenance_block(str(note.get("content", ""))),
+        strip_maintenance_block(str(note.get("learning_content", note.get("content", "")))),
     ]
     return " ".join(values)
 
@@ -902,12 +1384,21 @@ def _note_search_text(note: dict[str, Any]) -> str:
 class AdaptiveVaultIndex:
     """Corpus-adaptive retrieval; it proposes candidates but never decides relationships."""
 
-    def __init__(self, notes: list[dict[str, Any]]):
+    def __init__(
+        self,
+        notes: list[dict[str, Any]],
+        *,
+        noncanonical_paths: set[str] | None = None,
+    ):
         self.notes = notes
+        self.noncanonical_paths = {
+            _target_key(path) for path in (noncanonical_paths or set()) if _target_key(path)
+        }
         self.note_count = len(notes)
         self.term_counts: list[Counter[str]] = []
         self.postings: dict[str, list[int]] = {}
         self.tag_counts: Counter[str] = Counter()
+        self.tag_paths: dict[str, list[str]] = {}
         self.folder_counts: Counter[str] = Counter()
         document_frequency: Counter[str] = Counter()
         for index, note in enumerate(notes):
@@ -916,11 +1407,12 @@ class AdaptiveVaultIndex:
             for term in terms:
                 self.postings.setdefault(term, []).append(index)
                 document_frequency[term] += 1
-            self.tag_counts.update(
-                normalize_obsidian_tag(str(tag))
-                for tag in note.get("tags", [])
-                if normalize_obsidian_tag(str(tag))
-            )
+            for raw_tag in note.get("human_tags", note.get("tags", [])):
+                tag = normalize_obsidian_tag(str(raw_tag))
+                if not tag:
+                    continue
+                self.tag_counts[tag] += 1
+                self.tag_paths.setdefault(tag, []).append(str(note.get("path", "")))
             path = Path(str(note.get("path", "")))
             parent = path.parent.as_posix()
             if parent not in {"", "."}:
@@ -933,6 +1425,55 @@ class AdaptiveVaultIndex:
             term: math.log((total + 1) / (frequency + 1)) + 1
             for term, frequency in document_frequency.items()
         }
+
+    @staticmethod
+    def _project_scope(path: str) -> str:
+        parents = Path(path).parent.parts
+        if not parents:
+            return ""
+        return Path(*parents[: min(2, len(parents))]).as_posix().casefold()
+
+    def tag_vocabulary_for(self, note: dict[str, Any]) -> list[str]:
+        """Return human tags observed in the source's project or named by its content."""
+
+        source_path = str(note.get("path", ""))
+        source_scope = self._project_scope(source_path)
+        classification_terms = set(
+            search_terms(
+                " ".join(
+                    [
+                        source_path,
+                        str(note.get("title", "")),
+                        *(str(value) for value in note.get("headings", [])),
+                    ]
+                ),
+                maximum=500,
+            )
+        )
+        content_text = re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            strip_maintenance_block(
+                str(note.get("learning_content", note.get("content", "")))
+            ).casefold(),
+        ).strip()
+        allowed: list[str] = []
+        for tag in self.tag_counts:
+            tag_terms = re.findall(r"[a-z0-9]+", tag.casefold())
+            same_scope = bool(source_scope) and any(
+                self._project_scope(path) == source_scope for path in self.tag_paths.get(tag, [])
+            )
+            named_by_classification = bool(tag_terms) and set(tag_terms) <= classification_terms
+            tag_phrase = " ".join(tag_terms)
+            named_project = len(tag_terms) >= 2 and bool(
+                re.search(rf"(?:^| ){re.escape(tag_phrase)}(?: |$)", content_text)
+            )
+            dated_memory_log = tag.casefold() == "memory-log" and bool(
+                re.fullmatch(r"\d{4}-\d{2}-\d{2}", Path(source_path).stem)
+            )
+            if same_scope or named_by_classification or named_project or dated_memory_log:
+                allowed.append(tag)
+        return allowed
 
     @staticmethod
     def _hub_score(note: dict[str, Any]) -> int:
@@ -1002,6 +1543,8 @@ class AdaptiveVaultIndex:
             path = str(note.get("path", ""))
             if exclude_path and path.casefold() == exclude_path.casefold():
                 continue
+            if _target_key(path) in self.noncanonical_paths:
+                continue
             counts = self.term_counts[index]
             overlap = set(query_terms) & set(counts)
             if not overlap:
@@ -1014,7 +1557,9 @@ class AdaptiveVaultIndex:
             reasons = [f"corpus similarity {similarity:.3f}"]
             if shared_properties:
                 reasons.append(f"{len(shared_properties)} exact shared property value(s)")
-            clean_content = strip_maintenance_block(str(note.get("content", "")))
+            clean_content = strip_maintenance_block(
+                str(note.get("learning_content", note.get("content", "")))
+            )
             enriched = dict(note)
             enriched.update(
                 {
@@ -1024,17 +1569,20 @@ class AdaptiveVaultIndex:
                     "link_target": link_target(note),
                     "content_excerpt": _excerpt(clean_content, set(query_terms), maximum=4000),
                     "structural_role": "category-hub" if self._hub_score(note) >= 2 else "note",
+                    "already_linked": bool(source_note and note_links_to(source_note, note)),
                 }
             )
             scored.append((score, str(note.get("title", "")).casefold(), enriched))
         scored.sort(key=lambda item: (-item[0], item[1], str(item[2].get("path", ""))))
         result = [note for _score, _title, note in scored[: max(0, maximum)]]
+        protected_ranges = _protected_markdown_ranges(strip_maintenance_block(text))
         for note in result:
             note["anchor_options"] = inline_anchor_options(
                 text,
                 note,
                 document_frequency=self.document_frequency,
                 note_count=self.note_count,
+                protected_ranges=protected_ranges,
             )
         return result
 

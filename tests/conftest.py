@@ -40,6 +40,7 @@ def adaptive_ai(monkeypatch: pytest.MonkeyPatch):
         feedback=None,
         owned_operations=None,
         tag_vocabulary=None,
+        allowed_folders=None,
     ):
         source_content = strip_maintenance_block(str(source_note.get("content", "")))
         source_terms = search_terms(f"{source_note.get('title', '')} {source_content}")
@@ -64,7 +65,7 @@ def adaptive_ai(monkeypatch: pytest.MonkeyPatch):
                 continue
             target = link_target(candidate)
             anchors = [
-                str(item.get("text", ""))
+                item
                 for item in candidate.get("anchor_options", [])
                 if isinstance(item, dict) and str(item.get("text", "")).strip()
             ]
@@ -74,7 +75,9 @@ def adaptive_ai(monkeypatch: pytest.MonkeyPatch):
             relationships.append(
                 {
                     "target": target,
-                    "anchor": anchors[0],
+                    "anchor": anchors[0]["text"],
+                    "anchor_context": anchors[0].get("context", ""),
+                    "anchor_occurrence": anchors[0].get("occurrence", 0),
                     "relationship_type": "specific-record",
                     "relationship": "Both records describe the same named record or party",
                     "evidence": [

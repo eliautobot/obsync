@@ -89,6 +89,11 @@ jobs:
           pattern: obsync-*
           path: release-artifacts
           merge-multiple: true
+      - name: Create SHA-256 checksums
+        shell: bash
+        run: |
+          cd release-artifacts
+          sha256sum obsync-* > SHA256SUMS.txt
       - name: Create GitHub release
         shell: bash
         env:

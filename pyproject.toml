@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "obsync-app"
-version = "0.17.0"
+version = "0.18.0"
 description = "Continuously turn folders from any computer into organized Obsidian Markdown."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -28,7 +28,7 @@ dependencies = [
   "openpyxl>=3.1,<4",
   "platformdirs>=4.3,<5",
   "pydantic>=2.11,<3",
-  "pypdf>=5.7,<6",
+  "pypdf>=6.13.3,<7",
   "python-docx>=1.2,<2",
   "python-multipart>=0.0.20,<1",
   "python-pptx>=1.0,<2",
@@ -39,7 +39,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-ocr = ["Pillow>=11,<12", "pytesseract>=0.3.13,<1"]
+ocr = ["Pillow>=12.3,<13", "pytesseract>=0.3.13,<1"]
 dev = [
   "coverage[toml]>=7.9,<8",
   "pyinstaller>=6.14,<7",

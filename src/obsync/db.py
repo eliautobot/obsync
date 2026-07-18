@@ -151,6 +151,20 @@ CREATE TABLE IF NOT EXISTS vault_edit_ownership (
 CREATE INDEX IF NOT EXISTS idx_vault_edit_ownership_active
 ON vault_edit_ownership(vault_key, path, status);
 
+CREATE TABLE IF NOT EXISTS vault_duplicate_resolutions (
+    vault_key TEXT NOT NULL,
+    duplicate_path TEXT NOT NULL,
+    canonical_path TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    source_change_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(vault_key, duplicate_path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_duplicate_canonical
+ON vault_duplicate_resolutions(vault_key, canonical_path, status);
+
 CREATE TABLE IF NOT EXISTS admin_users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT NOT NULL COLLATE NOCASE UNIQUE,
@@ -427,7 +441,7 @@ class Database:
                 connection.execute("ALTER TABLE enrollments ADD COLUMN agent_id TEXT")
             row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
-                connection.execute("INSERT INTO schema_meta(version) VALUES (11)")
+                connection.execute("INSERT INTO schema_meta(version) VALUES (12)")
             else:
                 schema_version = int(row["version"])
             if row is not None and schema_version < 9:
@@ -472,6 +486,32 @@ class Database:
                     (utc_now(),),
                 )
                 connection.execute("UPDATE schema_meta SET version = 11")
+                schema_version = 11
+            if row is not None and schema_version < 12:
+                connection.execute(
+                    "UPDATE vault_changes SET status = 'superseded', reviewed_at = ?, "
+                    "error = 'Superseded by context-grounded maintenance; run a new "
+                    "Maintenance Sweep.' WHERE status = 'pending'",
+                    (utc_now(),),
+                )
+                connection.execute(
+                    'UPDATE settings SET value = \'["links", "tags", "organization"]\', '
+                    "updated_at = ? WHERE key = 'vault_maintenance_categories' "
+                    'AND value = \'["links", "tags"]\'',
+                    (utc_now(),),
+                )
+                connection.execute(
+                    "INSERT INTO settings(key, value, is_secret, updated_at) "
+                    "VALUES ('vault_metadata_version', '0', 0, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = '0', updated_at = excluded.updated_at",
+                    (utc_now(),),
+                )
+                connection.execute(
+                    "UPDATE vault_models SET status = 'not-learned', fingerprint = '', "
+                    "corpus_fingerprint = '', updated_at = ?",
+                    (utc_now(),),
+                )
+                connection.execute("UPDATE schema_meta SET version = 12")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

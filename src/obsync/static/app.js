@@ -877,8 +877,7 @@ async function copyText(value) {
   } catch (_error) {
     const input = document.createElement("textarea");
     input.value = value;
-    input.style.position = "fixed";
-    input.style.opacity = "0";
+    input.className = "clipboard-fallback";
     document.body.append(input);
     input.select();
     document.execCommand("copy");
@@ -988,10 +987,30 @@ async function openVaultChangeDiff(changeId) {
   const modal = $("#modal");
   $("#modal-title").textContent = `Proposed vault change · ${change.path}`;
   const relationships = change.decision?.relationships || [];
+  const tagDecisions = change.decision?.suggested_tags || [];
   const operations = change.decision?.operations || [];
-  $("#modal-body").innerHTML = `<p class="modal-note"><strong>Reason:</strong> ${escapeHtml(change.reason)}</p>${operations.length ? `<h3>Native Obsidian edits</h3><ul class="plain-list">${operations.map((item) => `<li><strong>${escapeHtml(`${item.action} ${item.kind}`)}</strong>${item.anchor ? ` — “${escapeHtml(item.anchor)}” → ${escapeHtml(item.target || "")}` : item.tag ? ` — #${escapeHtml(item.tag)}` : ""}</li>`).join("")}</ul>` : ""}${relationships.length ? `<h3>Evidence-backed relationships</h3><ul class="plain-list">${relationships.map((item) => `<li><strong>${escapeHtml(item.target)}</strong> — link the existing phrase “${escapeHtml(item.anchor || "")}” because ${escapeHtml(item.relationship)} (${Math.round((item.confidence || 0) * 100)}%)<ul>${(item.evidence || []).map((fact) => `<li>${escapeHtml(fact)}</li>`).join("")}</ul></li>`).join("")}</ul>` : '<p class="modal-note">No new relationship link is being forced. This proposal only performs the native cleanup or tag edits listed above.</p>'}<div class="diff-grid"><section><h3>Before</h3><pre>${escapeHtml(change.before_content)}</pre></section><section><h3>After</h3><pre>${escapeHtml(change.after_content)}</pre></section></div><div class="modal-actions"><button class="secondary" id="diff-close" type="button">Close</button></div>`;
+  const operationLabel = (item) => item.anchor
+    ? `“${item.anchor}” → ${item.target || ""}`
+    : item.tag
+      ? `#${item.tag}`
+      : item.to_path
+        ? `${item.from_path} → ${item.to_path}`
+        : item.canonical_path
+          ? `${item.duplicate_path} → canonical ${item.canonical_path}`
+          : item.source_target || item.target || "";
+  $("#modal-body").innerHTML = `<p class="modal-note"><strong>Reason:</strong> ${escapeHtml(change.reason)}</p>${operations.length ? `<h3>Review each operation</h3><ul class="plain-list operation-review-list">${operations.map((item) => `<li><label class="check-row"><input class="vault-operation-choice" type="checkbox" value="${escapeHtml(item.operation_id || "")}" checked> <strong>${escapeHtml(`${item.action} ${item.kind}`)}</strong>${operationLabel(item) ? ` — ${escapeHtml(operationLabel(item))}` : ""} · ${Math.round((item.confidence ?? change.confidence ?? 0) * 100)}%</label>${item.anchor_context ? `<p class="modal-note">Source line: “${escapeHtml(item.anchor_context)}”</p>` : ""}${item.reason ? `<p class="modal-note">${escapeHtml(item.reason)}</p>` : ""}${(item.evidence || []).length ? `<ul>${item.evidence.map((fact) => `<li>${escapeHtml(fact)}</li>`).join("")}</ul>` : ""}</li>`).join("")}</ul>` : ""}${relationships.length ? `<h3>Operation-backed relationships</h3><ul class="plain-list">${relationships.map((item) => `<li><strong>${escapeHtml(item.target)}</strong> — link “${escapeHtml(item.anchor || "")}” because ${escapeHtml(item.relationship)} (${Math.round((item.confidence || 0) * 100)}%)</li>`).join("")}</ul>` : ""}${tagDecisions.length ? `<h3>Evidence-backed tags</h3><ul class="plain-list">${tagDecisions.map((item) => `<li><strong>#${escapeHtml(item.tag)}</strong> — ${escapeHtml(item.reason)} (${Math.round((item.confidence || 0) * 100)}%)</li>`).join("")}</ul>` : ""}<div class="diff-grid"><section><h3>Before</h3><pre>${escapeHtml(change.before_content)}</pre></section><section><h3>After</h3><pre>${escapeHtml(change.after_content)}</pre></section></div><div class="modal-actions"><button class="secondary" id="diff-close" type="button">Close</button>${change.status === "pending" ? '<button class="primary" id="apply-selected-operations" type="button">Apply selected</button>' : ""}</div>`;
   if (!modal.open) modal.showModal();
   $("#diff-close").addEventListener("click", () => modal.close());
+  $("#apply-selected-operations")?.addEventListener("click", async (event) => {
+    const operationIds = $$(".vault-operation-choice:checked", $("#modal-body")).map((input) => input.value).filter(Boolean);
+    if (!operationIds.length) { toast("Choose at least one operation.", true); return; }
+    event.currentTarget.disabled = true; event.currentTarget.textContent = "Applying…";
+    try {
+      await api(`/api/v1/admin/vault/changes/${changeId}/approve`, { method: "POST", body: { operation_ids: operationIds } });
+      modal.close(); toast("Selected vault operations applied.");
+      await Promise.all([renderVaultRecommendations(), refreshReviewBadge()]);
+    } catch (error) { toast(error.message, true); event.currentTarget.disabled = false; event.currentTarget.textContent = "Apply selected"; }
+  });
 }
 
 async function renderVaultRecommendations() {
@@ -1002,7 +1021,7 @@ async function renderVaultRecommendations() {
     host.innerHTML = '<section class="panel empty"><div class="empty-icon">✓</div><p>No vault-maintenance recommendations need review.</p></section>';
     return;
   }
-  host.innerHTML = `<div class="section-head"><div><h2>Vault maintenance recommendations</h2><p>${data.total} proposed native Obsidian change(s), each with operation-level evidence and a before/after diff.</p></div><div class="settings-actions compact"><button class="secondary" id="apply-all-vault-changes" type="button">Apply all</button><button class="danger" id="reject-all-vault-changes" type="button">Disregard all</button></div></div><div class="vault-review-grid">${data.items.map((change) => { const operations = change.decision?.operations || []; const links = operations.filter((item) => item.kind === "inline-link").length; const tags = operations.filter((item) => item.kind === "frontmatter-tag").length; const cleanup = operations.filter((item) => item.action === "remove").length; return `<article class="settings-card vault-change-card"><div><span class="eyebrow">${escapeHtml(change.sweep_type)} SWEEP</span><h3>${escapeHtml(change.path)}</h3><p>${escapeHtml(change.reason)}</p></div><div class="confidence-meter"><span style="width:${Math.round(change.confidence * 100)}%"></span></div><small>${Math.round(change.confidence * 100)}% confidence · ${links} inline link edit(s) · ${tags} tag edit(s) · ${cleanup} cleanup(s)</small><div class="document-actions"><button class="quiet view-vault-change" data-id="${change.id}" type="button">View native edits & diff</button><button class="secondary approve-vault-change" data-id="${change.id}" type="button">Apply</button><button class="danger reject-vault-change" data-id="${change.id}" type="button">Disregard</button></div></article>`; }).join("")}</div>`;
+  host.innerHTML = `<div class="section-head"><div><h2>Vault maintenance recommendations</h2><p>${data.total} proposed changes. Open a card to apply only the operations you want.</p></div><div class="settings-actions compact"><button class="secondary" id="apply-all-vault-changes" type="button">Apply every displayed operation</button><button class="danger" id="reject-all-vault-changes" type="button">Disregard all</button></div></div><div class="vault-review-grid">${data.items.map((change) => { const operations = change.decision?.operations || []; const links = operations.filter((item) => item.kind === "inline-link").length; const tags = operations.filter((item) => item.kind === "frontmatter-tag").length; const organization = operations.filter((item) => ["move-note", "index-membership", "canonical-selection"].includes(item.kind)).length; const cleanup = operations.filter((item) => item.action === "remove").length; const confidence = Math.round(change.confidence * 100); return `<article class="settings-card vault-change-card"><div><span class="eyebrow">${escapeHtml(change.change_type || change.sweep_type)} </span><h3>${escapeHtml(change.path)}</h3><p>${escapeHtml(change.reason)}</p></div><progress class="confidence-meter" max="100" value="${confidence}" aria-label="${confidence}% minimum operation confidence">${confidence}%</progress><small>${confidence}% minimum operation confidence · ${links} link(s) · ${tags} tag(s) · ${organization} organization · ${cleanup} cleanup(s)</small><div class="document-actions"><button class="quiet view-vault-change" data-id="${change.id}" type="button">Review operations & diff</button><button class="secondary approve-vault-change" data-id="${change.id}" type="button">Apply all operations</button><button class="danger reject-vault-change" data-id="${change.id}" type="button">Disregard</button></div></article>`; }).join("")}</div>`;
   const reload = async () => { await Promise.all([renderVaultRecommendations(), refreshReviewBadge()]); };
   $$(".view-vault-change", host).forEach((button) => button.addEventListener("click", () => openVaultChangeDiff(button.dataset.id).catch((error) => toast(error.message, true))));
   $$(".approve-vault-change", host).forEach((button) => button.addEventListener("click", async () => {
@@ -1241,9 +1260,9 @@ async function renderVault() {
         ${sweepProgress(sweeps.active, "maintenance")}
         ${sweepFailure(sweeps.recent, "maintenance")}
         <div class="sweep-ai-host ai-live-host" data-ai-live-host data-sweep-ai-host="maintenance">${aiActivityMarkup(sweepAiActivity(activity, "maintenance", sweeps.active))}</div>
-        <div class="field"><label for="vault-maintenance-change-mode">Maintenance sweep changes</label><select id="vault-maintenance-change-mode"><option value="review">Send all recommended changes to Review</option><option value="auto">Allow AI Agent to apply all recommended changes</option></select><small class="danger-copy">Warning: automatic mode may modify existing notes, links, tags, and organization without human approval.</small></div>
+        <div class="field"><label for="vault-maintenance-change-mode">Maintenance sweep changes</label><select id="vault-maintenance-change-mode"><option value="review">Send all recommended changes to Review</option><option value="auto">Allow AI Agent to apply validated link/tag changes</option></select><small class="danger-copy">Folder moves, index membership, and duplicate canonical choices always require Review, even in automatic mode.</small></div>
         <div class="behavior-grid maintenance-categories">
-          ${[["links", "Inline relationship links on existing phrases"], ["tags", "Native YAML/frontmatter tags"]].map(([value, label]) => `<label class="check-row"><input class="maintenance-category" type="checkbox" value="${value}"> ${label}</label>`).join("")}
+          ${[["links", "Inline relationship links on existing phrases"], ["tags", "Native YAML/frontmatter tags"], ["organization", "Review-only folders, indexes, and duplicates"]].map(([value, label]) => `<label class="check-row"><input class="maintenance-category" type="checkbox" value="${value}"> ${label}</label>`).join("")}
         </div>
         ${sweepScheduleFields("vault-maintenance", settings)}
       </section>
@@ -1280,7 +1299,7 @@ async function renderVault() {
     $(`#${prefix}-weekday`).value = settings[`${prefix.replaceAll("-", "_")}_schedule_weekday`] || "6";
   });
   let maintenanceCategories = [];
-  try { maintenanceCategories = JSON.parse(settings.vault_maintenance_categories || "[]"); } catch (_error) { maintenanceCategories = ["links", "tags"]; }
+  try { maintenanceCategories = JSON.parse(settings.vault_maintenance_categories || "[]"); } catch (_error) { maintenanceCategories = ["links", "tags", "organization"]; }
   $$(".maintenance-category").forEach((input) => { input.checked = maintenanceCategories.includes(input.value); });
   $$(".start-sweep").forEach((button) => button.addEventListener("click", async () => {
     button.disabled = true;
