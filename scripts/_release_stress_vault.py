@@ -48,6 +48,8 @@ def install_deterministic_scale_harness() -> None:
             "note_patterns": [],
             "folder_hierarchy": [],
             "entity_types": [],
+            "relationship_types": [],
+            "canonicalization_rules": [],
             "low_value_relationship_patterns": [],
             "tag_guidance": [],
             "relationship_guidance": [],
@@ -101,6 +103,14 @@ def install_deterministic_scale_harness() -> None:
             if not target or not anchor:
                 continue
             target_evidence = candidate.get("content_excerpt", candidate.get("title", target))
+            source_nodes = source_note.get("knowledge_graph", {}).get("entity_nodes", [])
+            target_nodes = candidate.get("knowledge_graph", {}).get("entity_nodes", [])
+            source_document = next(
+                (item for item in source_nodes if item.get("type") == "document"), {}
+            )
+            target_document = next(
+                (item for item in target_nodes if item.get("type") == "document"), {}
+            )
             relationships.append(
                 {
                     "target": target,
@@ -108,6 +118,9 @@ def install_deterministic_scale_harness() -> None:
                     "anchor_occurrence": int(option.get("occurrence", 0) or 0),
                     "anchor_context": str(option.get("context", "")),
                     "relationship_type": "specific-record",
+                    "source_entity": str(source_document.get("name", "")),
+                    "target_entity": str(target_document.get("name", "")),
+                    "predicate": "references_named_document",
                     "relationship": (
                         f"{source_note.get('title', source_note.get('path', 'Source'))} "
                         f"explicitly names {candidate.get('title', target)}"

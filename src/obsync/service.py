@@ -1313,6 +1313,9 @@ class ObsyncService:
                 )
                 operation["evidence"] = list(metadata.get("evidence", []))
                 operation["confidence"] = float(metadata.get("confidence", 1.0))
+                for graph_field in ("source_entity", "target_entity", "predicate"):
+                    if metadata.get(graph_field):
+                        operation[graph_field] = str(metadata[graph_field])
             actual_link_keys = {
                 str(operation.get("target", "")).casefold()
                 for operation in operations

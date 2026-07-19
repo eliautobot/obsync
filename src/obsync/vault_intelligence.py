@@ -14,6 +14,7 @@ from urllib.parse import unquote, urlsplit
 
 import yaml
 
+from .knowledge_graph import graph_relationship_is_eligible
 from .markdown import is_managed_note, note_tags, note_title
 from .security import slugify
 
@@ -61,6 +62,34 @@ _LOW_INFORMATION_ANCHORS = frozenset(
         "version",
     }
 )
+_GENERIC_ENTITY_ROLE_WORDS = frozenset(
+    {
+        "account",
+        "action",
+        "architecture",
+        "category",
+        "checklist",
+        "dashboard",
+        "decision",
+        "document",
+        "guide",
+        "hub",
+        "index",
+        "inventory",
+        "model",
+        "note",
+        "overview",
+        "plan",
+        "project",
+        "readme",
+        "record",
+        "report",
+        "setup",
+        "specification",
+        "system",
+        "template",
+    }
+)
 _ANCHOR_EDGE_STOP_WORDS = frozenset(
     {
         "a",
@@ -70,14 +99,18 @@ _ANCHOR_EDGE_STOP_WORDS = frozenset(
         "at",
         "by",
         "create",
+        "draft",
+        "expose",
         "for",
         "from",
+        "goal",
         "in",
         "into",
         "is",
         "of",
         "on",
         "or",
+        "perform",
         "the",
         "to",
         "watch",
@@ -88,6 +121,11 @@ _ANCHOR_EDGE_STOP_WORDS = frozenset(
 _DATE_ANCHOR_RE = re.compile(r"^(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})$")
 _TIME_ANCHOR_RE = re.compile(r"^\d{1,2}:\d{2}(?::\d{2})?(?:\s*[ap]m)?$", re.IGNORECASE)
 _NUMBER_ANCHOR_RE = re.compile(r"^[#]?(?:0x)?[0-9a-f][0-9a-f.,:/_-]*$", re.IGNORECASE)
+_BOILERPLATE_ANCHOR_CONTEXT_RE = re.compile(
+    r"\b(?:draft\s+for\b.{0,80}\breview|expose\b.{0,80}\bport|"
+    r"goal\s+is\s+to\s+keep|must\s+perform)\b",
+    re.IGNORECASE,
+)
 STOP_WORDS = frozenset(
     {
         "about",
@@ -274,6 +312,96 @@ def _low_information_anchor(
     return False
 
 
+def _document_entity_id(candidate: dict[str, Any]) -> str:
+    path = str(candidate.get("path", "")).replace("\\", "/").strip().removesuffix(".md")
+    if path:
+        return f"document:{path.casefold()}"
+    title = normalized_text(str(candidate.get("title", "")))
+    return f"document:{title}" if title else ""
+
+
+def _anchor_graph_specificity(
+    value: str,
+    candidate: dict[str, Any],
+    *,
+    document_frequency: Counter[str],
+    note_count: int,
+    reason: str,
+) -> tuple[float, str]:
+    """Score whether an anchor identifies the target rather than a generic concept.
+
+    This uses inverse-document-frequency entity weighting. A short phrase such as ``backup plan``
+    is not accepted merely because it is an alias: it omits the distinguishing
+    ``workspace`` identity from ``Workspace Backup Plan``. Stable identifiers and complete,
+    distinctive names remain eligible.
+    """
+
+    anchor_terms = search_terms(value, maximum=30)
+    if not anchor_terms:
+        return 0.0, ""
+    title = str(candidate.get("title", "")).strip()
+    primary_terms = search_terms(
+        title or Path(str(candidate.get("path", ""))).stem.replace("_", " ").replace("-", " "),
+        maximum=30,
+    )
+    informative_primary = primary_terms - _GENERIC_ENTITY_ROLE_WORDS
+    informative_anchor = anchor_terms - _GENERIC_ENTITY_ROLE_WORDS
+    total = max(1, note_count)
+    ratios = [document_frequency.get(term, 0) / total for term in informative_anchor]
+    rare_ratio = min(ratios, default=1.0)
+    coverage = (
+        len(informative_anchor & informative_primary) / len(informative_primary)
+        if informative_primary
+        else 0.0
+    )
+    has_identifier = any(character.isdigit() for character in value) or bool(
+        re.search(r"\b[A-Za-z][A-Za-z0-9_-]*[:#-][A-Za-z0-9][A-Za-z0-9./_-]{2,}\b", value)
+    )
+    full_primary_name = bool(primary_terms) and primary_terms <= anchor_terms
+    normalized_anchor = normalized_text(value)
+    target_knowledge = normalized_text(
+        " ".join(
+            [
+                str(candidate.get("content_excerpt", "")),
+                str(candidate.get("content", ""))[:20_000],
+            ]
+        )
+    )
+    exact_target_phrase = len(normalized_anchor) >= 8 and normalized_anchor in target_knowledge
+    score = 0.0
+    if has_identifier and reason == "exact target title, alias, or identifier":
+        score = 1.0
+    elif full_primary_name and len(informative_primary) >= 2:
+        score = 0.94
+    elif full_primary_name and len(informative_primary) == 1:
+        score = (
+            0.86
+            if candidate.get("structural_role") == "category-hub"
+            else 0.82
+            if rare_ratio <= 0.01
+            else 0.0
+        )
+    elif reason == "exact target title, alias, or identifier" and len(informative_anchor) >= 2:
+        score = 0.86
+    elif coverage >= 0.8 and len(informative_anchor) >= 2:
+        score = 0.82
+    elif (
+        reason == "distinctive phrase shared with the target note"
+        and len(informative_anchor) >= 3
+        and exact_target_phrase
+        and rare_ratio <= 0.05
+    ):
+        score = 0.74
+    if (
+        len(informative_anchor) < 2
+        and primary_terms & _GENERIC_ENTITY_ROLE_WORDS
+        and not has_identifier
+        and not full_primary_name
+    ):
+        score = min(score, 0.45)
+    return round(score, 4), _document_entity_id(candidate) if score >= 0.7 else ""
+
+
 def _candidate_descriptor_terms(candidate: dict[str, Any]) -> tuple[list[str], set[str]]:
     descriptors = [
         str(candidate.get("title", "")),
@@ -320,7 +448,7 @@ def inline_anchor_options(
         return []
     frequency = document_frequency or Counter()
     total = max(1, note_count)
-    scored: dict[str, tuple[float, str, str, int, str]] = {}
+    scored: dict[str, tuple[float, str, str, int, str, float, str]] = {}
     protected = (
         protected_ranges if protected_ranges is not None else _protected_markdown_ranges(content)
     )
@@ -372,7 +500,18 @@ def inline_anchor_options(
         if not occurrences:
             return
         for occurrence, (start, end, actual) in enumerate(occurrences):
+            graph_specificity, canonical_entity_id = _anchor_graph_specificity(
+                actual,
+                candidate,
+                document_frequency=frequency,
+                note_count=total,
+                reason=reason,
+            )
+            if graph_specificity < 0.7 or not canonical_entity_id:
+                continue
             context = _anchor_context(content, start, end)
+            if _BOILERPLATE_ANCHOR_CONTEXT_RE.search(context):
+                continue
             context_terms = search_terms(context, maximum=100)
             contextual_overlap = context_terms & target_terms
             if reason != "exact target title, alias, or identifier" and len(contextual_overlap) < 2:
@@ -384,7 +523,15 @@ def inline_anchor_options(
             key = actual.casefold()
             previous = scored.get(key)
             if previous is None or contextual_score > previous[0]:
-                scored[key] = (contextual_score, reason, actual, occurrence, context)
+                scored[key] = (
+                    contextual_score,
+                    reason,
+                    actual,
+                    occurrence,
+                    context,
+                    graph_specificity,
+                    canonical_entity_id,
+                )
 
     for descriptor in descriptors:
         descriptor_terms = search_terms(descriptor, maximum=100)
@@ -402,8 +549,18 @@ def inline_anchor_options(
                 "reason": reason,
                 "occurrence": occurrence,
                 "context": context,
+                "graph_specificity": graph_specificity,
+                "canonical_entity_id": canonical_entity_id,
             }
-            for _key, (score, reason, actual, occurrence, context) in ranked[:maximum]
+            for _key, (
+                score,
+                reason,
+                actual,
+                occurrence,
+                context,
+                graph_specificity,
+                canonical_entity_id,
+            ) in ranked[:maximum]
         ]
 
     # Exact titles, aliases, and identifiers are the clearest possible anchors. Once found,
@@ -926,6 +1083,87 @@ def link_target(note: dict[str, Any]) -> str:
     return f"{path}|{title}" if Path(path).name.casefold() != title.casefold() else path
 
 
+def _stable_entity_parts(value: str) -> tuple[str, str, str] | None:
+    raw = re.sub(r"\s+", " ", str(value)).strip()
+    if ":" not in raw:
+        return None
+    entity_type, _separator, name = raw.partition(":")
+    clean_type = slugify(entity_type, fallback="identifier", max_length=40).replace("-", "_")
+    clean_name = name.strip()[:200]
+    if not clean_name:
+        return None
+    entity_id = f"{clean_type}:{clean_name.casefold()}"
+    display_type = "email_address" if clean_type == "email" else clean_type
+    return entity_id, clean_name, display_type
+
+
+def knowledge_graph_nodes(
+    note: dict[str, Any],
+    *,
+    entity_document_frequency: Counter[str] | None = None,
+    note_count: int = 1,
+) -> list[dict[str, Any]]:
+    """Build canonical document and durable-identifier nodes for one note."""
+
+    title = str(note.get("title", "")).strip() or Path(str(note.get("path", ""))).stem
+    document_id = _document_entity_id(note)
+    aliases = [
+        re.sub(r"\s+", " ", str(value)).strip()[:160]
+        for value in note.get("aliases", [])
+        if str(value).strip()
+    ][:20]
+    nodes: list[dict[str, Any]] = []
+    if document_id and title:
+        nodes.append(
+            {
+                "id": document_id,
+                "name": title[:200],
+                "type": "document",
+                "aliases": aliases,
+                "evidence": f"title and path of {str(note.get('path', ''))[:300]}",
+                "specificity": 1.0,
+            }
+        )
+    frequency = entity_document_frequency or Counter()
+    total = max(1, note_count)
+    for raw_entity in note.get("entities", []):
+        parts = _stable_entity_parts(str(raw_entity))
+        if not parts:
+            continue
+        entity_id, name, entity_type = parts
+        ratio = frequency.get(entity_id, 1) / total
+        specificity = max(0.0, min(1.0, 1.0 - ratio))
+        nodes.append(
+            {
+                "id": entity_id,
+                "name": name,
+                "type": entity_type,
+                "aliases": [],
+                "evidence": f"exact identifier {raw_entity}",
+                "specificity": round(specificity, 4),
+            }
+        )
+        if len(nodes) >= 40:
+            break
+    return nodes
+
+
+def _explicit_graph_fields(
+    source_note: dict[str, Any], candidate: dict[str, Any], *, predicate: str
+) -> dict[str, str]:
+    if not (source_note.get("knowledge_graph") or candidate.get("knowledge_graph")):
+        return {}
+    source_nodes = knowledge_graph_nodes(source_note)
+    target_nodes = knowledge_graph_nodes(candidate)
+    source_document = next((item for item in source_nodes if item["type"] == "document"), {})
+    target_document = next((item for item in target_nodes if item["type"] == "document"), {})
+    return {
+        "source_entity": str(source_document.get("name", "")),
+        "target_entity": str(target_document.get("name", "")),
+        "predicate": predicate,
+    }
+
+
 def exact_duplicate_groups(notes: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     """Group substantive notes with exactly the same knowledge content."""
     groups: dict[str, list[dict[str, Any]]] = {}
@@ -1043,21 +1281,22 @@ def explicit_category_hub_relationships(
         candidate_links = {_target_key(str(link)) for link in candidate.get("links", [])}
         if source_path not in candidate_links:
             continue
-        relationships.append(
-            {
-                "target": link_target(candidate),
-                "anchor": anchor,
-                "anchor_occurrence": int((anchor_option or {}).get("occurrence", 0) or 0),
-                "anchor_context": str((anchor_option or {}).get("context", "")),
-                "relationship_type": "category-hub",
-                "relationship": "This category hub explicitly catalogs the source note",
-                "evidence": [
-                    f"SOURCE: the note explicitly names {anchor}",
-                    f"TARGET: the hub directly links to {source_title or source_path}",
-                ],
-                "confidence": 0.99,
-            }
-        )
+        relationship = {
+            "target": link_target(candidate),
+            "anchor": anchor,
+            "anchor_occurrence": int((anchor_option or {}).get("occurrence", 0) or 0),
+            "anchor_context": str((anchor_option or {}).get("context", "")),
+            "relationship_type": "category-hub",
+            "relationship": "This category hub explicitly catalogs the source note",
+            "evidence": [
+                f"SOURCE: the note explicitly names {anchor}",
+                f"TARGET: the hub directly links to {source_title or source_path}",
+            ],
+            "confidence": 0.99,
+            **_explicit_graph_fields(source_note, candidate, predicate="catalogs_document"),
+        }
+        if graph_relationship_is_eligible(source_note, candidate, relationship):
+            relationships.append(relationship)
     return relationships
 
 
@@ -1117,27 +1356,28 @@ def explicit_reciprocal_relationships(
             start, end, _actual = _free_occurrences(candidate_content, reciprocal_descriptor)[0]
             target_context = _anchor_context(candidate_content, start, end)
         source_context = str((anchor_option or {}).get("context", ""))
-        relationships.append(
-            {
-                "target": link_target(candidate),
-                "anchor": anchor,
-                "anchor_occurrence": int((anchor_option or {}).get("occurrence", 0) or 0),
-                "anchor_context": source_context,
-                "relationship_type": "specific-record",
-                "relationship": (
-                    "Both notes explicitly identify the same two-sided record relationship"
+        relationship = {
+            "target": link_target(candidate),
+            "anchor": anchor,
+            "anchor_occurrence": int((anchor_option or {}).get("occurrence", 0) or 0),
+            "anchor_context": source_context,
+            "relationship_type": "specific-record",
+            "relationship": (
+                "Both notes explicitly identify the same two-sided record relationship"
+            ),
+            "evidence": [
+                f"SOURCE: {source_context or f'the source explicitly names {anchor}'}",
+                (
+                    f"TARGET: {target_context}"
+                    if target_context
+                    else "TARGET: the candidate directly links back to the source note"
                 ),
-                "evidence": [
-                    f"SOURCE: {source_context or f'the source explicitly names {anchor}'}",
-                    (
-                        f"TARGET: {target_context}"
-                        if target_context
-                        else "TARGET: the candidate directly links back to the source note"
-                    ),
-                ],
-                "confidence": 0.99,
-            }
-        )
+            ],
+            "confidence": 0.99,
+            **_explicit_graph_fields(source_note, candidate, predicate="cross_references_document"),
+        }
+        if graph_relationship_is_eligible(source_note, candidate, relationship):
+            relationships.append(relationship)
     return relationships
 
 
@@ -1173,21 +1413,22 @@ def explicit_reference_relationships(
         if not anchor or not target:
             continue
         context = str((anchor_option or {}).get("context", ""))
-        relationships.append(
-            {
-                "target": target,
-                "anchor": anchor,
-                "anchor_occurrence": int((anchor_option or {}).get("occurrence", 0) or 0),
-                "anchor_context": context,
-                "relationship_type": "reference",
-                "relationship": "This navigation record explicitly names the target document",
-                "evidence": [
-                    f"SOURCE: {context or f'the source explicitly names {anchor}'}",
-                    f"TARGET: {candidate.get('title') or target} is the named document",
-                ],
-                "confidence": 0.99,
-            }
-        )
+        relationship = {
+            "target": target,
+            "anchor": anchor,
+            "anchor_occurrence": int((anchor_option or {}).get("occurrence", 0) or 0),
+            "anchor_context": context,
+            "relationship_type": "reference",
+            "relationship": "This navigation record explicitly names the target document",
+            "evidence": [
+                f"SOURCE: {context or f'the source explicitly names {anchor}'}",
+                f"TARGET: {candidate.get('title') or target} is the named document",
+            ],
+            "confidence": 0.99,
+            **_explicit_graph_fields(source_note, candidate, predicate="references_named_document"),
+        }
+        if graph_relationship_is_eligible(source_note, candidate, relationship):
+            relationships.append(relationship)
     return relationships
 
 
@@ -1400,6 +1641,7 @@ class AdaptiveVaultIndex:
         self.tag_counts: Counter[str] = Counter()
         self.tag_paths: dict[str, list[str]] = {}
         self.folder_counts: Counter[str] = Counter()
+        self.entity_document_frequency: Counter[str] = Counter()
         document_frequency: Counter[str] = Counter()
         for index, note in enumerate(notes):
             terms = Counter(search_terms(_note_search_text(note)))
@@ -1419,6 +1661,12 @@ class AdaptiveVaultIndex:
                 parts = path.parent.parts
                 for depth in range(1, min(len(parts), 6) + 1):
                     self.folder_counts[Path(*parts[:depth]).as_posix()] += 1
+            stable_entity_ids = {
+                parts[0]
+                for raw_entity in note.get("entities", [])
+                if (parts := _stable_entity_parts(str(raw_entity)))
+            }
+            self.entity_document_frequency.update(stable_entity_ids)
         self.document_frequency = document_frequency
         total = max(1, len(notes))
         self.idf = {
@@ -1488,6 +1736,74 @@ class AdaptiveVaultIndex:
             score += 1
         return score
 
+    def knowledge_graph_for(
+        self,
+        note: dict[str, Any],
+        *,
+        source_note: dict[str, Any] | None = None,
+        anchor_options: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Return a compact graph projection used by Maintenance edge validation."""
+
+        nodes = knowledge_graph_nodes(
+            note,
+            entity_document_frequency=self.entity_document_frequency,
+            note_count=self.note_count,
+        )
+        document = next((item for item in nodes if item["type"] == "document"), {})
+        edges: list[dict[str, Any]] = []
+        parent = Path(str(note.get("path", ""))).parent.as_posix()
+        if document and parent not in {"", "."}:
+            edges.append(
+                {
+                    "source": document["id"],
+                    "predicate": "belongs_to_category",
+                    "target": f"category:{parent.casefold()}",
+                }
+            )
+        for entity in nodes:
+            if entity.get("type") != "document" and document:
+                edges.append(
+                    {
+                        "source": document["id"],
+                        "predicate": "mentions_entity",
+                        "target": entity["id"],
+                    }
+                )
+        for target in note.get("links", [])[:20]:
+            clean_target = _target_key(str(target))
+            if clean_target and document:
+                edges.append(
+                    {
+                        "source": document["id"],
+                        "predicate": "links_to_document",
+                        "target": f"document:{clean_target}",
+                    }
+                )
+        signals: dict[str, Any] = {}
+        if source_note is not None:
+            source_nodes = knowledge_graph_nodes(
+                source_note,
+                entity_document_frequency=self.entity_document_frequency,
+                note_count=self.note_count,
+            )
+            source_ids = {
+                str(item["id"]) for item in source_nodes if item.get("type") != "document"
+            }
+            target_ids = {str(item["id"]) for item in nodes if item.get("type") != "document"}
+            signals = {
+                "source_names_target": bool(anchor_options),
+                "source_links_target": note_links_to(source_note, note),
+                "target_links_source": note_links_to(note, source_note),
+                "shared_entity_ids": sorted(source_ids & target_ids)[:12],
+            }
+        return {
+            "entity_nodes": nodes[:40],
+            "structural_edges": edges[:60],
+            "signals": signals,
+            "policy": "typed edge with exact evidence and graph-specific anchor required",
+        }
+
     def corpus_profile(self) -> dict[str, Any]:
         total = max(1, self.note_count)
         high_frequency = [
@@ -1506,6 +1822,9 @@ class AdaptiveVaultIndex:
             for note in self.notes
             if self._hub_score(note) >= 2
         ][:100]
+        unique_entity_types = Counter(
+            entity_id.split(":", 1)[0] for entity_id in self.entity_document_frequency
+        )
         return {
             "note_count": self.note_count,
             "folders": [
@@ -1517,6 +1836,36 @@ class AdaptiveVaultIndex:
             ],
             "high_frequency_terms": high_frequency,
             "existing_category_hubs": hubs,
+            "knowledge_graph": {
+                "node_counts": {
+                    "document": self.note_count,
+                    **dict(unique_entity_types.most_common(30)),
+                },
+                "edge_counts": {
+                    "belongs_to_category": sum(
+                        1
+                        for note in self.notes
+                        if Path(str(note.get("path", ""))).parent.as_posix() not in {"", "."}
+                    ),
+                    "mentions_entity": sum(
+                        sum(
+                            _stable_entity_parts(str(entity)) is not None
+                            for entity in note.get("entities", [])
+                        )
+                        for note in self.notes
+                    ),
+                    "links_to_document": sum(len(note.get("links", [])) for note in self.notes),
+                },
+                "entity_frequency": [
+                    {
+                        "id": entity_id,
+                        "notes": count,
+                        "specificity": round(1.0 - count / total, 4),
+                    }
+                    for entity_id, count in self.entity_document_frequency.most_common(120)
+                ],
+                "specificity_method": "inverse document frequency",
+            },
         }
 
     def candidates(
@@ -1576,6 +1925,8 @@ class AdaptiveVaultIndex:
         scored.sort(key=lambda item: (-item[0], item[1], str(item[2].get("path", ""))))
         result = [note for _score, _title, note in scored[: max(0, maximum)]]
         protected_ranges = _protected_markdown_ranges(strip_maintenance_block(text))
+        if source_note is not None:
+            source_note["knowledge_graph"] = self.knowledge_graph_for(source_note)
         for note in result:
             note["anchor_options"] = inline_anchor_options(
                 text,
@@ -1583,6 +1934,11 @@ class AdaptiveVaultIndex:
                 document_frequency=self.document_frequency,
                 note_count=self.note_count,
                 protected_ranges=protected_ranges,
+            )
+            note["knowledge_graph"] = self.knowledge_graph_for(
+                note,
+                source_note=source_note,
+                anchor_options=note["anchor_options"],
             )
         return result
 

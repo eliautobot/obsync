@@ -9,7 +9,7 @@ Obsync is a self-hosted ingestion layer that keeps an Obsidian vault aligned wit
 - Source: <https://github.com/eliautobot/obsync>
 - License: MIT
 - Initial release: `v0.1.0`
-- Current development version: `v0.18.0`
+- Current development version: `v0.19.0`
 
 ## Product decisions
 
@@ -64,6 +64,8 @@ Version 0.16.0 adds the complete Local AI live-inference experience to Index and
 Version 0.17.0 makes Index Sweeps strictly read-only and replaces visible maintenance blocks with native inline wikilinks and YAML tags. Operation-level ownership lets approved edits survive ordinary source sync while respecting later human removal, and Review, automatic apply, migration, concurrent-edit protection, and Undo Sweep operate on those native edits.
 
 Version 0.18.0 grounds every maintenance operation in current Markdown. It rejects dates, numbers, metadata labels, generic words, stale metadata, duplicate existing links, and relationships that cannot produce a real edit; requires independent evidence and confidence for tags; detects exact duplicates; adds review-only folder/index operations; and lets administrators approve individual operations. Startup recovery and immediate model-request cancellation prevent interrupted sweeps from remaining stuck.
+
+Version 0.19.0 adds a private Vault Knowledge Graph that maps canonical documents, durable identifiers, category membership, existing links, and entity specificity before Maintenance. Link proposals require a typed directional edge, an exact graph-specific anchor, and evidence from both notes; AI and deterministic shortcuts share the same validator. Generic shorthand and boilerplate action phrases are rejected, Review displays the proposed edge, and schema 13 supersedes older pending recommendations and cached vault models.
 
 ## Initial validation
 

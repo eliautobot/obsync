@@ -211,6 +211,28 @@ def test_anchor_candidates_reject_sentence_fragments_and_promotional_verbs() -> 
     assert "double-entry accounting core" in anchors
 
 
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "draft for Eli review",
+        "expose host port",
+        "goal is to keep Cody",
+        "Archo must perform",
+    ],
+)
+def test_anchor_candidates_reject_boilerplate_action_phrases(phrase: str) -> None:
+    candidate = {
+        "path": "Runbooks/Deployment Runbook.md",
+        "title": "Deployment Runbook",
+        "content": f"The current work item says {phrase} before completion.",
+    }
+
+    assert (
+        inline_anchor_options(f"The current work item says {phrase} before completion.", candidate)
+        == []
+    )
+
+
 def test_readme_notes_are_classified_as_category_hubs() -> None:
     notes = [
         {
@@ -832,14 +854,16 @@ def test_explicit_reciprocal_relationship_requires_two_sided_exact_identificatio
     assert relationships[0]["anchor_context"].startswith("Orion Research commissioned")
 
 
-def test_checklist_exact_document_names_become_safe_reference_links() -> None:
+def test_checklist_generic_document_aliases_do_not_become_reference_links() -> None:
     source = parse_note(
         Path("Operations/Setup Checklist.md"),
         content="# Setup Checklist\n\n- [x] Create account inventory\n",
     ).as_dict()
     account = parse_note(
         Path("Operations/Account Inventory.md"),
-        content="# Account Inventory\n\nCanonical inventory of business accounts.\n",
+        content=(
+            "---\naliases: [account inventory]\n---\n# Account Inventory\n\nCanonical inventory.\n"
+        ),
     ).as_dict()
     candidate = {
         **account,
@@ -850,9 +874,30 @@ def test_checklist_exact_document_names_become_safe_reference_links() -> None:
 
     relationships = explicit_reference_relationships(source, [candidate])
 
-    assert len(relationships) == 1
-    assert relationships[0]["anchor"].casefold() == "account inventory"
-    assert relationships[0]["target"] == "Operations/Account Inventory"
+    assert candidate["anchor_options"] == []
+    assert relationships == []
+
+
+def test_checklist_complete_distinctive_document_name_becomes_reference_link() -> None:
+    source = parse_note(
+        Path("Operations/Setup Checklist.md"),
+        content="# Setup Checklist\n\n- [x] Review Workspace Backup Plan\n",
+    ).as_dict()
+    plan = parse_note(
+        Path("Operations/Workspace Backup Plan.md"),
+        content="# Workspace Backup Plan\n\nRecovery design for the workspace.\n",
+    ).as_dict()
+    candidate = {
+        **plan,
+        "link_target": link_target(plan),
+        "already_linked": False,
+        "anchor_options": inline_anchor_options(source["content"], plan),
+    }
+
+    relationships = explicit_reference_relationships(source, [candidate])
+
+    assert relationships[0]["anchor"] == "Workspace Backup Plan"
+    assert relationships[0]["target"] == "Operations/Workspace Backup Plan"
 
 
 def test_ordinary_note_mentions_do_not_force_reference_links() -> None:
@@ -1519,7 +1564,7 @@ def test_v0151_migration_raises_only_the_legacy_default_ai_timeout(tmp_path: Pat
     service.db.initialize()
 
     assert service.db.get_setting("llm_timeout_seconds") == "600"
-    assert service.db.query_one("SELECT version FROM schema_meta")["version"] == 12
+    assert service.db.query_one("SELECT version FROM schema_meta")["version"] == 13
 
     service.db.set_settings({"llm_timeout_seconds": ("900", False)})
     service.db.execute("UPDATE schema_meta SET version = 9")
@@ -1565,7 +1610,7 @@ def test_v011_migration_supersedes_block_recommendations_and_forces_read_only_in
     assert "native inline maintenance" in change["error"]
     assert service.db.get_setting("vault_index_change_mode") == "index-only"
     assert service.db.get_setting("vault_link_limit") == "8"
-    assert service.db.query_one("SELECT version FROM schema_meta")["version"] == 12
+    assert service.db.query_one("SELECT version FROM schema_meta")["version"] == 13
 
 
 def test_v012_migration_rebuilds_metadata_and_supersedes_contextless_recommendations(
@@ -1617,7 +1662,49 @@ def test_v012_migration_rebuilds_metadata_and_supersedes_contextless_recommendat
     assert model and model["status"] == "not-learned"
     assert model["fingerprint"] == ""
     assert model["corpus_fingerprint"] == ""
-    assert service.db.query_one("SELECT version FROM schema_meta")["version"] == 12
+    assert service.db.query_one("SELECT version FROM schema_meta")["version"] == 13
+
+
+def test_v019_migration_supersedes_pre_graph_recommendations_and_model(
+    tmp_path: Path,
+) -> None:
+    service = ObsyncService(
+        Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
+    )
+    now = utc_now()
+    service.db.execute(
+        "INSERT INTO vault_sweeps(id, sweep_type, vault_key, status, change_mode, "
+        "created_at, updated_at) VALUES ('v18-sweep', 'maintenance', 'local', "
+        "'completed', 'review', ?, ?)",
+        (now, now),
+    )
+    change_id = service._create_vault_change(
+        sweep_id="v18-sweep",
+        note={"path": "Record.md", "content": "# Record\n"},
+        after_content="# Record\n\n[[Generic Plan|plan]]\n",
+        reason="Pre-graph recommendation",
+        evidence=["generic phrase"],
+        confidence=0.8,
+    )
+    service.db.execute(
+        "INSERT OR REPLACE INTO vault_models(vault_key, status, model_json, fingerprint, "
+        "provider, model_name, note_count, error, corpus_json, corpus_fingerprint, updated_at) "
+        "VALUES ('local', 'ready', '{}', 'old-model', 'ollama', 'test', 1, '', '{}', "
+        "'current-corpus', ?)",
+        (now,),
+    )
+    service.db.execute("UPDATE schema_meta SET version = 12")
+
+    service.db.initialize()
+
+    change = service.db.query_one("SELECT * FROM vault_changes WHERE id = ?", (change_id,))
+    model = service.db.query_one("SELECT * FROM vault_models WHERE vault_key = 'local'")
+    assert change and change["status"] == "superseded"
+    assert "graph-grounded maintenance" in change["error"]
+    assert model and model["status"] == "not-learned"
+    assert model["fingerprint"] == ""
+    assert model["corpus_fingerprint"] == "current-corpus"
+    assert service.db.query_one("SELECT version FROM schema_meta")["version"] == 13
 
 
 def test_review_feedback_changes_the_adaptive_vault_model_fingerprint(
@@ -2045,6 +2132,34 @@ def test_adaptive_index_stress_handles_five_thousand_notes_without_quadratic_sca
 
     assert candidates[0]["path"] == "Records/Record 4321.md"
     assert elapsed < 8
+
+
+def test_adaptive_index_builds_compact_vault_knowledge_graph_context() -> None:
+    source = parse_note(
+        Path("Invoices/INV-9.md"),
+        content="# Invoice INV-9\n\nInvoice INV-9 bills Client Alpha for account A1-900.\n",
+    ).as_dict()
+    client = parse_note(
+        Path("Clients/Client Alpha.md"),
+        content="# Client Alpha\n\nClient Alpha owns account A1-900.\n",
+    ).as_dict()
+    index = AdaptiveVaultIndex([source, client])
+
+    candidates = index.candidates(
+        source["path"],
+        source["content"],
+        source_note=source,
+        exclude_path=source["path"],
+    )
+    profile = index.corpus_profile()
+
+    assert source["knowledge_graph"]["entity_nodes"][0]["id"] == "document:invoices/inv-9"
+    assert candidates[0]["knowledge_graph"]["entity_nodes"][0]["id"] == (
+        "document:clients/client alpha"
+    )
+    assert candidates[0]["knowledge_graph"]["signals"]["source_names_target"] is True
+    assert profile["knowledge_graph"]["node_counts"]["document"] == 2
+    assert profile["knowledge_graph"]["specificity_method"] == "inverse document frequency"
 
 
 def test_tag_vocabulary_is_scoped_to_project_or_exact_named_domain() -> None:

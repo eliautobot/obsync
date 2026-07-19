@@ -441,7 +441,7 @@ class Database:
                 connection.execute("ALTER TABLE enrollments ADD COLUMN agent_id TEXT")
             row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
-                connection.execute("INSERT INTO schema_meta(version) VALUES (12)")
+                connection.execute("INSERT INTO schema_meta(version) VALUES (13)")
             else:
                 schema_version = int(row["version"])
             if row is not None and schema_version < 9:
@@ -512,6 +512,20 @@ class Database:
                     (utc_now(),),
                 )
                 connection.execute("UPDATE schema_meta SET version = 12")
+                schema_version = 12
+            if row is not None and schema_version < 13:
+                connection.execute(
+                    "UPDATE vault_changes SET status = 'superseded', reviewed_at = ?, "
+                    "error = 'Superseded by graph-grounded maintenance; run a new "
+                    "Maintenance Sweep.' WHERE status = 'pending'",
+                    (utc_now(),),
+                )
+                connection.execute(
+                    "UPDATE vault_models SET status = 'not-learned', fingerprint = '', "
+                    "updated_at = ?",
+                    (utc_now(),),
+                )
+                connection.execute("UPDATE schema_meta SET version = 13")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

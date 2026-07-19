@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from .knowledge_graph import graph_relationship_is_eligible
 from .profiles import (
     FULL_TRANSFER_PROFILE,
     PROTECTED_SYSTEM_PROMPT,
@@ -40,8 +41,9 @@ Infer the vault's own vocabulary, folder logic, note roles, and relationship pri
 sample. Do not impose a fixed business taxonomy and do not invent notes, folders, or facts.
 
 Keep the response concise enough to remain valid JSON: one sentence for vault_summary; at most 8
-organization principles, 12 note patterns, 20 hierarchy entries, 12 entity types, 10 low-value
-patterns, and 10 items in each guidance array. Keep every string under 180 characters.
+organization principles, 12 note patterns, 20 hierarchy entries, 12 entity types, 16 relationship
+types, 10 canonicalization or low-value patterns, and 10 items in each guidance array. Keep every
+string under 180 characters.
 
 Required schema:
 {
@@ -54,6 +56,13 @@ Required schema:
     "signals": ["observed signal"]
   }],
   "entity_types": [{"name": "durable entity type", "signals": ["observed signal"]}],
+  "relationship_types": [{
+    "predicate": "specific_directional_snake_case_predicate",
+    "source_type": "observed source entity type",
+    "target_type": "observed target entity type",
+    "signals": ["evidence that supports this exact edge type"]
+  }],
+  "canonicalization_rules": ["observed rule for aliases and stable identities"],
   "low_value_patterns": ["repeated detail that should not drive direct links"],
   "relationship_guidance": ["when a link is substantively useful"],
   "negative_relationship_guidance": ["when similar notes must not be linked"],
@@ -84,6 +93,9 @@ Required schema:
     "target": "EXACT LINK TARGET copied from a candidate",
     "anchor": "EXACT ALLOWED INLINE ANCHOR copied from that candidate",
     "anchor_context": "EXACT CONTEXT copied with that allowed anchor",
+    "source_entity": "EXACT source graph entity name or id",
+    "target_entity": "EXACT candidate document graph entity name or id",
+    "predicate": "specific directional snake_case graph predicate",
     "relationship_type": "one allowed relationship type",
     "relationship": "specific factual relationship between the two records",
     "evidence": ["SOURCE: exact supporting fact", "TARGET: exact supporting fact"],
@@ -119,7 +131,11 @@ share a word, tag, folder, template, category, document type, or broad subject. 
 same type are not related unless a concrete fact shown in both notes explains how those specific
 records connect. Prefer no link over a weak link. Use only exact candidate LINK TARGET values. Every
 accepted relationship needs one SOURCE and one TARGET evidence item grounded in the supplied text.
-Allowed relationship types: entity, specific-record, category-hub, sequence, dependency, reference.
+Allowed relationship classes: entity, specific-record, category-hub, sequence, dependency,
+reference. The class is not the graph predicate. Every relationship must also name an exact source
+entity, an exact candidate document entity, and a specific directional snake_case predicate such
+as owns_account, depends_on_system, documents_decision, or catalogs_document. Never use generic
+predicates such as related_to, associated_with, links_to, reference, entity, or same_as.
 An inline link is valid only when a candidate supplies a natural ALLOWED INLINE ANCHOR already
 present in the source note. Copy both its text and its supplied source context; the exact line must
 support the relationship. Never choose dates, times, standalone numbers, metadata labels such as
@@ -135,8 +151,9 @@ alone must never put an organization, person, or other adjacent entity into a tr
 index. Only mark a current
 Obsync-owned edit obsolete when the supplied evidence no longer supports it. Prefer the shortest
 complete entity, title, alias, or identifier; never include surrounding verbs, articles, or
-punctuation in an anchor. Empty relationship, tag, organization, and cleanup arrays are valid and
-expected."""
+punctuation in an anchor. Treat the supplied graph as a constraint, not as evidence: exact SOURCE
+and TARGET quotes are still required for the claimed edge. Empty relationship, tag, organization,
+and cleanup arrays are valid and expected."""
 
 _GENERIC_RELATIONSHIP_WORDS = frozenset(
     {
@@ -660,12 +677,18 @@ def _candidate_prompt_line(candidate: str | dict[str, Any]) -> str:
             {
                 "text": str(item.get("text", "")),
                 "context": str(item.get("context", "")),
+                "graph_specificity": item.get("graph_specificity", 0.0),
+                "canonical_entity_id": str(item.get("canonical_entity_id", "")),
             }
             for item in raw_anchors[:8]
             if isinstance(item, dict) and str(item.get("text", "")).strip()
         ]
         if isinstance(raw_anchors, list)
         else []
+    )
+    graph = candidate.get("knowledge_graph", {})
+    graph_text = (
+        json.dumps(graph, ensure_ascii=False)[:3500] if isinstance(graph, dict) and graph else ""
     )
     details = [
         value
@@ -685,6 +708,7 @@ def _candidate_prompt_line(candidate: str | dict[str, Any]) -> str:
                 if anchors
                 else "NO SAFE INLINE ANCHOR"
             ),
+            f"KNOWLEDGE GRAPH: {graph_text}" if graph_text else "",
         )
         if value
     ]
@@ -754,6 +778,28 @@ def _normalize_vault_model(
         signals = _bounded_strings(entity.get("signals", []), maximum=12, length=240)
         if name and signals:
             entity_types.append({"name": name, "signals": signals})
+    relationship_types: list[dict[str, Any]] = []
+    raw_relationship_types = value.get("relationship_types", [])
+    for relationship in (
+        raw_relationship_types[:40] if isinstance(raw_relationship_types, list) else []
+    ):
+        if not isinstance(relationship, dict):
+            continue
+        predicate = re.sub(
+            r"[^a-z0-9_]+", "_", str(relationship.get("predicate", "")).casefold()
+        ).strip("_")[:80]
+        source_type = re.sub(r"\s+", " ", str(relationship.get("source_type", ""))).strip()[:80]
+        target_type = re.sub(r"\s+", " ", str(relationship.get("target_type", ""))).strip()[:80]
+        signals = _bounded_strings(relationship.get("signals", []), maximum=12, length=240)
+        if predicate and source_type and target_type and signals:
+            relationship_types.append(
+                {
+                    "predicate": predicate,
+                    "source_type": source_type,
+                    "target_type": target_type,
+                    "signals": signals,
+                }
+            )
     try:
         confidence = max(0.0, min(1.0, float(value.get("confidence", 0.0))))
     except (TypeError, ValueError):
@@ -766,6 +812,10 @@ def _normalize_vault_model(
         "note_patterns": patterns,
         "category_hierarchy": hierarchy,
         "entity_types": entity_types,
+        "relationship_types": relationship_types,
+        "canonicalization_rules": _bounded_strings(
+            value.get("canonicalization_rules", []), maximum=20, length=300
+        ),
         "low_value_patterns": _bounded_strings(
             value.get("low_value_patterns", []), maximum=50, length=300
         ),
@@ -841,6 +891,11 @@ def _deterministic_vault_model(
         "note_patterns": patterns,
         "category_hierarchy": hierarchy,
         "entity_types": [],
+        "relationship_types": [],
+        "canonicalization_rules": [
+            "Treat note paths as document identities and exact labeled identifiers as durable "
+            "entities"
+        ],
         "low_value_patterns": [
             "Shared folders, tags, dates, templates, or document types without a concrete fact"
         ],
@@ -968,6 +1023,11 @@ def _normalize_relationship_decision(
             relationship_type = re.sub(
                 r"[^a-z-]", "", str(raw.get("relationship_type", "specific-record")).casefold()
             )[:40]
+            source_entity = re.sub(r"\s+", " ", str(raw.get("source_entity", ""))).strip()[:240]
+            target_entity = re.sub(r"\s+", " ", str(raw.get("target_entity", ""))).strip()[:240]
+            predicate = re.sub(r"[^a-z0-9_]+", "_", str(raw.get("predicate", "")).casefold()).strip(
+                "_"
+            )[:80]
             evidence = _bounded_strings(raw.get("evidence", []), maximum=6, length=600)
             source_evidence = any(item.casefold().startswith("source:") for item in evidence)
             target_evidence = any(item.casefold().startswith("target:") for item in evidence)
@@ -1001,6 +1061,28 @@ def _normalize_relationship_decision(
                 confidence = max(0.0, min(1.0, float(raw.get("confidence", 0.0))))
             except (TypeError, ValueError):
                 confidence = 0.0
+            normalized_relationship = {
+                "target": target,
+                "anchor": anchor,
+                "anchor_occurrence": int((option or {}).get("occurrence", 0) or 0),
+                "anchor_context": anchor_context,
+                "relationship_type": relationship_type or "specific-record",
+                "relationship": label,
+                "evidence": evidence,
+                "confidence": round(confidence, 4),
+            }
+            graph_required = bool(
+                (source_note or {}).get("knowledge_graph")
+                or (candidate or {}).get("knowledge_graph")
+            )
+            if graph_required or source_entity or target_entity or predicate:
+                normalized_relationship.update(
+                    {
+                        "source_entity": source_entity,
+                        "target_entity": target_entity,
+                        "predicate": predicate,
+                    }
+                )
             if (
                 not target
                 or not anchor
@@ -1012,20 +1094,12 @@ def _normalize_relationship_decision(
                 or not paired_evidence
                 or confidence < minimum_confidence
                 or target in {item["target"] for item in relationships}
+                or not graph_relationship_is_eligible(
+                    source_note or {}, candidate or {}, normalized_relationship
+                )
             ):
                 continue
-            relationships.append(
-                {
-                    "target": target,
-                    "anchor": anchor,
-                    "anchor_occurrence": int((option or {}).get("occurrence", 0) or 0),
-                    "anchor_context": anchor_context,
-                    "relationship_type": relationship_type or "specific-record",
-                    "relationship": label,
-                    "evidence": evidence,
-                    "confidence": round(confidence, 4),
-                }
-            )
+            relationships.append(normalized_relationship)
             if len(relationships) >= max(0, min(maximum_links, 50)):
                 break
 
@@ -1660,6 +1734,7 @@ class LLMAnalyzer:
                 list(source_note.get("headings", [])), maximum=30, length=200
             ),
             "properties": bounded_properties,
+            "knowledge_graph": source_note.get("knowledge_graph", {}),
             "content": _strip_generated_relationships(
                 str(source_note.get("learning_content", source_note.get("content", "")))
             )[:20_000],

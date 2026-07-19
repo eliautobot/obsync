@@ -2,6 +2,33 @@
 
 All notable changes to Obsync will be documented here.
 
+## 0.19.0 - 2026-07-19
+
+### Added
+
+- Added a private Vault Knowledge Graph containing canonical document nodes, durable identifiers, folder membership, existing links, entity frequency, and compact structural edges
+- Added typed relationship fields for every proposed link: source entity, directional predicate, target document entity, exact source anchor, and two-sided evidence
+- Added graph-edge details to each link operation in Review so the reason for a proposed connection is visible before approval
+
+### Changed
+
+- Index Sweep now prepares graph context from the complete vault while remaining strictly read-only and making no Markdown changes
+- Local AI learns vault-specific entity types, relationship types, canonicalization rules, category structure, and low-value patterns before evaluating individual notes
+- AI-generated links and deterministic checklist, README, reciprocal-link, and category-hub shortcuts now pass through the same graph eligibility gate
+- Candidate weighting reduces the influence of entities and terms repeated throughout the vault while preserving distinctive names and stable identifiers
+
+### Fixed
+
+- Rejected generic document shorthand such as `backup plan` or `account inventory` when it does not identify the complete target record
+- Rejected generic predicates such as `related_to`, `links_to`, `reference`, and `same_as` in favor of concrete directional relationships
+- Rejected recurring boilerplate action phrases such as draft-review, port-exposure, keep-alive-goal, and must-perform text as link anchors
+- Superseded pending pre-upgrade Maintenance recommendations and invalidated the cached vault model during schema 13 migration
+
+### Validation
+
+- Added graph extraction, relationship-gate, shortcut, generic-anchor, boilerplate-anchor, model-schema, UI, migration, and operation-serialization regressions
+- Completed the full test and coverage suite, package build, static checks, and a deterministic 511-note review/apply/Undo scale sweep
+
 ## 0.18.0 - 2026-07-18
 
 ### Added

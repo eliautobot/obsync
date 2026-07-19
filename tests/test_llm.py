@@ -230,6 +230,106 @@ def test_relationship_validator_rejects_ungrounded_model_evidence() -> None:
     assert result["relationships"][0]["confidence"] == 0.95
 
 
+def test_relationship_validator_requires_typed_canonical_graph_edge() -> None:
+    source = {
+        "path": "Invoices/INV-9.md",
+        "title": "Invoice INV-9",
+        "content": "Invoice INV-9 bills Client Alpha for account A1.",
+        "knowledge_graph": {
+            "entity_nodes": [
+                {
+                    "id": "document:invoices/inv-9",
+                    "name": "Invoice INV-9",
+                    "type": "document",
+                    "aliases": [],
+                }
+            ]
+        },
+    }
+    candidate = {
+        "path": "People/Client Alpha.md",
+        "title": "Client Alpha",
+        "link_target": "People/Client Alpha",
+        "content": "Client Alpha owns billing account A1.",
+        "anchor_options": [
+            {
+                "text": "Client Alpha",
+                "context": "Invoice INV-9 bills Client Alpha for account A1.",
+                "graph_specificity": 0.94,
+                "canonical_entity_id": "document:people/client alpha",
+            }
+        ],
+        "knowledge_graph": {
+            "entity_nodes": [
+                {
+                    "id": "document:people/client alpha",
+                    "name": "Client Alpha",
+                    "type": "document",
+                    "aliases": [],
+                }
+            ]
+        },
+    }
+    base = {
+        "target": "People/Client Alpha",
+        "anchor": "Client Alpha",
+        "anchor_context": "Invoice INV-9 bills Client Alpha for account A1.",
+        "relationship_type": "entity",
+        "relationship": "Invoice INV-9 bills Client Alpha's account",
+        "evidence": [
+            "SOURCE: Invoice INV-9 bills Client Alpha for account A1",
+            "TARGET: Client Alpha owns billing account A1",
+        ],
+        "confidence": 0.95,
+    }
+
+    missing_edge = _normalize_relationship_decision(
+        {"relationships": [base]},
+        [candidate],
+        minimum_confidence=0.72,
+        maximum_links=8,
+        source_note=source,
+    )
+    generic_edge = _normalize_relationship_decision(
+        {
+            "relationships": [
+                {
+                    **base,
+                    "source_entity": "Invoice INV-9",
+                    "target_entity": "Client Alpha",
+                    "predicate": "related_to",
+                }
+            ]
+        },
+        [candidate],
+        minimum_confidence=0.72,
+        maximum_links=8,
+        source_note=source,
+    )
+    accepted = _normalize_relationship_decision(
+        {
+            "relationships": [
+                {
+                    **base,
+                    "source_entity": "Invoice INV-9",
+                    "target_entity": "Client Alpha",
+                    "predicate": "bills_client_account",
+                }
+            ]
+        },
+        [candidate],
+        minimum_confidence=0.72,
+        maximum_links=8,
+        source_note=source,
+    )
+
+    assert missing_edge["relationships"] == []
+    assert generic_edge["relationships"] == []
+    assert accepted["relationships"][0]["predicate"] == "bills_client_account"
+    assert accepted["relationships"][0]["source_entity"] == "Invoice INV-9"
+    assert accepted["relationships"][0]["target_entity"] == "Client Alpha"
+
+
 def test_relationship_validator_rejects_evidence_about_two_different_facts() -> None:
     candidates = [
         {
@@ -824,6 +924,15 @@ async def test_vault_model_accepts_vault_specific_patterns_without_fixed_categor
             "note_patterns": [
                 {"name": "mycelium specimen", "signals": ["spore print", "collection site"]}
             ],
+            "relationship_types": [
+                {
+                    "predicate": "collected_during_expedition",
+                    "source_type": "specimen",
+                    "target_type": "expedition",
+                    "signals": ["recorded collection event"],
+                }
+            ],
+            "canonicalization_rules": ["Expedition codes identify one expedition."],
             "relationship_guidance": ["Link a specimen to its recorded expedition."],
             "negative_relationship_guidance": ["Do not link specimens only by genus."],
             "folder_guidance": ["Use existing expedition folders."],
@@ -842,6 +951,8 @@ async def test_vault_model_accepts_vault_specific_patterns_without_fixed_categor
     )
 
     assert model["note_patterns"][0]["name"] == "mycelium specimen"
+    assert model["relationship_types"][0]["predicate"] == "collected_during_expedition"
+    assert model["canonicalization_rules"] == ["Expedition codes identify one expedition."]
     assert model["provider"] == "ollama"
 
 
