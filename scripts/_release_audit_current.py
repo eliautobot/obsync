@@ -13,7 +13,6 @@ from obsync.service import ObsyncService
 from obsync.vault_intelligence import (
     exact_duplicate_groups,
     explicit_category_hub_relationships,
-    explicit_reciprocal_relationships,
     explicit_reference_relationships,
     native_maintenance_content,
     normalize_obsidian_tag,
@@ -34,7 +33,7 @@ async def run(args: argparse.Namespace) -> None:
             "llm_timeout_seconds": (str(args.timeout), False),
             "vault_relationship_candidate_limit": ("20", False),
             "vault_relationship_min_confidence": ("0.72", False),
-            "vault_link_limit": ("8", False),
+            "vault_link_limit": ("3", False),
             "vault_maintenance_categories": ('["links", "tags", "organization"]', False),
         }
     )
@@ -141,7 +140,7 @@ async def run(args: argparse.Namespace) -> None:
                 candidates,
                 vault_model=model,
                 minimum_confidence=0.72,
-                maximum_links=8,
+                maximum_links=3,
                 feedback=[],
                 owned_operations=[],
                 tag_vocabulary=tag_vocabulary,
@@ -163,7 +162,6 @@ async def run(args: argparse.Namespace) -> None:
         relationships = list(decision["relationships"])
         existing_targets = {str(item["target"]).casefold() for item in relationships}
         for explicit in [
-            *explicit_reciprocal_relationships(note, candidates),
             *explicit_category_hub_relationships(note, candidates),
             *explicit_reference_relationships(note, candidates),
         ]:

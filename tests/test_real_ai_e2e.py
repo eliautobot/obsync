@@ -44,7 +44,7 @@ def _configure_real_ai(service: ObsyncService) -> None:
             "llm_timeout_seconds": ("600", False),
             "vault_relationship_candidate_limit": ("16", False),
             "vault_relationship_min_confidence": ("0.78", False),
-            "vault_link_limit": ("8", False),
+            "vault_link_limit": ("3", False),
         }
     )
 

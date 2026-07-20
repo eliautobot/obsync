@@ -19,6 +19,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .config import Settings
 from .db import Database, utc_now
 from .extractors import extract_document
+from .knowledge_graph import (
+    BASE_GRAPH_PREDICATES,
+    canonical_entity_id,
+    feedback_feature_keys,
+    markdown_graph_chunks,
+)
 from .llm import (
     DEFAULT_LLM_TIMEOUT_SECONDS,
     MAX_LLM_TIMEOUT_SECONDS,
@@ -70,7 +76,6 @@ from .vault_intelligence import (
     exact_duplicate_groups,
     existing_note_match,
     explicit_category_hub_relationships,
-    explicit_reciprocal_relationships,
     explicit_reference_relationships,
     link_target,
     native_maintenance_content,
@@ -117,7 +122,7 @@ DEFAULT_SETTINGS: dict[str, tuple[str, bool]] = {
     "vault_maintenance_categories": ('["links", "tags", "organization"]', False),
     "vault_relationship_candidate_limit": ("20", False),
     "vault_relationship_min_confidence": ("0.72", False),
-    "vault_link_limit": ("8", False),
+    "vault_link_limit": ("3", False),
     "vault_metadata_version": ("2", False),
 }
 
@@ -535,6 +540,1002 @@ class ObsyncService:
                 ],
             )
 
+    @staticmethod
+    def _graph_row_id(*parts: str, prefix: str) -> str:
+        digest = hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()[:32]
+        return f"{prefix}:{digest}"
+
+    def _snapshot_unchanged_semantic_graph(
+        self, vault_key: str, notes: list[dict[str, Any]]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Keep AI graph rows whose source note hash still exactly matches the Index."""
+
+        hashes = {str(note.get("path", "")): str(note.get("content_hash", "")) for note in notes}
+        states = [
+            row
+            for row in self.db.query_all(
+                "SELECT * FROM vault_graph_state WHERE vault_key=? AND semantic_status='ready'",
+                (vault_key,),
+            )
+            if hashes.get(str(row["path"])) == str(row["content_hash"])
+        ]
+        preserved_paths = {str(row["path"]) for row in states}
+        if not preserved_paths:
+            return {"states": [], "entities": [], "mentions": [], "edges": []}
+        mentions = [
+            row
+            for row in self.db.query_all(
+                "SELECT * FROM vault_graph_mentions WHERE vault_key=? AND source_kind='semantic'",
+                (vault_key,),
+            )
+            if str(row["path"]) in preserved_paths
+        ]
+        edges = [
+            row
+            for row in self.db.query_all(
+                "SELECT * FROM vault_graph_edges WHERE vault_key=? AND source_kind='semantic'",
+                (vault_key,),
+            )
+            if str(row["source_path"]) in preserved_paths
+        ]
+        entity_ids = {
+            *[str(row["entity_id"]) for row in mentions],
+            *[str(row["source_id"]) for row in edges],
+            *[str(row["target_id"]) for row in edges],
+        }
+        entities = [
+            row
+            for row in self.db.query_all(
+                "SELECT * FROM vault_graph_entities WHERE vault_key=?", (vault_key,)
+            )
+            if str(row["id"]) in entity_ids
+        ]
+        return {
+            "states": states,
+            "entities": entities,
+            "mentions": mentions,
+            "edges": edges,
+        }
+
+    @staticmethod
+    def _restore_unchanged_semantic_graph(
+        connection: Any,
+        vault_key: str,
+        snapshot: dict[str, list[dict[str, Any]]],
+        now: str,
+    ) -> None:
+        """Merge unchanged semantic rows back after deterministic graph reconstruction."""
+
+        for entity in snapshot["entities"]:
+            existing = connection.execute(
+                "SELECT aliases_json,descriptions_json,source_kind FROM vault_graph_entities "
+                "WHERE vault_key=? AND id=?",
+                (vault_key, entity["id"]),
+            ).fetchone()
+            if existing:
+                aliases = list(
+                    dict.fromkeys(
+                        [
+                            *json.loads(existing["aliases_json"] or "[]"),
+                            *json.loads(entity["aliases_json"] or "[]"),
+                        ]
+                    )
+                )[:40]
+                descriptions = list(
+                    dict.fromkeys(
+                        [
+                            *json.loads(existing["descriptions_json"] or "[]"),
+                            *json.loads(entity["descriptions_json"] or "[]"),
+                        ]
+                    )
+                )[:20]
+                connection.execute(
+                    "UPDATE vault_graph_entities SET aliases_json=?,descriptions_json=?,"
+                    "source_kind='structural+semantic',feedback_weight=?,updated_at=? "
+                    "WHERE vault_key=? AND id=?",
+                    (
+                        json.dumps(aliases, ensure_ascii=False),
+                        json.dumps(descriptions, ensure_ascii=False),
+                        entity["feedback_weight"],
+                        now,
+                        vault_key,
+                        entity["id"],
+                    ),
+                )
+            else:
+                connection.execute(
+                    "INSERT INTO vault_graph_entities(vault_key,id,name,entity_type,aliases_json,"
+                    "descriptions_json,document_frequency,specificity,feedback_weight,source_kind,"
+                    "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        vault_key,
+                        entity["id"],
+                        entity["name"],
+                        entity["entity_type"],
+                        entity["aliases_json"],
+                        entity["descriptions_json"],
+                        entity["document_frequency"],
+                        entity["specificity"],
+                        entity["feedback_weight"],
+                        "semantic",
+                        entity["created_at"],
+                        now,
+                    ),
+                )
+        for mention in snapshot["mentions"]:
+            connection.execute(
+                "INSERT OR REPLACE INTO vault_graph_mentions(vault_key,id,path,chunk_id,entity_id,"
+                "start_offset,end_offset,quote,content_hash,source_kind,confidence,created_at,"
+                "updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    vault_key,
+                    mention["id"],
+                    mention["path"],
+                    mention["chunk_id"],
+                    mention["entity_id"],
+                    mention["start_offset"],
+                    mention["end_offset"],
+                    mention["quote"],
+                    mention["content_hash"],
+                    "semantic",
+                    mention["confidence"],
+                    mention["created_at"],
+                    now,
+                ),
+            )
+        for edge in snapshot["edges"]:
+            connection.execute(
+                "INSERT OR REPLACE INTO vault_graph_edges(vault_key,id,source_id,predicate,"
+                "target_id,source_type,target_type,description,evidence,source_path,"
+                "source_chunk_id,start_offset,end_offset,content_hash,confidence,feedback_weight,"
+                "frequency,valid_from,valid_to,state,source_kind,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    vault_key,
+                    edge["id"],
+                    edge["source_id"],
+                    edge["predicate"],
+                    edge["target_id"],
+                    edge["source_type"],
+                    edge["target_type"],
+                    edge["description"],
+                    edge["evidence"],
+                    edge["source_path"],
+                    edge["source_chunk_id"],
+                    edge["start_offset"],
+                    edge["end_offset"],
+                    edge["content_hash"],
+                    edge["confidence"],
+                    edge["feedback_weight"],
+                    edge["frequency"],
+                    edge["valid_from"],
+                    edge["valid_to"],
+                    edge["state"],
+                    "semantic",
+                    edge["created_at"],
+                    now,
+                ),
+            )
+        for state in snapshot["states"]:
+            connection.execute(
+                "UPDATE vault_graph_state SET semantic_status='ready',provider=?,model_name=?,"
+                "error='',extracted_at=?,updated_at=? WHERE vault_key=? AND path=?",
+                (
+                    state["provider"],
+                    state["model_name"],
+                    state["extracted_at"],
+                    now,
+                    vault_key,
+                    state["path"],
+                ),
+            )
+
+    def _replace_structural_graph(self, vault_key: str, notes: list[dict[str, Any]]) -> None:
+        """Build the read-only chunk, provenance, hierarchy, and exact-reference graph."""
+
+        now = utc_now()
+        semantic_snapshot = self._snapshot_unchanged_semantic_graph(vault_key, notes)
+        note_count = max(1, len(notes))
+        entities: dict[str, dict[str, Any]] = {}
+        chunks: list[dict[str, Any]] = []
+        mentions: list[dict[str, Any]] = []
+        edges: list[dict[str, Any]] = []
+        hierarchy: dict[str, dict[str, Any]] = {}
+        document_by_path: dict[str, dict[str, Any]] = {}
+        alias_targets: dict[str, list[dict[str, Any]]] = {}
+        chunks_by_path: dict[str, list[dict[str, Any]]] = {}
+
+        def add_entity(
+            entity_id: str,
+            name: str,
+            entity_type: str,
+            *,
+            aliases: list[str] | None = None,
+            descriptions: list[str] | None = None,
+        ) -> None:
+            if not entity_id:
+                return
+            current = entities.setdefault(
+                entity_id,
+                {
+                    "id": entity_id,
+                    "name": name[:240],
+                    "entity_type": entity_type,
+                    "aliases": [],
+                    "descriptions": [],
+                    "paths": set(),
+                },
+            )
+            for alias in aliases or []:
+                clean = re.sub(r"\s+", " ", str(alias)).strip()[:200]
+                if (
+                    clean
+                    and clean.casefold() != current["name"].casefold()
+                    and clean not in current["aliases"]
+                ):
+                    current["aliases"].append(clean)
+            for description in descriptions or []:
+                clean = re.sub(r"\s+", " ", str(description)).strip()[:500]
+                if clean and clean not in current["descriptions"]:
+                    current["descriptions"].append(clean)
+
+        for note in notes:
+            path = str(note.get("path", ""))
+            title = str(note.get("title", "")).strip() or Path(path).stem
+            document_id = canonical_entity_id("document", title, scope=path)
+            aliases = [
+                *[str(value) for value in note.get("aliases", [])],
+                Path(path).stem.replace("_", " ").replace("-", " "),
+            ]
+            add_entity(document_id, title, "document", aliases=aliases)
+            entities[document_id]["paths"].add(path)
+            document = {
+                "id": document_id,
+                "path": path,
+                "title": title,
+                "aliases": aliases,
+            }
+            document_by_path[path.casefold().removesuffix(".md")] = document
+            for value in [title, *aliases]:
+                key = re.sub(r"\s+", " ", value).strip().casefold()
+                words = re.findall(r"[A-Za-z0-9][A-Za-z0-9&'’./_-]*", key)
+                if len(key) >= 4 and (len(words) >= 2 or len(key) >= 6):
+                    alias_targets.setdefault(key, []).append(document)
+
+            note_chunks = markdown_graph_chunks(
+                path,
+                str(note.get("learning_content", note.get("content", ""))),
+                content_hash=str(note.get("content_hash", "")),
+            )
+            chunks.extend(note_chunks)
+            chunks_by_path[path] = note_chunks
+            parents = [Path(path).parent, *Path(path).parent.parents]
+            for parent in parents:
+                folder = parent.as_posix()
+                if folder in {"", "."}:
+                    folder = "."
+                entry = hierarchy.setdefault(
+                    folder,
+                    {
+                        "path": folder,
+                        "parent_path": ""
+                        if folder == "."
+                        else (Path(folder).parent.as_posix() or "."),
+                        "depth": 0 if folder == "." else len(Path(folder).parts),
+                        "note_paths": set(),
+                        "tags": {},
+                    },
+                )
+                entry["note_paths"].add(path)
+                for tag in note.get("human_tags", note.get("tags", [])):
+                    clean_tag = str(tag).strip()
+                    if clean_tag:
+                        entry["tags"][clean_tag] = entry["tags"].get(clean_tag, 0) + 1
+
+            parent = Path(path).parent.as_posix()
+            if parent not in {"", "."}:
+                category_id = canonical_entity_id("category", parent)
+                add_entity(category_id, parent, "category")
+                edge_id = self._graph_row_id(
+                    vault_key, document_id, "belongs_to_category", category_id, prefix="edge"
+                )
+                edges.append(
+                    {
+                        "id": edge_id,
+                        "source_id": document_id,
+                        "predicate": "belongs_to_category",
+                        "target_id": category_id,
+                        "source_type": "document",
+                        "target_type": "category",
+                        "description": f"{title} is stored in {parent}",
+                        "evidence": path,
+                        "source_path": path,
+                        "source_chunk_id": "",
+                        "start_offset": 0,
+                        "end_offset": 0,
+                        "content_hash": str(note.get("content_hash", "")),
+                    }
+                )
+            for tag in note.get("human_tags", note.get("tags", [])):
+                clean_tag = str(tag).strip()
+                tag_id = canonical_entity_id("tag", clean_tag)
+                if not tag_id:
+                    continue
+                add_entity(tag_id, clean_tag, "tag")
+                entities[tag_id]["paths"].add(path)
+                edges.append(
+                    {
+                        "id": self._graph_row_id(
+                            vault_key, document_id, "has_tag", tag_id, prefix="edge"
+                        ),
+                        "source_id": document_id,
+                        "predicate": "has_tag",
+                        "target_id": tag_id,
+                        "source_type": "document",
+                        "target_type": "tag",
+                        "description": f"{title} has native tag {clean_tag}",
+                        "evidence": f"#{clean_tag}",
+                        "source_path": path,
+                        "source_chunk_id": "",
+                        "start_offset": 0,
+                        "end_offset": 0,
+                        "content_hash": str(note.get("content_hash", "")),
+                    }
+                )
+            for raw in note.get("entities", []):
+                value = str(raw)
+                if ":" not in value:
+                    continue
+                label, name = value.split(":", 1)
+                entity_id = canonical_entity_id("identifier", name)
+                if not entity_id:
+                    continue
+                add_entity(entity_id, name, "identifier", descriptions=[label])
+                entities[entity_id]["paths"].add(path)
+
+        unambiguous_aliases = {
+            alias: values[0]
+            for alias, values in alias_targets.items()
+            if len({item["id"] for item in values}) == 1
+        }
+        if unambiguous_aliases:
+            alias_pattern = re.compile(
+                r"(?<![A-Za-z0-9_])("
+                + "|".join(
+                    re.escape(value)
+                    for value in sorted(unambiguous_aliases, key=lambda item: (-len(item), item))
+                )
+                + r")(?![A-Za-z0-9_])",
+                re.IGNORECASE,
+            )
+            for note in notes:
+                path = str(note.get("path", ""))
+                source_document = document_by_path.get(path.casefold().removesuffix(".md"))
+                if not source_document:
+                    continue
+                content = str(note.get("learning_content", note.get("content", "")))
+                note_chunks = chunks_by_path.get(path, [])
+                block_start = content.find("<!-- obsync:maintenance:start -->")
+                block_end = (
+                    content.find("<!-- obsync:maintenance:end -->", block_start)
+                    if block_start >= 0
+                    else -1
+                )
+                if block_end >= 0:
+                    block_end += len("<!-- obsync:maintenance:end -->")
+                seen_targets: set[str] = set()
+                for match in alias_pattern.finditer(content):
+                    if block_start >= 0 and block_start <= match.start() < block_end:
+                        continue
+                    target = unambiguous_aliases.get(match.group(0).casefold())
+                    if not target or target["id"] == source_document["id"]:
+                        continue
+                    quote = content[match.start() : match.end()]
+                    chunk = next(
+                        (
+                            item
+                            for item in note_chunks
+                            if item["start_offset"] <= match.start() < item["end_offset"]
+                        ),
+                        None,
+                    )
+                    if not chunk:
+                        continue
+                    mention_id = self._graph_row_id(
+                        vault_key,
+                        path,
+                        target["id"],
+                        str(match.start()),
+                        str(match.end()),
+                        prefix="mention",
+                    )
+                    mentions.append(
+                        {
+                            "id": mention_id,
+                            "path": path,
+                            "chunk_id": str((chunk or {}).get("id", "")),
+                            "entity_id": target["id"],
+                            "start_offset": match.start(),
+                            "end_offset": match.end(),
+                            "quote": quote,
+                            "content_hash": str(note.get("content_hash", "")),
+                            "source_kind": "structural",
+                            "confidence": 1.0,
+                        }
+                    )
+                    entities[target["id"]]["paths"].add(path)
+                    if target["id"] in seen_targets:
+                        continue
+                    seen_targets.add(target["id"])
+                    edges.append(
+                        {
+                            "id": self._graph_row_id(
+                                vault_key,
+                                source_document["id"],
+                                "references_named_document",
+                                target["id"],
+                                prefix="edge",
+                            ),
+                            "source_id": source_document["id"],
+                            "predicate": "references_named_document",
+                            "target_id": target["id"],
+                            "source_type": "document",
+                            "target_type": "document",
+                            "description": (
+                                f"{source_document['title']} explicitly names {target['title']}"
+                            ),
+                            "evidence": quote,
+                            "source_path": path,
+                            "source_chunk_id": str((chunk or {}).get("id", "")),
+                            "start_offset": match.start(),
+                            "end_offset": match.end(),
+                            "content_hash": str(note.get("content_hash", "")),
+                        }
+                    )
+
+        with self.db.transaction() as connection:
+            for table in (
+                "vault_graph_chunks",
+                "vault_graph_mentions",
+                "vault_graph_edges",
+                "vault_graph_entities",
+                "vault_graph_state",
+                "vault_graph_hierarchy",
+            ):
+                connection.execute(f"DELETE FROM {table} WHERE vault_key = ?", (vault_key,))
+            connection.executemany(
+                "INSERT INTO vault_graph_chunks(vault_key,id,path,ordinal,heading,start_offset,"
+                "end_offset,text,text_hash,content_hash,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                [
+                    (
+                        vault_key,
+                        item["id"],
+                        item["path"],
+                        item["ordinal"],
+                        item["heading"],
+                        item["start_offset"],
+                        item["end_offset"],
+                        item["text"],
+                        item["text_hash"],
+                        item["content_hash"],
+                        now,
+                        now,
+                    )
+                    for item in chunks
+                ],
+            )
+            connection.executemany(
+                "INSERT INTO vault_graph_entities(vault_key,id,name,entity_type,aliases_json,"
+                "descriptions_json,document_frequency,specificity,source_kind,created_at,"
+                "updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                [
+                    (
+                        vault_key,
+                        item["id"],
+                        item["name"],
+                        item["entity_type"],
+                        json.dumps(item["aliases"][:40], ensure_ascii=False),
+                        json.dumps(item["descriptions"][:20], ensure_ascii=False),
+                        len(item["paths"]),
+                        round(1.0 - len(item["paths"]) / note_count, 4),
+                        "structural",
+                        now,
+                        now,
+                    )
+                    for item in entities.values()
+                ],
+            )
+            connection.executemany(
+                "INSERT INTO vault_graph_mentions(vault_key,id,path,chunk_id,entity_id,"
+                "start_offset,end_offset,quote,content_hash,source_kind,confidence,created_at,"
+                "updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [
+                    (
+                        vault_key,
+                        item["id"],
+                        item["path"],
+                        item["chunk_id"],
+                        item["entity_id"],
+                        item["start_offset"],
+                        item["end_offset"],
+                        item["quote"],
+                        item["content_hash"],
+                        item["source_kind"],
+                        item["confidence"],
+                        now,
+                        now,
+                    )
+                    for item in mentions
+                ],
+            )
+            connection.executemany(
+                "INSERT INTO vault_graph_edges(vault_key,id,source_id,predicate,target_id,"
+                "source_type,target_type,description,evidence,source_path,source_chunk_id,"
+                "start_offset,end_offset,content_hash,confidence,source_kind,created_at,"
+                "updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [
+                    (
+                        vault_key,
+                        item["id"],
+                        item["source_id"],
+                        item["predicate"],
+                        item["target_id"],
+                        item["source_type"],
+                        item["target_type"],
+                        item["description"],
+                        item["evidence"],
+                        item["source_path"],
+                        item["source_chunk_id"],
+                        item["start_offset"],
+                        item["end_offset"],
+                        item["content_hash"],
+                        1.0,
+                        "structural",
+                        now,
+                        now,
+                    )
+                    for item in edges
+                ],
+            )
+            connection.executemany(
+                "INSERT INTO vault_graph_state(vault_key,path,content_hash,semantic_status,"
+                "updated_at) "
+                "VALUES (?,?,?,?,?)",
+                [
+                    (
+                        vault_key,
+                        str(note.get("path", "")),
+                        str(note.get("content_hash", "")),
+                        "pending",
+                        now,
+                    )
+                    for note in notes
+                ],
+            )
+            connection.executemany(
+                "INSERT INTO vault_graph_hierarchy(vault_key,path,parent_path,depth,note_count,"
+                "summary_json,updated_at) VALUES (?,?,?,?,?,?,?)",
+                [
+                    (
+                        vault_key,
+                        item["path"],
+                        item["parent_path"],
+                        item["depth"],
+                        len(item["note_paths"]),
+                        json.dumps(
+                            {
+                                "top_tags": sorted(
+                                    item["tags"].items(), key=lambda value: (-value[1], value[0])
+                                )[:20],
+                                "sample_notes": sorted(item["note_paths"])[:20],
+                            },
+                            ensure_ascii=False,
+                        ),
+                        now,
+                    )
+                    for item in hierarchy.values()
+                ],
+            )
+            self._restore_unchanged_semantic_graph(connection, vault_key, semantic_snapshot, now)
+
+    def _store_semantic_graph(
+        self,
+        vault_key: str,
+        note: dict[str, Any],
+        graph: dict[str, list[dict[str, Any]]],
+        *,
+        provider: str,
+        model_name: str,
+    ) -> None:
+        path = str(note.get("path", ""))
+        now = utc_now()
+        with self.db.transaction() as connection:
+            connection.execute(
+                "DELETE FROM vault_graph_mentions WHERE vault_key = ? AND path = ? "
+                "AND source_kind = 'semantic'",
+                (vault_key, path),
+            )
+            connection.execute(
+                "DELETE FROM vault_graph_edges WHERE vault_key = ? AND source_path = ? "
+                "AND source_kind = 'semantic'",
+                (vault_key, path),
+            )
+            for entity in graph.get("entities", []):
+                existing = connection.execute(
+                    "SELECT aliases_json, descriptions_json, source_kind FROM vault_graph_entities "
+                    "WHERE vault_key = ? AND id = ?",
+                    (vault_key, entity["id"]),
+                ).fetchone()
+                old_aliases = json.loads(existing["aliases_json"] or "[]") if existing else []
+                old_descriptions = (
+                    json.loads(existing["descriptions_json"] or "[]") if existing else []
+                )
+                aliases = list(dict.fromkeys([*old_aliases, *entity.get("aliases", [])]))[:40]
+                descriptions = list(
+                    dict.fromkeys([*old_descriptions, *entity.get("descriptions", [])])
+                )[:20]
+                connection.execute(
+                    "INSERT INTO vault_graph_entities(vault_key,id,name,entity_type,aliases_json,"
+                    "descriptions_json,source_kind,created_at,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(vault_key,id) DO UPDATE SET name=excluded.name, "
+                    "entity_type=excluded.entity_type, aliases_json=excluded.aliases_json, "
+                    "descriptions_json=excluded.descriptions_json, source_kind=CASE WHEN "
+                    "vault_graph_entities.source_kind='structural' THEN 'structural+semantic' "
+                    "ELSE 'semantic' END, updated_at=excluded.updated_at",
+                    (
+                        vault_key,
+                        entity["id"],
+                        entity["name"],
+                        entity["type"],
+                        json.dumps(aliases, ensure_ascii=False),
+                        json.dumps(descriptions, ensure_ascii=False),
+                        "semantic",
+                        now,
+                        now,
+                    ),
+                )
+            for mention in graph.get("mentions", []):
+                mention_id = self._graph_row_id(
+                    vault_key,
+                    path,
+                    mention["entity_id"],
+                    str(mention["start_offset"]),
+                    str(mention["end_offset"]),
+                    prefix="mention",
+                )
+                chunk = connection.execute(
+                    "SELECT id FROM vault_graph_chunks WHERE vault_key=? AND path=? "
+                    "AND start_offset<=? AND end_offset>? ORDER BY ordinal LIMIT 1",
+                    (vault_key, path, mention["start_offset"], mention["start_offset"]),
+                ).fetchone()
+                connection.execute(
+                    "INSERT OR REPLACE INTO vault_graph_mentions(vault_key,id,path,chunk_id,"
+                    "entity_id,start_offset,end_offset,quote,content_hash,source_kind,confidence,"
+                    "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        vault_key,
+                        mention_id,
+                        path,
+                        str(chunk["id"] if chunk else ""),
+                        mention["entity_id"],
+                        mention["start_offset"],
+                        mention["end_offset"],
+                        mention["quote"],
+                        mention["content_hash"],
+                        "semantic",
+                        mention["confidence"],
+                        now,
+                        now,
+                    ),
+                )
+            for edge in graph.get("claims", []):
+                connection.execute(
+                    "INSERT OR REPLACE INTO vault_graph_edges(vault_key,id,source_id,predicate,"
+                    "target_id,source_type,target_type,description,evidence,source_path,"
+                    "source_chunk_id,start_offset,end_offset,content_hash,confidence,valid_from,"
+                    "valid_to,state,source_kind,created_at,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        vault_key,
+                        edge["id"],
+                        edge["source_id"],
+                        edge["predicate"],
+                        edge["target_id"],
+                        edge["source_type"],
+                        edge["target_type"],
+                        edge["description"],
+                        edge["evidence"],
+                        path,
+                        edge["source_chunk_id"],
+                        edge["start_offset"],
+                        edge["end_offset"],
+                        edge["content_hash"],
+                        edge["confidence"],
+                        edge["valid_from"],
+                        edge["valid_to"],
+                        edge["state"],
+                        "semantic",
+                        now,
+                        now,
+                    ),
+                )
+            connection.execute(
+                "INSERT INTO vault_graph_state(vault_key,path,content_hash,semantic_status,"
+                "provider,"
+                "model_name,error,extracted_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(vault_key,path) DO UPDATE SET content_hash=excluded.content_hash,"
+                "semantic_status='ready',provider=excluded.provider,model_name=excluded.model_name,"
+                "error='',extracted_at=excluded.extracted_at,updated_at=excluded.updated_at",
+                (
+                    vault_key,
+                    path,
+                    str(note.get("content_hash", "")),
+                    "ready",
+                    provider,
+                    model_name,
+                    "",
+                    now,
+                    now,
+                ),
+            )
+
+    def _mark_semantic_graph_failed(self, vault_key: str, note: dict[str, Any], error: str) -> None:
+        self.db.execute(
+            "UPDATE vault_graph_state SET semantic_status='failed', error=?, updated_at=? "
+            "WHERE vault_key=? AND path=?",
+            (error[:1000], utc_now(), vault_key, str(note.get("path", ""))),
+        )
+
+    def _refresh_graph_statistics(self, vault_key: str, note_count: int) -> None:
+        """Recompute entity rarity after semantic mentions from the complete vault are stored."""
+
+        rows = self.db.query_all(
+            "SELECT id,entity_type,document_frequency,source_kind FROM vault_graph_entities "
+            "WHERE vault_key=?",
+            (vault_key,),
+        )
+        paths_by_entity: dict[str, set[str]] = {}
+        for row in self.db.query_all(
+            "SELECT entity_id,path FROM vault_graph_mentions WHERE vault_key=?",
+            (vault_key,),
+        ):
+            paths_by_entity.setdefault(str(row["entity_id"]), set()).add(str(row["path"]))
+        for row in self.db.query_all(
+            "SELECT source_id,target_id,source_path FROM vault_graph_edges WHERE vault_key=?",
+            (vault_key,),
+        ):
+            path = str(row["source_path"])
+            paths_by_entity.setdefault(str(row["source_id"]), set()).add(path)
+            paths_by_entity.setdefault(str(row["target_id"]), set()).add(path)
+        total = max(1, note_count)
+        updates: list[tuple[int, float, str, str]] = []
+        for row in rows:
+            observed = len(paths_by_entity.get(str(row["id"]), set()))
+            if row["entity_type"] == "document":
+                frequency = 1
+            else:
+                frequency = max(
+                    observed,
+                    int(row["document_frequency"])
+                    if str(row["source_kind"]).startswith("structural")
+                    else 0,
+                )
+            updates.append(
+                (
+                    frequency,
+                    round(max(0.0, min(1.0, 1.0 - frequency / total)), 4),
+                    vault_key,
+                    str(row["id"]),
+                )
+            )
+        with self.db.transaction() as connection:
+            connection.executemany(
+                "UPDATE vault_graph_entities SET document_frequency=?,specificity=?,updated_at=? "
+                "WHERE vault_key=? AND id=?",
+                [
+                    (frequency, specificity, utc_now(), key, entity_id)
+                    for frequency, specificity, key, entity_id in updates
+                ],
+            )
+
+    def _consolidate_graph_aliases(self, vault_key: str) -> None:
+        """Merge exact, evidenced aliases without fuzzy-merging same-named entities."""
+
+        rows = self.db.query_all(
+            "SELECT * FROM vault_graph_entities WHERE vault_key=? AND entity_type!='document'",
+            (vault_key,),
+        )
+        by_id = {str(row["id"]): row for row in rows}
+
+        def key(value: str) -> str:
+            return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+
+        names: dict[tuple[str, str], list[str]] = {}
+        for row in rows:
+            normalized = key(str(row["name"]))
+            if normalized:
+                names.setdefault((str(row["entity_type"]), normalized), []).append(str(row["id"]))
+        parents = {entity_id: entity_id for entity_id in by_id}
+
+        def find(entity_id: str) -> str:
+            while parents[entity_id] != entity_id:
+                parents[entity_id] = parents[parents[entity_id]]
+                entity_id = parents[entity_id]
+            return entity_id
+
+        def union(left: str, right: str) -> None:
+            left_root, right_root = find(left), find(right)
+            if left_root != right_root:
+                parents[right_root] = left_root
+
+        for row in rows:
+            for alias in json.loads(row["aliases_json"] or "[]"):
+                targets = names.get((str(row["entity_type"]), key(str(alias))), [])
+                if len(targets) == 1 and targets[0] != row["id"]:
+                    union(str(row["id"]), targets[0])
+        components: dict[str, list[str]] = {}
+        for entity_id in by_id:
+            components.setdefault(find(entity_id), []).append(entity_id)
+        now = utc_now()
+        with self.db.transaction() as connection:
+            for entity_ids in components.values():
+                if len(entity_ids) < 2:
+                    continue
+                canonical = max(
+                    entity_ids,
+                    key=lambda entity_id: (
+                        len(key(str(by_id[entity_id]["name"])).split()),
+                        len(key(str(by_id[entity_id]["name"]))),
+                        entity_id,
+                    ),
+                )
+                canonical_row = by_id[canonical]
+                aliases: list[str] = json.loads(canonical_row["aliases_json"] or "[]")
+                descriptions: list[str] = json.loads(canonical_row["descriptions_json"] or "[]")
+                for duplicate in entity_ids:
+                    if duplicate == canonical:
+                        continue
+                    duplicate_row = by_id[duplicate]
+                    aliases.extend(
+                        [
+                            str(duplicate_row["name"]),
+                            *json.loads(duplicate_row["aliases_json"] or "[]"),
+                        ]
+                    )
+                    descriptions.extend(json.loads(duplicate_row["descriptions_json"] or "[]"))
+                    connection.execute(
+                        "UPDATE vault_graph_mentions SET entity_id=? WHERE vault_key=? "
+                        "AND entity_id=?",
+                        (canonical, vault_key, duplicate),
+                    )
+                    connection.execute(
+                        "UPDATE vault_graph_edges SET source_id=? WHERE vault_key=? "
+                        "AND source_id=?",
+                        (canonical, vault_key, duplicate),
+                    )
+                    connection.execute(
+                        "UPDATE vault_graph_edges SET target_id=? WHERE vault_key=? "
+                        "AND target_id=?",
+                        (canonical, vault_key, duplicate),
+                    )
+                    connection.execute(
+                        "DELETE FROM vault_graph_entities WHERE vault_key=? AND id=?",
+                        (vault_key, duplicate),
+                    )
+                clean_aliases = [
+                    value
+                    for value in dict.fromkeys(aliases)
+                    if key(value) and key(value) != key(str(canonical_row["name"]))
+                ][:40]
+                connection.execute(
+                    "UPDATE vault_graph_entities SET aliases_json=?,descriptions_json=?,"
+                    "source_kind='semantic',updated_at=? WHERE vault_key=? AND id=?",
+                    (
+                        json.dumps(clean_aliases, ensure_ascii=False),
+                        json.dumps(list(dict.fromkeys(descriptions))[:20], ensure_ascii=False),
+                        now,
+                        vault_key,
+                        canonical,
+                    ),
+                )
+
+    def _attach_graph_memory(self, vault_key: str, notes: list[dict[str, Any]]) -> None:
+        entity_rows = self.db.query_all(
+            "SELECT * FROM vault_graph_entities WHERE vault_key = ?", (vault_key,)
+        )
+        entities = {row["id"]: row for row in entity_rows}
+        mentions_by_path: dict[str, list[dict[str, Any]]] = {}
+        for row in self.db.query_all(
+            "SELECT * FROM vault_graph_mentions WHERE vault_key = ? ORDER BY path,start_offset",
+            (vault_key,),
+        ):
+            entity = entities.get(row["entity_id"], {})
+            mentions_by_path.setdefault(str(row["path"]), []).append(
+                {
+                    **row,
+                    "entity_name": str(entity.get("name", "")),
+                    "entity_type": str(entity.get("entity_type", "")),
+                    "aliases": json.loads(entity.get("aliases_json") or "[]"),
+                }
+            )
+        predicate_feedback = {
+            str(row["feature_value"]): row
+            for row in self.db.query_all(
+                "SELECT * FROM vault_graph_feedback WHERE vault_key=? AND feature_type='predicate'",
+                (vault_key,),
+            )
+        }
+        edges_by_path: dict[str, list[dict[str, Any]]] = {}
+        for row in self.db.query_all(
+            "SELECT * FROM vault_graph_edges WHERE vault_key = ? AND state != 'superseded' "
+            "ORDER BY source_path,predicate,id",
+            (vault_key,),
+        ):
+            source = entities.get(row["source_id"], {})
+            target = entities.get(row["target_id"], {})
+            learned = predicate_feedback.get(str(row["predicate"]), {})
+            learned_count = int(learned.get("approvals", 0)) + int(learned.get("rejections", 0))
+            edges_by_path.setdefault(str(row["source_path"]), []).append(
+                {
+                    **row,
+                    "feedback_weight": float(learned.get("weight", 0.5))
+                    if learned_count >= 2
+                    else float(row.get("feedback_weight", 0.5)),
+                    "source_name": str(source.get("name", "")),
+                    "target_name": str(target.get("name", "")),
+                }
+            )
+        state_by_path = {
+            str(row["path"]): row
+            for row in self.db.query_all(
+                "SELECT * FROM vault_graph_state WHERE vault_key = ?", (vault_key,)
+            )
+        }
+        for note in notes:
+            path = str(note.get("path", ""))
+            document_id = canonical_entity_id(
+                "document", str(note.get("title", Path(path).stem)), scope=path
+            )
+            mentioned_ids = {row["entity_id"] for row in mentions_by_path.get(path, [])}
+            node_ids = {document_id, *mentioned_ids}
+            note["persistent_graph_nodes"] = [
+                {
+                    "id": row["id"],
+                    "name": row["name"],
+                    "type": row["entity_type"],
+                    "aliases": json.loads(row.get("aliases_json") or "[]"),
+                    "document_frequency": int(row.get("document_frequency", 0)),
+                    "specificity": float(row.get("specificity", 0.0)),
+                    "feedback_weight": float(row.get("feedback_weight", 0.5)),
+                }
+                for entity_id in node_ids
+                if (row := entities.get(entity_id))
+            ]
+            note["graph_mentions"] = mentions_by_path.get(path, [])
+            note["graph_edges"] = edges_by_path.get(path, [])
+            note["graph_version"] = 2
+            note["semantic_graph_status"] = str(
+                state_by_path.get(path, {}).get("semantic_status", "pending")
+            )
+
+    @staticmethod
+    def _graph_ontology_predicates(vault_model: dict[str, Any]) -> set[str]:
+        predicates = set(BASE_GRAPH_PREDICATES)
+        for item in vault_model.get("relationship_types", []):
+            if not isinstance(item, dict):
+                continue
+            predicate = re.sub(
+                r"[^a-z0-9_]+", "_", str(item.get("predicate", "")).casefold()
+            ).strip("_")
+            if predicate and re.fullmatch(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*", predicate):
+                predicates.add(predicate)
+        return predicates
+
     async def _scan_local_vault(self, sweep_id: str, *, full_rebuild: bool) -> bool:
         vault = self.settings.vault_path
         paths = sorted(
@@ -581,6 +1582,8 @@ class ObsyncService:
                 "UPDATE vault_sweeps SET changed_notes = ?, updated_at = ? WHERE id = ?",
                 (result["changed"], utc_now(), sweep_id),
             )
+            indexed_notes = self._reparse_indexed_notes("local")
+            self._replace_structural_graph("local", indexed_notes)
         return not stopped
 
     async def _wait_for_command(self, command_id: str, sweep_id: str) -> bool:
@@ -1062,6 +2065,125 @@ class ObsyncService:
                 )
         return change_ids
 
+    async def _enrich_semantic_graph(
+        self,
+        sweep_id: str,
+        notes: list[dict[str, Any]],
+        analyzer: LLMAnalyzer,
+        vault_model: dict[str, Any],
+        *,
+        noncanonical_paths: set[str],
+    ) -> None:
+        """Build and persist grounded factual claims before relationship selection."""
+
+        vault_key = self._vault_key()
+        states = {
+            str(row["path"]): row
+            for row in self.db.query_all(
+                "SELECT * FROM vault_graph_state WHERE vault_key = ?", (vault_key,)
+            )
+        }
+        allowed_predicates = self._graph_ontology_predicates(vault_model)
+        total = len(notes)
+        for index, note in enumerate(notes, start=1):
+            if self._sweep_stop.is_set():
+                return
+            path = str(note.get("path", ""))
+            if path in noncanonical_paths:
+                continue
+            state = states.get(path, {})
+            if state.get("semantic_status") == "ready" and state.get("content_hash") == note.get(
+                "content_hash"
+            ):
+                continue
+            self.db.execute(
+                "UPDATE vault_sweeps SET total_notes=?, current_note=?, updated_at=? WHERE id=?",
+                (total, path, utc_now(), sweep_id),
+            )
+            self._update_sweep_inference(
+                sweep_id,
+                "stage",
+                f"Building factual graph {index} of {total}: {path}",
+                phase="graph",
+                phase_label=f"Building factual graph {index} of {total}",
+                current_note=path,
+            )
+            try:
+                ai_task = asyncio.create_task(
+                    analyzer.extract_note_graph(
+                        note,
+                        vault_model=vault_model,
+                        allowed_predicates=allowed_predicates,
+                    )
+                )
+                self._sweep_ai_task = ai_task
+                try:
+                    graph = await ai_task
+                finally:
+                    if self._sweep_ai_task is ai_task:
+                        self._sweep_ai_task = None
+                self._store_semantic_graph(
+                    vault_key,
+                    note,
+                    graph,
+                    provider=analyzer.config.provider,
+                    model_name=analyzer.config.model,
+                )
+            except Exception as exc:
+                message = str(exc).strip() or type(exc).__name__
+                self._mark_semantic_graph_failed(vault_key, note, message)
+                self.db.add_event(
+                    "vault.graph_extraction_failed",
+                    f"Skipped factual graph extraction for {path}: {message}",
+                    level="warning",
+                    details={"sweep_id": sweep_id, "path": path},
+                )
+                self._update_sweep_inference(
+                    sweep_id,
+                    "error",
+                    f"Factual graph extraction skipped {path}: {message}",
+                    phase="graph",
+                    phase_label=f"Building factual graph {index} of {total}",
+                    current_note=path,
+                )
+            await asyncio.sleep(0)
+
+        self._consolidate_graph_aliases(vault_key)
+        self._refresh_graph_statistics(vault_key, len(notes))
+        self._attach_graph_memory(vault_key, notes)
+
+    def _record_graph_feedback(
+        self, operations: list[dict[str, Any]], *, approved_ids: set[str]
+    ) -> None:
+        vault_key = self._vault_key()
+        now = utc_now()
+        with self.db.transaction() as connection:
+            for operation in operations:
+                approved = str(operation.get("operation_id", "")) in approved_ids
+                for feature_type, feature_value in feedback_feature_keys(operation):
+                    if not feature_type or not feature_value:
+                        continue
+                    connection.execute(
+                        "INSERT INTO vault_graph_feedback(vault_key,feature_type,feature_value,"
+                        "approvals,rejections,weight,updated_at) VALUES (?,?,?,?,?,?,?) "
+                        "ON CONFLICT(vault_key,feature_type,feature_value) DO UPDATE SET "
+                        "approvals=vault_graph_feedback.approvals+excluded.approvals,"
+                        "rejections=vault_graph_feedback.rejections+excluded.rejections,"
+                        "weight=CAST(vault_graph_feedback.approvals+excluded.approvals+1 AS REAL)/"
+                        "(vault_graph_feedback.approvals+excluded.approvals+"
+                        "vault_graph_feedback.rejections+excluded.rejections+2),"
+                        "updated_at=excluded.updated_at",
+                        (
+                            vault_key,
+                            feature_type,
+                            feature_value,
+                            int(approved),
+                            int(not approved),
+                            2 / 3 if approved else 1 / 3,
+                            now,
+                        ),
+                    )
+
     async def _generate_maintenance_changes(self, sweep_id: str) -> list[str]:
         notes = self._reparse_indexed_notes(self._vault_key())
         if notes:
@@ -1074,11 +2196,18 @@ class ObsyncService:
                 (utc_now(), sweep_id),
             )
             return []
+        graph_count = self.db.query_one(
+            "SELECT count(*) AS count FROM vault_graph_chunks WHERE vault_key = ?",
+            (self._vault_key(),),
+        )
+        if not graph_count or int(graph_count["count"]) == 0:
+            self._replace_structural_graph(self._vault_key(), notes)
+        self._attach_graph_memory(self._vault_key(), notes)
         sweep = self.db.query_one("SELECT sweep_type FROM vault_sweeps WHERE id = ?", (sweep_id,))
         sweep_type = str(sweep.get("sweep_type") if sweep else "maintenance")
         self._start_sweep_inference(sweep_id, sweep_type)
         try:
-            maximum = max(1, min(int(self.db.get_setting("vault_link_limit", "8")), 20))
+            maximum = max(1, min(int(self.db.get_setting("vault_link_limit", "3")), 20))
             candidate_limit = max(
                 5,
                 min(
@@ -1094,7 +2223,7 @@ class ObsyncService:
                 ),
             )
         except ValueError:
-            maximum, candidate_limit, minimum_confidence = 8, 20, 0.72
+            maximum, candidate_limit, minimum_confidence = 3, 20, 0.72
         categories_raw = self.db.get_setting("vault_maintenance_categories", "[]")
         try:
             categories = set(json.loads(categories_raw))
@@ -1122,6 +2251,21 @@ class ObsyncService:
                 phase="relationships",
                 phase_label="Analyzing note relationships",
             ),
+        )
+        await self._enrich_semantic_graph(
+            sweep_id,
+            notes,
+            analyzer,
+            vault_model,
+            noncanonical_paths=noncanonical_paths,
+        )
+        if self._sweep_stop.is_set():
+            return change_ids
+        search_index = AdaptiveVaultIndex(notes, noncanonical_paths=noncanonical_paths)
+        self.db.execute(
+            "UPDATE vault_sweeps SET processed_notes=0,current_note='',recommendations=?,"
+            "changed_notes=?,updated_at=? WHERE id=?",
+            (len(change_ids), len(change_ids), utc_now(), sweep_id),
         )
         failures = 0
         failure_messages: list[str] = []
@@ -1209,18 +2353,45 @@ class ObsyncService:
                 continue
             relationships = decision.get("relationships", []) if "links" in categories else []
             if "links" in categories:
+                bounded_relationships: list[dict[str, Any]] = []
+                used_contexts: set[str] = set()
+                for relationship in relationships:
+                    context_key = (
+                        re.sub(r"\s+", " ", str(relationship.get("anchor_context", "")))
+                        .strip()
+                        .casefold()
+                    )
+                    if context_key and context_key in used_contexts:
+                        continue
+                    bounded_relationships.append(relationship)
+                    if context_key:
+                        used_contexts.add(context_key)
+                    if len(bounded_relationships) >= maximum:
+                        break
+                relationships = bounded_relationships
                 existing_targets = {
                     str(relationship.get("target", "")).casefold() for relationship in relationships
                 }
                 for explicit in [
-                    *explicit_reciprocal_relationships(note, candidates),
                     *explicit_category_hub_relationships(note, candidates),
                     *explicit_reference_relationships(note, candidates),
                 ]:
                     key = str(explicit.get("target", "")).casefold()
-                    if key and key not in existing_targets:
+                    context_key = (
+                        re.sub(r"\s+", " ", str(explicit.get("anchor_context", "")))
+                        .strip()
+                        .casefold()
+                    )
+                    if (
+                        len(relationships) < maximum
+                        and key
+                        and key not in existing_targets
+                        and (not context_key or context_key not in used_contexts)
+                    ):
                         relationships.append(explicit)
                         existing_targets.add(key)
+                        if context_key:
+                            used_contexts.add(context_key)
             tag_decisions = decision.get("suggested_tags", []) if "tags" in categories else []
             allowed_tag_keys = {
                 normalize_obsidian_tag(tag).casefold()
@@ -1313,7 +2484,12 @@ class ObsyncService:
                 )
                 operation["evidence"] = list(metadata.get("evidence", []))
                 operation["confidence"] = float(metadata.get("confidence", 1.0))
-                for graph_field in ("source_entity", "target_entity", "predicate"):
+                for graph_field in (
+                    "source_entity",
+                    "target_entity",
+                    "predicate",
+                    "graph_edge_id",
+                ):
                     if metadata.get(graph_field):
                         operation[graph_field] = str(metadata[graph_field])
             actual_link_keys = {
@@ -1460,6 +2636,22 @@ class ObsyncService:
                         change_type="index-membership",
                     )
                 )
+            live_counts = self.db.query_one(
+                "SELECT count(*) AS recommendations,count(DISTINCT path) AS changed_notes "
+                "FROM vault_changes WHERE sweep_id=?",
+                (sweep_id,),
+            ) or {"recommendations": 0, "changed_notes": 0}
+            self.db.execute(
+                "UPDATE vault_sweeps SET recommendations=?,changed_notes=?,processed_notes=?,"
+                "updated_at=? WHERE id=?",
+                (
+                    int(live_counts["recommendations"]),
+                    int(live_counts["changed_notes"]),
+                    index,
+                    utc_now(),
+                    sweep_id,
+                ),
+            )
             await asyncio.sleep(0)
         if attempted and failures == attempted:
             detail = failure_messages[-1] if failure_messages else "Unknown Local AI error"
@@ -1646,6 +2838,10 @@ class ObsyncService:
             raise ValueError("Vault recommendation not found")
         if change["status"] != "pending":
             raise ValueError("Vault recommendation has already been reviewed")
+        original_decision = json.loads(change.get("decision_json") or "{}")
+        original_operations = [
+            item for item in original_decision.get("operations", []) if isinstance(item, dict)
+        ]
         if selected_operation_ids is not None:
             change = self._select_change_operations(change, selected_operation_ids)
         if change["change_type"] == "duplicate-finding":
@@ -1702,9 +2898,23 @@ class ObsyncService:
             f"Applied vault recommendation to {change['path']}",
             details={"change_id": change_id, "sweep_id": change["sweep_id"]},
         )
+        applied_decision = json.loads(change.get("decision_json") or "{}")
+        approved_ids = {
+            str(item.get("operation_id", ""))
+            for item in applied_decision.get("operations", [])
+            if isinstance(item, dict) and str(item.get("operation_id", ""))
+        }
+        self._record_graph_feedback(original_operations, approved_ids=approved_ids)
         return {"ok": True, "id": change_id, "status": "applied"}
 
     def reject_vault_change(self, change_id: str) -> dict[str, Any]:
+        change = self.db.query_one(
+            "SELECT decision_json FROM vault_changes WHERE id=? AND status='pending'", (change_id,)
+        )
+        if not change:
+            raise ValueError("Pending vault recommendation not found")
+        decision = json.loads(change.get("decision_json") or "{}")
+        operations = [item for item in decision.get("operations", []) if isinstance(item, dict)]
         changed = self.db.execute(
             "UPDATE vault_changes SET status = 'rejected', reviewed_at = ? "
             "WHERE id = ? AND status = 'pending'",
@@ -1712,6 +2922,7 @@ class ObsyncService:
         )
         if not changed:
             raise ValueError("Pending vault recommendation not found")
+        self._record_graph_feedback(operations, approved_ids=set())
         return {"ok": True, "id": change_id, "status": "rejected"}
 
     async def undo_vault_sweep(self, sweep_id: str) -> dict[str, Any]:
@@ -2113,6 +3324,7 @@ class ObsyncService:
                     for note in notes
                 ],
             )
+        self._replace_structural_graph(agent_id, self._reparse_indexed_notes(agent_id))
         previous = int(before["count"] if before else 0)
         return {"notes": len(notes), "removed": max(0, previous - len(notes))}
 
@@ -4326,13 +5538,13 @@ class ObsyncService:
                 )
                 maximum_links = min(
                     active_profile.related_notes_limit,
-                    int(self.db.get_setting("vault_link_limit", "8")),
+                    int(self.db.get_setting("vault_link_limit", "3")),
                     50,
                 )
             except ValueError:
                 minimum_relationship_confidence, maximum_links = (
                     0.72,
-                    min(active_profile.related_notes_limit, 8),
+                    min(active_profile.related_notes_limit, 3),
                 )
             analysis.relationships = [
                 relationship

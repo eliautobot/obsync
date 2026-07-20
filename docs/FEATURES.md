@@ -40,10 +40,13 @@ Obsync is a one-way, continuously reconciled knowledge pipeline from arbitrary f
 - Visible profile prompts, prompt template, provider parameters, context limits, and output behavior
 - Per-profile Obsidian controls for vault context, `[[wikilinks]]`, tags, properties, folders, and source details
 - Persistent whole-vault indexing of full note content, headings, aliases, properties, tags, folders, links, backlinks, named entities, stable identifiers, hashes, and modification times
+- Persistent heading-aware graph chunks, canonical nodes, exact entity mentions, typed factual edges, quote/offset/hash provenance, temporal state, entity frequency, and folder hierarchy
+- Two-pass Maintenance analysis: conservative factual extraction first, supported-edge link selection second
+- Incremental semantic reuse for unchanged note hashes and hybrid graph-plus-corpus candidate retrieval
 - Whole-vault relevance ranking with bounded full-content context and exact path-qualified link validation
 - Adaptive per-vault Local AI organization models with no compiled business taxonomy or folder convention
 - Corpus-adaptive candidate retrieval separated from relationship decisions, so similarity alone never creates a link
-- Evidence-gated links requiring an exact target, an exact existing phrase in the source note, a specific relationship, grounded source/target facts, configurable confidence, and a safety ceiling up to 20
+- Evidence-gated links requiring a precomputed edge ID, canonical endpoints, allowed predicate, exact existing source phrase, grounded source/target facts, configurable confidence, and a default safety ceiling of three
 - Read-only Index Sweeps plus live Maintenance Sweep inference with streamed provider reasoning/output, processing stages, validated decisions, errors, current-note context, and independent follow-latest controls
 - Context-grounded anchor validation that rejects dates, numbers, metadata labels, generic words, protected Markdown, duplicate existing links, and source sentences that do not support the target
 - Current-Markdown metadata rebuilding, human-tag-only learning, exact duplicate detection, review-only folder/index recommendations, and per-operation approval
@@ -59,7 +62,7 @@ Each document receives:
 - Optional category, tags, related-note wikilinks, YAML properties, and source details according to the profile
 - A manual section that Obsync preserves across updates
 
-Approved maintenance uses native Obsidian Markdown only: exact contextual body phrases become inline path-qualified `[[wikilinks]]`, and independently evidenced tags join the existing YAML frontmatter. It adds no visible Obsync maintenance section. Exact duplicates, folder placement, and index membership remain explicit review operations and never auto-delete or auto-merge notes. Operation ownership is stored in SQLite so later source sync can rebase only edits that still exist; a human-removed link or tag is not resurrected.
+Approved maintenance uses native Obsidian Markdown only: exact contextual body phrases become inline path-qualified `[[wikilinks]]`, and independently evidenced tags join the existing YAML frontmatter. It adds no visible Obsync maintenance section. Legacy block-only tags are migrated into YAML before marked-block cleanup can be applied. Exact duplicates, folder placement, and index membership remain explicit review operations and never auto-delete or auto-merge notes. Operation ownership is stored in SQLite so later source sync can rebase only edits that still exist; a human-removed link or tag is not resurrected.
 
 New notes reuse a strongly related existing vault folder when the index supplies a validated high-confidence context; otherwise they use the configured destination/device/root/category fallback. Their destination remains stable on later edits, preventing routine reclassification from breaking backlinks.
 

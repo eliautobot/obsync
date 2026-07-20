@@ -74,6 +74,133 @@ CREATE TABLE IF NOT EXISTS vault_models (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS vault_graph_chunks (
+    vault_key TEXT NOT NULL,
+    id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    heading TEXT NOT NULL DEFAULT '',
+    start_offset INTEGER NOT NULL,
+    end_offset INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    text_hash TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(vault_key, id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_graph_chunks_path
+ON vault_graph_chunks(vault_key, path, ordinal);
+
+CREATE TABLE IF NOT EXISTS vault_graph_entities (
+    vault_key TEXT NOT NULL,
+    id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    aliases_json TEXT NOT NULL DEFAULT '[]',
+    descriptions_json TEXT NOT NULL DEFAULT '[]',
+    document_frequency INTEGER NOT NULL DEFAULT 0,
+    specificity REAL NOT NULL DEFAULT 0,
+    feedback_weight REAL NOT NULL DEFAULT 0.5,
+    source_kind TEXT NOT NULL DEFAULT 'structural',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(vault_key, id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_graph_entities_name
+ON vault_graph_entities(vault_key, name COLLATE NOCASE);
+
+CREATE TABLE IF NOT EXISTS vault_graph_mentions (
+    vault_key TEXT NOT NULL,
+    id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    chunk_id TEXT NOT NULL DEFAULT '',
+    entity_id TEXT NOT NULL,
+    start_offset INTEGER NOT NULL,
+    end_offset INTEGER NOT NULL,
+    quote TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    source_kind TEXT NOT NULL DEFAULT 'structural',
+    confidence REAL NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(vault_key, id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_graph_mentions_entity
+ON vault_graph_mentions(vault_key, entity_id, path);
+
+CREATE TABLE IF NOT EXISTS vault_graph_edges (
+    vault_key TEXT NOT NULL,
+    id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    predicate TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    evidence TEXT NOT NULL DEFAULT '',
+    source_path TEXT NOT NULL,
+    source_chunk_id TEXT NOT NULL DEFAULT '',
+    start_offset INTEGER NOT NULL DEFAULT 0,
+    end_offset INTEGER NOT NULL DEFAULT 0,
+    content_hash TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 0,
+    feedback_weight REAL NOT NULL DEFAULT 0.5,
+    frequency INTEGER NOT NULL DEFAULT 1,
+    valid_from TEXT NOT NULL DEFAULT '',
+    valid_to TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'active',
+    source_kind TEXT NOT NULL DEFAULT 'semantic',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(vault_key, id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_graph_edges_source
+ON vault_graph_edges(vault_key, source_id, state);
+
+CREATE INDEX IF NOT EXISTS idx_vault_graph_edges_target
+ON vault_graph_edges(vault_key, target_id, state);
+
+CREATE TABLE IF NOT EXISTS vault_graph_state (
+    vault_key TEXT NOT NULL,
+    path TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    semantic_status TEXT NOT NULL DEFAULT 'pending',
+    provider TEXT NOT NULL DEFAULT '',
+    model_name TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    extracted_at TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(vault_key, path)
+);
+
+CREATE TABLE IF NOT EXISTS vault_graph_feedback (
+    vault_key TEXT NOT NULL,
+    feature_type TEXT NOT NULL,
+    feature_value TEXT NOT NULL,
+    approvals INTEGER NOT NULL DEFAULT 0,
+    rejections INTEGER NOT NULL DEFAULT 0,
+    weight REAL NOT NULL DEFAULT 0.5,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(vault_key, feature_type, feature_value)
+);
+
+CREATE TABLE IF NOT EXISTS vault_graph_hierarchy (
+    vault_key TEXT NOT NULL,
+    path TEXT NOT NULL,
+    parent_path TEXT NOT NULL DEFAULT '',
+    depth INTEGER NOT NULL DEFAULT 0,
+    note_count INTEGER NOT NULL DEFAULT 0,
+    summary_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(vault_key, path)
+);
+
 CREATE TABLE IF NOT EXISTS vault_sweeps (
     id TEXT PRIMARY KEY,
     sweep_type TEXT NOT NULL,
@@ -441,7 +568,7 @@ class Database:
                 connection.execute("ALTER TABLE enrollments ADD COLUMN agent_id TEXT")
             row = connection.execute("SELECT version FROM schema_meta LIMIT 1").fetchone()
             if row is None:
-                connection.execute("INSERT INTO schema_meta(version) VALUES (13)")
+                connection.execute("INSERT INTO schema_meta(version) VALUES (14)")
             else:
                 schema_version = int(row["version"])
             if row is not None and schema_version < 9:
@@ -526,6 +653,25 @@ class Database:
                     (utc_now(),),
                 )
                 connection.execute("UPDATE schema_meta SET version = 13")
+                schema_version = 13
+            if row is not None and schema_version < 14:
+                connection.execute(
+                    "UPDATE vault_changes SET status = 'superseded', reviewed_at = ?, "
+                    "error = 'Superseded by provenance-backed factual maintenance; run a new "
+                    "Maintenance Sweep.' WHERE status = 'pending'",
+                    (utc_now(),),
+                )
+                connection.execute(
+                    "UPDATE vault_models SET status = 'not-learned', fingerprint = '', "
+                    "corpus_fingerprint = '', updated_at = ?",
+                    (utc_now(),),
+                )
+                connection.execute(
+                    "UPDATE settings SET value='3',updated_at=? "
+                    "WHERE key='vault_link_limit' AND value='8'",
+                    (utc_now(),),
+                )
+                connection.execute("UPDATE schema_meta SET version = 14")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

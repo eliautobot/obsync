@@ -11,10 +11,74 @@ from typing import Any
 from obsync.config import Settings
 from obsync.llm import LLMAnalyzer
 from obsync.service import ObsyncService
-from obsync.vault_intelligence import content_hash
+from obsync.vault_intelligence import MAINTENANCE_END, MAINTENANCE_START, content_hash
 
-UNSAFE_ANCHORS = {"owner", "status", "updated", "current", "date", "number"}
+UNSAFE_ANCHORS = {
+    "owner",
+    "status",
+    "updated",
+    "current",
+    "date",
+    "number",
+    "who want a more",
+    "define exact free vs pro",
+    "around virtual office",
+    "draft for eli review",
+    "expose host port",
+    "goal is to keep cody",
+    "archo must perform",
+}
 LOW_VALUE_TAGS = {"ai", "business", "phase", "project", "estimate-list"}
+EXPECTED_ANCHORS = {"Workspace Backup Plan", "Ent Forge Outreach Scripts"}
+
+
+def build_fixture_vault(vault: Path, *, note_count: int = 511) -> None:
+    """Create a disposable release corpus with explicit positive and negative outcomes."""
+
+    fixtures = {
+        "Operations/Setup Checklist.md": (
+            "# Setup Checklist\n\n"
+            "- [x] Review Workspace Backup Plan before launch.\n"
+            "- [x] Update Ent Forge Outreach Scripts for the campaign.\n"
+            "- [ ] Create a backup plan for temporary exports.\n"
+            "- [ ] Help people who want a more flexible office.\n"
+            "- [ ] Define exact Free vs Pro positioning.\n"
+        ),
+        "Operations/Workspace Backup Plan.md": (
+            "# Workspace Backup Plan\n\nEncrypted recovery plan for the Ent Forge workspace.\n"
+        ),
+        "Sales/Ent Forge Outreach Scripts.md": (
+            "# Ent Forge Outreach Scripts\n\nApproved named scripts for the Ent Forge campaign.\n"
+        ),
+        "Guides/Ollama Guide.md": (
+            "---\ntags: [guide, human-tag]\n---\n# Ollama Guide\n\nLocal model setup.\n\n"
+            f"{MAINTENANCE_START}\nRelated tags: #ollama #local-ai #windows #obsync\n"
+            f"{MAINTENANCE_END}\n"
+        ),
+        "Projects/Atlas Overview.md": (
+            "# Atlas Overview\n\nReview Atlas Record before closing the project.\n"
+        ),
+        "Projects/Atlas Record.md": (
+            "# Atlas Record\n\nThe canonical record links back to [[Projects/Atlas Overview]].\n"
+        ),
+        "Product/Positioning Notes.md": (
+            "# Positioning Notes\n\nThe sentence says define exact Free vs Pro positioning.\n"
+        ),
+    }
+    if note_count < len(fixtures):
+        raise ValueError(f"note_count must be at least {len(fixtures)}")
+    for relative, content in fixtures.items():
+        path = vault / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    for number in range(1, note_count - len(fixtures) + 1):
+        path = vault / f"Archive/Record {number:04d}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"# Record {number:04d}\n\nArchive identifier ARC-{number:04d}. "
+            "Routine status text with no cross-document claim.\n",
+            encoding="utf-8",
+        )
 
 
 def vault_hashes(vault: Path) -> dict[str, str]:
@@ -98,19 +162,20 @@ def install_deterministic_scale_harness() -> None:
             )
             if not option:
                 continue
+            supports = [
+                item
+                for item in candidate.get("knowledge_graph", {}).get("supported_edges", [])
+                if isinstance(item, dict)
+                and str(item.get("anchor", "")).casefold() == str(option.get("text", "")).casefold()
+            ]
+            if not supports:
+                continue
+            support = supports[0]
             target = str(candidate.get("link_target", ""))
             anchor = str(option.get("text", ""))
             if not target or not anchor:
                 continue
             target_evidence = candidate.get("content_excerpt", candidate.get("title", target))
-            source_nodes = source_note.get("knowledge_graph", {}).get("entity_nodes", [])
-            target_nodes = candidate.get("knowledge_graph", {}).get("entity_nodes", [])
-            source_document = next(
-                (item for item in source_nodes if item.get("type") == "document"), {}
-            )
-            target_document = next(
-                (item for item in target_nodes if item.get("type") == "document"), {}
-            )
             relationships.append(
                 {
                     "target": target,
@@ -118,9 +183,10 @@ def install_deterministic_scale_harness() -> None:
                     "anchor_occurrence": int(option.get("occurrence", 0) or 0),
                     "anchor_context": str(option.get("context", "")),
                     "relationship_type": "specific-record",
-                    "source_entity": str(source_document.get("name", "")),
-                    "target_entity": str(target_document.get("name", "")),
-                    "predicate": "references_named_document",
+                    "graph_edge_id": str(support.get("id", "")),
+                    "source_entity": str(support.get("source_entity", "")),
+                    "target_entity": str(support.get("target_entity", "")),
+                    "predicate": str(support.get("predicate", "")),
                     "relationship": (
                         f"{source_note.get('title', source_note.get('path', 'Source'))} "
                         f"explicitly names {candidate.get('title', target)}"
@@ -146,11 +212,24 @@ def install_deterministic_scale_harness() -> None:
             "obsolete_owned_tags": [],
         }
 
+    async def extract_note_graph(
+        _self,
+        note: dict[str, Any],
+        *,
+        vault_model: dict[str, Any],
+        allowed_predicates: set[str],
+    ) -> dict[str, Any]:
+        del note, vault_model, allowed_predicates
+        return {"chunks": [], "entities": [], "mentions": [], "claims": []}
+
     LLMAnalyzer.learn_vault_model = learn_vault_model
     LLMAnalyzer.adjudicate_relationships = adjudicate_relationships
+    LLMAnalyzer.extract_note_graph = extract_note_graph
 
 
 async def run(args: argparse.Namespace) -> None:
+    if args.generate_fixture:
+        build_fixture_vault(args.vault, note_count=args.fixture_notes)
     if args.deterministic_scale:
         install_deterministic_scale_harness()
     before = vault_hashes(args.vault)
@@ -168,7 +247,7 @@ async def run(args: argparse.Namespace) -> None:
             "llm_timeout_seconds": (str(args.timeout), False),
             "vault_relationship_candidate_limit": (str(args.candidate_limit), False),
             "vault_relationship_min_confidence": ("0.72", False),
-            "vault_link_limit": ("8", False),
+            "vault_link_limit": ("3", False),
             "vault_maintenance_categories": ('["links", "tags", "organization"]', False),
         }
     )
@@ -191,14 +270,24 @@ async def run(args: argparse.Namespace) -> None:
 
     pending = service.list_vault_changes(status="pending", limit=500)["items"]
     unsafe: list[dict[str, str]] = []
+    observed_anchors: set[str] = set()
+    legacy_migration_tags: set[str] = set()
+    graph_contract_failures: list[dict[str, str]] = []
     operation_counts: dict[str, int] = {}
+    link_counts: dict[str, int] = {}
     for change in pending:
         operations = decoded_operations(change)
         operation_counts[str(change["id"])] = len(operations)
+        link_counts[str(change["id"])] = sum(
+            item.get("kind") == "inline-link" and item.get("action") == "add" for item in operations
+        )
         for operation in operations:
             kind = str(operation.get("kind", ""))
+            if operation.get("migration_source") == "legacy-maintenance-block":
+                legacy_migration_tags.add(str(operation.get("tag", "")))
             if kind == "inline-link" and operation.get("action") == "add":
                 anchor = str(operation.get("anchor", "")).strip()
+                observed_anchors.add(anchor)
                 folded = anchor.casefold().strip(" .,:;!?()[]{}\"'`")
                 words = folded.split()
                 if (
@@ -211,12 +300,36 @@ async def run(args: argparse.Namespace) -> None:
                     or (words and words[-1] == "where")
                 ):
                     unsafe.append({"path": str(change["path"]), "anchor": anchor})
+                if not all(
+                    str(operation.get(field, "")).strip()
+                    for field in (
+                        "graph_edge_id",
+                        "source_entity",
+                        "target_entity",
+                        "predicate",
+                    )
+                ):
+                    graph_contract_failures.append({"path": str(change["path"]), "anchor": anchor})
             if kind == "frontmatter-tag" and operation.get("action") == "add":
                 tag = str(operation.get("tag", "")).casefold()
                 if tag in LOW_VALUE_TAGS:
                     unsafe.append({"path": str(change["path"]), "tag": tag})
     if unsafe:
         raise RuntimeError(f"Unsafe generated operations: {json.dumps(unsafe[:20])}")
+    if graph_contract_failures:
+        raise RuntimeError(
+            "Inline links missing graph contract: " + json.dumps(graph_contract_failures[:20])
+        )
+    if args.generate_fixture and not observed_anchors >= EXPECTED_ANCHORS:
+        raise RuntimeError(
+            f"Expected anchors missing: {sorted(EXPECTED_ANCHORS - observed_anchors)}"
+        )
+    if args.generate_fixture and "Atlas Record" in observed_anchors:
+        raise RuntimeError("Reciprocal Atlas Record navigation was not suppressed")
+    if args.generate_fixture and legacy_migration_tags != {"ollama", "local-ai", "windows"}:
+        raise RuntimeError(f"Legacy tag migration mismatch: {sorted(legacy_migration_tags)}")
+    if any(count > 3 for count in link_counts.values()):
+        raise RuntimeError("A recommendation exceeded the conservative per-note link bound")
 
     selective: dict[str, Any] = {"tested": False}
     native = next(
@@ -271,6 +384,16 @@ async def run(args: argparse.Namespace) -> None:
         )["count"],
         "review_mode_vault_unchanged": True,
         "unsafe_operations": unsafe,
+        "graph_contract_failures": graph_contract_failures,
+        "expected_anchors": sorted(EXPECTED_ANCHORS & observed_anchors),
+        "legacy_migration_tags": sorted(legacy_migration_tags),
+        "reciprocal_anchor_suppressed": "Atlas Record" not in observed_anchors,
+        "graph_entities": service.db.query_one(
+            "SELECT count(*) AS count FROM vault_graph_entities"
+        )["count"],
+        "graph_edges": service.db.query_one("SELECT count(*) AS count FROM vault_graph_edges")[
+            "count"
+        ],
         "selective_apply_and_undo": selective,
         "decision_mode": "deterministic-scale" if args.deterministic_scale else "real-model",
     }
@@ -288,6 +411,8 @@ def main() -> None:
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--candidate-limit", type=int, default=12)
     parser.add_argument("--deterministic-scale", action="store_true")
+    parser.add_argument("--generate-fixture", action="store_true")
+    parser.add_argument("--fixture-notes", type=int, default=511)
     parser.add_argument("--output", type=Path, required=True)
     asyncio.run(run(parser.parse_args()))
 

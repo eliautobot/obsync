@@ -14,7 +14,7 @@ from urllib.parse import unquote, urlsplit
 
 import yaml
 
-from .knowledge_graph import graph_relationship_is_eligible
+from .knowledge_graph import anchor_is_complete_entity_phrase, graph_relationship_is_eligible
 from .markdown import is_managed_note, note_tags, note_title
 from .security import slugify
 
@@ -174,6 +174,31 @@ def strip_maintenance_block(content: str) -> str:
         return content
     pattern = re.escape(MAINTENANCE_START) + r".*?" + re.escape(MAINTENANCE_END)
     return re.sub(pattern, "", content, count=1, flags=re.DOTALL).rstrip() + "\n"
+
+
+def legacy_maintenance_tags(content: str) -> list[str]:
+    """Return tags that would otherwise disappear with an owned legacy block."""
+
+    if MAINTENANCE_START not in content or MAINTENANCE_END not in content:
+        return []
+    start = content.find(MAINTENANCE_START)
+    end = content.find(MAINTENANCE_END, start)
+    if end < 0:
+        return []
+    block = content[start : end + len(MAINTENANCE_END)]
+    match = re.search(r"(?im)^\s*Related tags:\s*(.+?)\s*$", block)
+    if not match:
+        return []
+    result: list[str] = []
+    for raw in re.findall(r"(?<![\w/])#([A-Za-z][\w/-]{1,79})", match.group(1)):
+        tag = normalize_obsidian_tag(raw)
+        if (
+            tag
+            and tag.casefold() != "obsync"
+            and tag.casefold() not in {item.casefold() for item in result}
+        ):
+            result.append(tag)
+    return result[:40]
 
 
 def normalized_text(value: str) -> str:
@@ -407,6 +432,7 @@ def _candidate_descriptor_terms(candidate: dict[str, Any]) -> tuple[list[str], s
         str(candidate.get("title", "")),
         Path(str(candidate.get("path", ""))).stem.replace("_", " ").replace("-", " "),
         *(str(value) for value in candidate.get("aliases", [])),
+        *(str(value) for value in candidate.get("graph_anchor_entities", [])),
     ]
     for entity in candidate.get("entities", []):
         value = str(entity)
@@ -490,6 +516,7 @@ def inline_anchor_options(
                 and edge_words[-1].casefold() in _ANCHOR_EDGE_STOP_WORDS
             )
             or _low_information_anchor(clean, document_frequency=frequency, note_count=total)
+            or not anchor_is_complete_entity_phrase(clean)
         ):
             return
         occurrences = (
@@ -567,6 +594,10 @@ def inline_anchor_options(
     # scanning every word combination cannot improve safety and becomes expensive on run logs.
     if scored:
         return ranked_options()
+    # Version 2 graphs only allow a title, alias, identifier, or previously extracted entity
+    # mention to become link text. Shared prose is candidate-retrieval evidence, never an anchor.
+    if int(candidate.get("graph_version", 1) or 1) >= 2:
+        return []
     # Large append-only logs can contain hundreds of thousands of possible word sequences. If
     # they do not explicitly name the target, declining the link is safer than mining a generic
     # shared phrase and keeps whole-vault maintenance bounded.
@@ -792,10 +823,31 @@ def native_maintenance_content(
     owned_removals: list[dict[str, Any]] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Apply only native inline links/frontmatter tags and return operation-level audit data."""
-    updated = strip_maintenance_block(content)
     operations: list[dict[str, Any]] = []
-    if updated != content:
-        operations.append({"action": "remove", "kind": "legacy-maintenance-block", "key": "legacy"})
+    updated = content
+    migration_tags = legacy_maintenance_tags(content)
+    for tag in migration_tags:
+        updated, operation = change_native_tag(updated, tag=tag)
+        if operation:
+            operation["migration_source"] = "legacy-maintenance-block"
+            operation["reason"] = "Preserve a legacy Obsync tag in native YAML before cleanup"
+            operation["confidence"] = 1.0
+            operations.append(operation)
+    migrated_tag_keys = {value.casefold() for value in note_tags(updated.replace("\r\n", "\n"))}
+    migration_complete = {
+        normalize_obsidian_tag(value).casefold() for value in migration_tags
+    } <= migrated_tag_keys
+    stripped = strip_maintenance_block(updated) if migration_complete else updated
+    if migration_complete and stripped != updated:
+        operations.append(
+            {
+                "action": "remove",
+                "kind": "legacy-maintenance-block",
+                "key": "legacy",
+                "requires_tags": migration_tags,
+            }
+        )
+    updated = stripped
     for owned in owned_removals or []:
         if owned.get("kind") == "inline-link":
             updated, operation = remove_owned_inline_link(updated, owned)
@@ -1105,6 +1157,13 @@ def knowledge_graph_nodes(
 ) -> list[dict[str, Any]]:
     """Build canonical document and durable-identifier nodes for one note."""
 
+    persistent = [
+        dict(item)
+        for item in note.get("persistent_graph_nodes", [])
+        if isinstance(item, dict) and item.get("id") and item.get("name")
+    ]
+    if persistent:
+        return persistent[:80]
     title = str(note.get("title", "")).strip() or Path(str(note.get("path", ""))).stem
     document_id = _document_entity_id(note)
     aliases = [
@@ -1148,11 +1207,150 @@ def knowledge_graph_nodes(
     return nodes
 
 
+def graph_navigation_support(
+    source_note: dict[str, Any], candidate: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Return pre-existing factual edges that could justify navigation to one document."""
+
+    if int(source_note.get("graph_version", 1) or 1) < 2:
+        return []
+    # Obsidian already exposes the candidate's link as a backlink on the source. Adding the
+    # reverse inline link usually duplicates navigation and creates noisy two-way prose.
+    candidate_catalogs_source = note_links_to(candidate, source_note)
+    if candidate_catalogs_source and candidate.get("structural_role") != "category-hub":
+        return []
+    source_content = strip_maintenance_block(
+        str(source_note.get("learning_content", source_note.get("content", "")))
+    )
+    source_document_id = _document_entity_id(source_note)
+    target_document_id = _document_entity_id(candidate)
+    candidate_mentions = [
+        item for item in candidate.get("graph_mentions", []) if isinstance(item, dict)
+    ]
+    candidate_nodes = {
+        str(item.get("id", "")): item
+        for item in candidate.get("persistent_graph_nodes", [])
+        if isinstance(item, dict)
+    }
+    candidate_entity_ids = {str(item.get("entity_id", "")) for item in candidate_mentions}
+    supports: list[dict[str, Any]] = []
+    for edge in source_note.get("graph_edges", []):
+        if not isinstance(edge, dict) or str(edge.get("state", "active")) == "superseded":
+            continue
+        predicate = str(edge.get("predicate", ""))
+        target_id = str(edge.get("target_id", ""))
+        anchor = ""
+        target_evidence = ""
+        if predicate == "references_named_document" and target_id == target_document_id:
+            anchor = str(edge.get("evidence", ""))
+            target_evidence = str(candidate.get("title", ""))
+            if candidate_catalogs_source and candidate.get("structural_role") == "category-hub":
+                predicate = "cataloged_by"
+                target_evidence = (
+                    f"{candidate.get('title', '')} links to {source_note.get('title', '')}"
+                )
+        elif (
+            str(edge.get("source_kind", "")) == "semantic"
+            and target_id in candidate_entity_ids
+            and (
+                int(candidate_nodes.get(target_id, {}).get("document_frequency", 0)) <= 2
+                or float(candidate_nodes.get(target_id, {}).get("specificity", 0.0)) >= 0.7
+            )
+        ):
+            names = [
+                str(edge.get("target_name", "")),
+                *[
+                    str(value)
+                    for item in candidate_mentions
+                    if str(item.get("entity_id", "")) == target_id
+                    for value in [item.get("entity_name", ""), *item.get("aliases", [])]
+                ],
+            ]
+            for name in sorted({value for value in names if value}, key=len, reverse=True):
+                occurrences = _free_occurrences(source_content, name)
+                if occurrences and anchor_is_complete_entity_phrase(name):
+                    anchor = occurrences[0][2]
+                    break
+            target_evidence = next(
+                (
+                    str(item.get("quote", ""))
+                    for item in candidate_mentions
+                    if str(item.get("entity_id", "")) == target_id
+                ),
+                "",
+            )
+        if not anchor or not anchor_is_complete_entity_phrase(anchor):
+            continue
+        occurrences = _free_occurrences(source_content, anchor)
+        if not occurrences:
+            continue
+        start, end, actual = occurrences[0]
+        support_id = (
+            "navigation:"
+            + hashlib.sha256(
+                "\0".join(
+                    [
+                        str(edge.get("id", "")),
+                        source_document_id,
+                        target_document_id,
+                        actual.casefold(),
+                    ]
+                ).encode("utf-8")
+            ).hexdigest()[:32]
+        )
+        supports.append(
+            {
+                "id": support_id,
+                "source_edge_id": str(edge.get("id", "")),
+                "source_document_id": source_document_id,
+                "target_document_id": target_document_id,
+                "source_entity": str(edge.get("source_name", source_note.get("title", ""))),
+                "target_entity": str(edge.get("target_name", candidate.get("title", ""))),
+                "predicate": predicate,
+                "anchor": actual,
+                "anchor_context": _anchor_context(source_content, start, end),
+                "source_evidence": str(edge.get("evidence", "")),
+                "target_evidence": target_evidence,
+                "confidence": min(
+                    1.0,
+                    float(edge.get("confidence", 1.0))
+                    * (0.5 + float(edge.get("feedback_weight", 0.5))),
+                ),
+                "valid_from": str(edge.get("valid_from", "")),
+                "state": str(edge.get("state", "active")),
+            }
+        )
+    deduplicated: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in supports:
+        key = (item["predicate"], item["anchor"].casefold())
+        if key not in deduplicated or item["confidence"] > deduplicated[key]["confidence"]:
+            deduplicated[key] = item
+    return sorted(
+        deduplicated.values(),
+        key=lambda item: (-float(item["confidence"]), item["predicate"], item["anchor"]),
+    )[:12]
+
+
 def _explicit_graph_fields(
     source_note: dict[str, Any], candidate: dict[str, Any], *, predicate: str
 ) -> dict[str, str]:
     if not (source_note.get("knowledge_graph") or candidate.get("knowledge_graph")):
         return {}
+    support = next(
+        (
+            item
+            for item in candidate.get("knowledge_graph", {}).get("supported_edges", [])
+            if isinstance(item, dict) and str(item.get("predicate", "")) == predicate
+        ),
+        None,
+    )
+    if support:
+        return {
+            "source_entity": str(support.get("source_entity", "")),
+            "target_entity": str(support.get("target_entity", "")),
+            "predicate": predicate,
+            "graph_edge_id": str(support.get("id", "")),
+        }
     source_nodes = knowledge_graph_nodes(source_note)
     target_nodes = knowledge_graph_nodes(candidate)
     source_document = next((item for item in source_nodes if item["type"] == "document"), {})
@@ -1216,6 +1414,12 @@ def apply_native_operations(
     """Apply an explicitly selected operation subset for operation-level Review."""
     updated = content
     applied: list[dict[str, Any]] = []
+    selected_tag_additions = {
+        normalize_obsidian_tag(item.get("tag") or item.get("key", "")).casefold()
+        for item in operations
+        if item.get("kind") == "frontmatter-tag" and item.get("action") == "add"
+    }
+    existing_tags = {tag.casefold() for tag in note_tags(content.replace("\r\n", "\n"))}
     for requested in operations:
         kind = str(requested.get("kind", ""))
         action = str(requested.get("action", ""))
@@ -1241,9 +1445,17 @@ def apply_native_operations(
                 updated, source_target=str(requested.get("source_target", ""))
             )
         elif kind == "legacy-maintenance-block" and action == "remove":
-            stripped = strip_maintenance_block(updated)
-            operation = dict(requested) if stripped != updated else None
-            updated = stripped
+            required_tags = {
+                normalize_obsidian_tag(value).casefold()
+                for value in requested.get("requires_tags", [])
+                if normalize_obsidian_tag(value)
+            }
+            if not required_tags <= (existing_tags | selected_tag_additions):
+                operation = None
+            else:
+                stripped = strip_maintenance_block(updated)
+                operation = dict(requested) if stripped != updated else None
+                updated = stripped
         else:
             operation = None
         if operation:
@@ -1293,7 +1505,7 @@ def explicit_category_hub_relationships(
                 f"TARGET: the hub directly links to {source_title or source_path}",
             ],
             "confidence": 0.99,
-            **_explicit_graph_fields(source_note, candidate, predicate="catalogs_document"),
+            **_explicit_graph_fields(source_note, candidate, predicate="cataloged_by"),
         }
         if graph_relationship_is_eligible(source_note, candidate, relationship):
             relationships.append(relationship)
@@ -1642,8 +1854,19 @@ class AdaptiveVaultIndex:
         self.tag_paths: dict[str, list[str]] = {}
         self.folder_counts: Counter[str] = Counter()
         self.entity_document_frequency: Counter[str] = Counter()
+        self.graph_entity_postings: dict[str, list[int]] = {}
+        self.document_id_index: dict[str, int] = {}
         document_frequency: Counter[str] = Counter()
         for index, note in enumerate(notes):
+            document_id = _document_entity_id(note)
+            if document_id:
+                self.document_id_index[document_id] = index
+            for mention in note.get("graph_mentions", []):
+                if not isinstance(mention, dict):
+                    continue
+                entity_id = str(mention.get("entity_id", ""))
+                if entity_id:
+                    self.graph_entity_postings.setdefault(entity_id, []).append(index)
             terms = Counter(search_terms(_note_search_text(note)))
             self.term_counts.append(terms)
             for term in terms:
@@ -1797,11 +2020,31 @@ class AdaptiveVaultIndex:
                 "target_links_source": note_links_to(note, source_note),
                 "shared_entity_ids": sorted(source_ids & target_ids)[:12],
             }
+        supported_edges = [
+            {
+                **item,
+                "anchor_context": next(
+                    (
+                        str(option.get("context", ""))
+                        for option in (anchor_options or [])
+                        if str(option.get("text", "")).casefold()
+                        == str(item.get("anchor", "")).casefold()
+                    ),
+                    str(item.get("anchor_context", "")),
+                ),
+            }
+            for item in note.get("graph_navigation_support", [])
+            if isinstance(item, dict)
+        ]
         return {
+            "graph_version": int(note.get("graph_version", 1) or 1),
             "entity_nodes": nodes[:40],
             "structural_edges": edges[:60],
+            "supported_edges": supported_edges[:12],
             "signals": signals,
-            "policy": "typed edge with exact evidence and graph-specific anchor required",
+            "policy": (
+                "pre-existing factual edge with exact entity anchor and navigation utility required"
+            ),
         }
 
     def corpus_profile(self) -> dict[str, Any]:
@@ -1884,6 +2127,17 @@ class AdaptiveVaultIndex:
             indexes.update(self.postings.get(term, []))
             if len(indexes) >= 2000:
                 break
+        graph_target_ids: set[str] = set()
+        for edge in (source_note or {}).get("graph_edges", []):
+            if not isinstance(edge, dict) or str(edge.get("state", "active")) == "superseded":
+                continue
+            target_id = str(edge.get("target_id", ""))
+            if not target_id:
+                continue
+            graph_target_ids.add(target_id)
+            indexes.update(self.graph_entity_postings.get(target_id, []))
+            if target_id in self.document_id_index:
+                indexes.add(self.document_id_index[target_id])
         source_properties = _property_scalars((source_note or {}).get("properties", {}))
         query_weight = sum(self.idf.get(term, 1) ** 2 for term in query_terms) ** 0.5 or 1.0
         scored: list[tuple[float, str, dict[str, Any]]] = []
@@ -1896,7 +2150,15 @@ class AdaptiveVaultIndex:
                 continue
             counts = self.term_counts[index]
             overlap = set(query_terms) & set(counts)
-            if not overlap:
+            candidate_entity_ids = {
+                str(item.get("entity_id", ""))
+                for item in note.get("graph_mentions", [])
+                if isinstance(item, dict)
+            }
+            shared_graph_targets = graph_target_ids & candidate_entity_ids
+            if _document_entity_id(note) in graph_target_ids:
+                shared_graph_targets.add(_document_entity_id(note))
+            if not overlap and not shared_graph_targets:
                 continue
             dot = sum(self.idf.get(term, 1) ** 2 for term in overlap)
             note_weight = sum(self.idf.get(term, 1) ** 2 for term in counts) ** 0.5 or 1.0
@@ -1904,6 +2166,9 @@ class AdaptiveVaultIndex:
             shared_properties = source_properties & _property_scalars(note.get("properties", {}))
             score = similarity + min(len(shared_properties), 5) * 0.05
             reasons = [f"corpus similarity {similarity:.3f}"]
+            if shared_graph_targets:
+                score += 1.0 + min(len(shared_graph_targets), 4) * 0.15
+                reasons.append(f"{len(shared_graph_targets)} provenance-backed graph target(s)")
             if shared_properties:
                 reasons.append(f"{len(shared_properties)} exact shared property value(s)")
             clean_content = strip_maintenance_block(
@@ -1928,6 +2193,16 @@ class AdaptiveVaultIndex:
         if source_note is not None:
             source_note["knowledge_graph"] = self.knowledge_graph_for(source_note)
         for note in result:
+            note["graph_navigation_support"] = graph_navigation_support(source_note or {}, note)
+            note["graph_anchor_entities"] = [
+                str(item.get("anchor", ""))
+                for item in note["graph_navigation_support"]
+                if str(item.get("anchor", ""))
+            ]
+            note["graph_version"] = max(
+                int(note.get("graph_version", 1) or 1),
+                int((source_note or {}).get("graph_version", 1) or 1),
+            )
             note["anchor_options"] = inline_anchor_options(
                 text,
                 note,

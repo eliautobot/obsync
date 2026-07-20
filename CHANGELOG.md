@@ -2,6 +2,45 @@
 
 All notable changes to Obsync will be documented here.
 
+## 0.20.0 - 2026-07-19
+
+### Added
+
+- Added persistent heading-aware graph chunks, canonical entities, exact mentions, factual edges,
+  source offsets, content hashes, temporal state, folder hierarchy, and per-note extraction state
+- Added a dedicated factual-graph extraction pass before relationship selection, with a constrained
+  vault-adaptive ontology and exact evidence required for every entity-to-entity claim
+- Added hybrid candidate retrieval through proven graph targets plus the existing corpus index
+- Added operation-level review feedback weights for predicates, anchor shapes, tags, and edit kinds
+
+### Changed
+
+- Maintenance can only create an inline link by copying a precomputed supported edge; the model can
+  no longer invent a predicate or document connection during final link selection
+- Unchanged semantic graph rows survive later Index Sweeps, so Maintenance re-analyzes only notes
+  whose content hash changed
+- Ordinary reciprocal links are suppressed, while exact category-hub navigation remains eligible
+  through the directional `cataloged_by` relationship
+- The default inline-link safety ceiling is reduced from eight to three per note
+
+### Fixed
+
+- Rejected incomplete and action-clause anchors including `who want a more`,
+  `define exact Free vs Pro`, `around Virtual Office`, and similar boilerplate fragments
+- Preserved tags found only in an old marked Obsync block by migrating them into native YAML before
+  allowing deterministic block cleanup
+- Prevented common entities from creating noisy navigation links across every note that mentions
+  them, while retaining rare or directly named entities
+- Fixed live Maintenance recommendation and changed-note counters so they update during the sweep
+  and match the final Review queue
+
+### Validation
+
+- Passed 264 automated tests and branch coverage at 83 percent
+- Passed a disposable 511-note Index → Maintenance Review benchmark with zero unsafe anchors, zero
+  decision failures, exact expected links, preserved legacy tags, reciprocal suppression, read-only
+  Review, graph integrity/provenance checks, selective apply, and byte-exact Undo
+
 ## 0.19.0 - 2026-07-19
 
 ### Added

@@ -71,6 +71,16 @@ def adaptive_ai(monkeypatch: pytest.MonkeyPatch):
             ]
             if not anchors:
                 continue
+            supports = [
+                item
+                for item in candidate.get("knowledge_graph", {}).get("supported_edges", [])
+                if isinstance(item, dict)
+                and str(item.get("anchor", "")).casefold()
+                == str(anchors[0].get("text", "")).casefold()
+            ]
+            if int(candidate.get("graph_version", 1) or 1) >= 2 and not supports:
+                continue
+            support = supports[0] if supports else {}
             source_fact = title or next(iter(shared_terms), "named record")
             relationships.append(
                 {
@@ -79,6 +89,12 @@ def adaptive_ai(monkeypatch: pytest.MonkeyPatch):
                     "anchor_context": anchors[0].get("context", ""),
                     "anchor_occurrence": anchors[0].get("occurrence", 0),
                     "relationship_type": "specific-record",
+                    "graph_edge_id": str(support.get("id", "")),
+                    "source_entity": str(
+                        support.get("source_entity", source_note.get("title", ""))
+                    ),
+                    "target_entity": str(support.get("target_entity", title)),
+                    "predicate": str(support.get("predicate", "references_named_document")),
                     "relationship": "Both records describe the same named record or party",
                     "evidence": [
                         f"SOURCE: {source_fact} appears in the source",
@@ -99,8 +115,18 @@ def adaptive_ai(monkeypatch: pytest.MonkeyPatch):
             "obsolete_owned_tags": [],
         }
 
+    async def extract_graph(
+        _self,
+        note,
+        *,
+        vault_model,
+        allowed_predicates,
+    ):
+        return {"chunks": [], "entities": [], "mentions": [], "claims": []}
+
     monkeypatch.setattr(LLMAnalyzer, "learn_vault_model", learn)
     monkeypatch.setattr(LLMAnalyzer, "adjudicate_relationships", adjudicate)
+    monkeypatch.setattr(LLMAnalyzer, "extract_note_graph", extract_graph)
 
     def configure(service) -> None:
         service.db.set_settings(

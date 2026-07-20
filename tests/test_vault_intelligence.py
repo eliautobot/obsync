@@ -1090,7 +1090,7 @@ async def test_maintenance_sweep_streams_model_thinking_output_and_decisions(
 
 
 @pytest.mark.asyncio
-async def test_invalid_maintenance_limits_use_the_safe_eight_link_fallback(
+async def test_invalid_maintenance_limits_use_the_safe_three_link_fallback(
     tmp_path: Path, adaptive_ai, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = Settings(data_dir=tmp_path / "data", vault_path=tmp_path / "vault", admin_token="")
@@ -1135,7 +1135,7 @@ async def test_invalid_maintenance_limits_use_the_safe_eight_link_fallback(
     await service._sweep_task
 
     assert service.vault_sweep(sweep["id"])["status"] == "completed"
-    assert observed["maximum_links"] == 8
+    assert observed["maximum_links"] == 3
 
 
 @pytest.mark.asyncio
@@ -1551,7 +1551,7 @@ def test_v014_migration_supersedes_static_pending_changes_and_clamps_old_limit(
     change = service.db.query_one("SELECT * FROM vault_changes WHERE id = ?", (change_id,))
     assert change and change["status"] == "superseded"
     assert "adaptive relationship engine" in change["error"]
-    assert service.db.get_setting("vault_link_limit") == "8"
+    assert service.db.get_setting("vault_link_limit") == "3"
 
 
 def test_v0151_migration_raises_only_the_legacy_default_ai_timeout(tmp_path: Path) -> None:
@@ -1564,7 +1564,7 @@ def test_v0151_migration_raises_only_the_legacy_default_ai_timeout(tmp_path: Pat
     service.db.initialize()
 
     assert service.db.get_setting("llm_timeout_seconds") == "600"
-    assert service.db.query_one("SELECT version FROM schema_meta")["version"] == 13
+    assert service.db.query_one("SELECT version FROM schema_meta")["version"] == 14
 
     service.db.set_settings({"llm_timeout_seconds": ("900", False)})
     service.db.execute("UPDATE schema_meta SET version = 9")
@@ -1609,8 +1609,8 @@ def test_v011_migration_supersedes_block_recommendations_and_forces_read_only_in
     assert change and change["status"] == "superseded"
     assert "native inline maintenance" in change["error"]
     assert service.db.get_setting("vault_index_change_mode") == "index-only"
-    assert service.db.get_setting("vault_link_limit") == "8"
-    assert service.db.query_one("SELECT version FROM schema_meta")["version"] == 13
+    assert service.db.get_setting("vault_link_limit") == "3"
+    assert service.db.query_one("SELECT version FROM schema_meta")["version"] == 14
 
 
 def test_v012_migration_rebuilds_metadata_and_supersedes_contextless_recommendations(
@@ -1662,7 +1662,7 @@ def test_v012_migration_rebuilds_metadata_and_supersedes_contextless_recommendat
     assert model and model["status"] == "not-learned"
     assert model["fingerprint"] == ""
     assert model["corpus_fingerprint"] == ""
-    assert service.db.query_one("SELECT version FROM schema_meta")["version"] == 13
+    assert service.db.query_one("SELECT version FROM schema_meta")["version"] == 14
 
 
 def test_v019_migration_supersedes_pre_graph_recommendations_and_model(
@@ -1703,8 +1703,8 @@ def test_v019_migration_supersedes_pre_graph_recommendations_and_model(
     assert "graph-grounded maintenance" in change["error"]
     assert model and model["status"] == "not-learned"
     assert model["fingerprint"] == ""
-    assert model["corpus_fingerprint"] == "current-corpus"
-    assert service.db.query_one("SELECT version FROM schema_meta")["version"] == 13
+    assert model["corpus_fingerprint"] == ""
+    assert service.db.query_one("SELECT version FROM schema_meta")["version"] == 14
 
 
 def test_review_feedback_changes_the_adaptive_vault_model_fingerprint(
